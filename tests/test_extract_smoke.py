@@ -99,8 +99,27 @@ NO_SLEEP = lambda _sec: None
 
 
 # ── metrika_logs ───────────────────────────────────────────────────────────
+# Реальные неподдерживаемые Logs API имена полей (сверено с боевым evaluate):
+# источник visits не отдаёт флаг робота и отдельный yclid/gclid.
+_METRIKA_BAD_FIELDS = {"ym:s:isRobot", "ym:s:lastSignYclid", "ym:s:lastSignGclid"}
+
+
+def _evaluate_route(get_session, bad=frozenset()):
+    """Мок logrequests/evaluate: 400 «Unknown field» если в составе есть bad-поле."""
+    def responder(_n):
+        fields = get_session().calls[-1][2]["params"]["fields"].split(",")
+        offending = [f for f in fields if f in bad]
+        if offending:
+            msg = f"Unknown field in the request: {offending[0]} for the source visits"
+            return FakeResponse(status_code=400, json_data={
+                "errors": [{"error_type": "invalid_parameter", "message": msg}],
+                "code": 400, "message": msg})
+        return FakeResponse(json_data={"log_request_evaluation": {"possible": True}})
+    return (lambda m, u: m == "GET" and u.endswith("/logrequests/evaluate"), responder)
+
+
 def test_metrika_logs_writes_raw_and_manifest(paths):
-    """Полный цикл Logs API: create -> poll -> download -> csv.gz + manifest."""
+    """Полный цикл Logs API: evaluate -> create -> poll -> download -> csv.gz + manifest."""
     header = "\t".join(metrika_logs.VISIT_FIELDS)
     part_text = header + "\n" + "\t".join(["v1", "c1", "2026-05-02 10:00:00"] +
                                           ["x"] * (len(metrika_logs.VISIT_FIELDS) - 3)) + "\n"
@@ -111,16 +130,16 @@ def test_metrika_logs_writes_raw_and_manifest(paths):
         return FakeResponse(json_data={"log_request": {
             "request_id": 777, "status": status, "parts": parts}})
 
+    box = {}
     routes = [
-        # create logrequest (POST .../logrequests — множественное число)
+        _evaluate_route(lambda: box["session"]),  # все поля валидны (bad=пусто)
         (lambda m, u: m == "POST" and u.endswith("/logrequests"),
          FakeResponse(json_data={"log_request": {"request_id": 777, "status": "created"}})),
-        # poll (GET .../logrequest/777 — ЕДИНСТВЕННОЕ число, квирк Logs API)
         (lambda m, u: m == "GET" and u.endswith("/logrequest/777"), poll_responder),
-        # download part
         (_contains("/part/0/download"), FakeResponse(text=part_text)),
     ]
     session = FakeSession(routes)
+    box["session"] = session
 
     result = metrika_logs.extract(
         CONFIG_METRIKA, ENV, paths, session=session, sleeper=NO_SLEEP,
@@ -130,7 +149,6 @@ def test_metrika_logs_writes_raw_and_manifest(paths):
     src_dir = paths.raw / "metrika_logs"
     gz_files = sorted(src_dir.glob("*.csv.gz"))
     assert len(gz_files) == 2
-    # Сырьё лежит как csv.gz и распаковывается обратно в TSV.
     with gzip.open(gz_files[0], "rt", encoding="utf-8") as fh:
         assert fh.read().startswith("ym:s:visitID")
 
@@ -142,53 +160,65 @@ def test_metrika_logs_writes_raw_and_manifest(paths):
     assert entry["date_from"] == "2026-05-01" and entry["date_to"] == "2026-06-30"
     assert "fetched_at" in entry
 
-    # Патч 0.3.0: новые поля выгружены и зафиксированы в манифесте.
+    # Патч: новые поля согласованы и зафиксированы в манифесте.
     assert result["patch_backfill"] is False
     assert entry["patch_date"] == metrika_logs.PATCH_DATE
-    for new_field in ("ym:s:isRobot", "ym:s:lastTrafficSource", "ym:s:browser",
-                      "ym:s:operatingSystem", "ym:s:screenResolution",
+    assert entry["schema_version"] == metrika_logs.SCHEMA_VERSION
+    for new_field in ("ym:s:lastTrafficSource", "ym:s:browser", "ym:s:operatingSystem",
+                      "ym:s:screenWidth", "ym:s:screenHeight",
                       "ym:s:regionCountry", "ym:s:regionCity"):
         assert new_field in metrika_logs.VISIT_FIELDS
         assert new_field in entry["patch_fields"]
     # Наивная и last-significant модели атрибуции — ОБЕ (для T02).
     assert "ym:s:lastTrafficSource" in metrika_logs.VISIT_FIELDS
     assert "ym:s:lastsignTrafficSource" in metrika_logs.VISIT_FIELDS
+    # Все поля валидны в этом моке -> ничего не отброшено.
     assert entry["dropped_fields"] == []
 
 
-def test_metrika_logs_probes_optional_clickid_fields(paths):
-    """400 на состав полей (пробные yclid/gclid) -> откат без них, факт в манифесте."""
+def test_metrika_logs_negotiation_isolates_unsupported_fields(paths):
+    """evaluate отклоняет isRobot/yclid/gclid -> бинарное деление изолирует именно их."""
     cfg = {**CONFIG_METRIKA,
            "data_window": {"date_from": "2026-06-01", "date_to": "2026-06-30"}}
 
-    def create_responder(n):
-        # Первый POST (полный состав с yclid/gclid) — 400; второй (без них) — ок.
-        if n == 0:
-            return FakeResponse(status_code=400,
-                                json_data={"errors": [{"message": "unknown field yclid"}]})
-        return FakeResponse(json_data={"log_request": {"request_id": 42, "status": "created"}})
-
+    logged: list[str] = []
+    box = {}
     routes = [
-        (lambda m, u: m == "POST" and u.endswith("/logrequests"), create_responder),
+        _evaluate_route(lambda: box["session"], bad=_METRIKA_BAD_FIELDS),
+        (lambda m, u: m == "POST" and u.endswith("/logrequests"),
+         FakeResponse(json_data={"log_request": {"request_id": 42, "status": "created"}})),
         (lambda m, u: m == "GET" and u.endswith("/logrequest/42"),
          FakeResponse(json_data={"log_request": {"request_id": 42, "status": "processed",
                                                  "parts": [{"part_number": 0}]}})),
-        (_contains("/part/0/download"), FakeResponse(text="ym:s:visitID\tym:s:isRobot\nv1\tNo\n")),
+        (_contains("/part/0/download"),
+         FakeResponse(text="ym:s:visitID\tym:s:browser\nv1\tchrome\n")),
     ]
     session = FakeSession(routes)
+    box["session"] = session
 
-    result = metrika_logs.extract(cfg, ENV, paths, session=session, sleeper=NO_SLEEP)
+    result = metrika_logs.extract(cfg, ENV, paths, session=session,
+                                  sleeper=NO_SLEEP, log=logged.append)
 
-    # Пробные clickid-поля отброшены, но поля патча остались.
-    assert set(result["dropped_fields"]) == {"ym:s:lastSignYclid", "ym:s:lastSignGclid"}
+    # Изолированы именно неподдерживаемые поля, а не весь пакет новых.
+    assert set(result["dropped_fields"]) == _METRIKA_BAD_FIELDS
     entry = manifest_mod.load_manifest(paths.raw)["sources"]["metrika_logs"]
-    assert "ym:s:isRobot" in entry["available_fields"]
-    assert "ym:s:lastSignYclid" not in entry["available_fields"]
-    assert "ym:s:lastSignYclid" not in entry["patch_fields"]
+    # Валидные поля остались доступны.
+    for good in ("ym:s:lastTrafficSource", "ym:s:browser", "ym:s:screenWidth",
+                 "ym:s:regionCity"):
+        assert good in entry["available_fields"]
+    # Причина отклонения записана по каждому dropped-полю.
+    for bad in _METRIKA_BAD_FIELDS:
+        assert bad in entry["dropped_reasons"]
+        assert "Unknown field" in entry["dropped_reasons"][bad]
+        assert bad not in entry["patch_fields"]
+    # Безопасный лог: отклонённый состав виден, токен/Authorization — нет.
+    joined = "\n".join(logged)
+    assert "evaluate отклонил" in joined
+    assert "fake-metrika" not in joined and "OAuth" not in joined
 
 
 def test_metrika_logs_backfill_preserves_old_files(paths):
-    """Окно уже выгружено ДО патча -> довыгрузка полей отдельными backfill-файлами."""
+    """Окно уже выгружено ДО патча -> довыгрузка полей в подкаталог backfill/."""
     cfg = {**CONFIG_METRIKA,
            "data_window": {"date_from": "2026-06-01", "date_to": "2026-06-30"}}
 
@@ -205,33 +235,43 @@ def test_metrika_logs_backfill_preserves_old_files(paths):
         script_version="0.2.0", canonical_tables=["visits"],
     )
 
+    box = {}
     routes = [
+        _evaluate_route(lambda: box["session"], bad=_METRIKA_BAD_FIELDS),
         (lambda m, u: m == "POST" and u.endswith("/logrequests"),
          FakeResponse(json_data={"log_request": {"request_id": 888, "status": "created"}})),
         (lambda m, u: m == "GET" and u.endswith("/logrequest/888"),
          FakeResponse(json_data={"log_request": {"request_id": 888, "status": "processed",
                                                  "parts": [{"part_number": 0}]}})),
         (_contains("/part/0/download"),
-         FakeResponse(text="ym:s:visitID\tym:s:isRobot\tym:s:lastTrafficSource\nv1\tNo\tdirect\n")),
+         FakeResponse(text="ym:s:visitID\tym:s:lastTrafficSource\nv1\tdirect\n")),
     ]
     session = FakeSession(routes)
+    box["session"] = session
 
     result = metrika_logs.extract(cfg, ENV, paths, session=session, sleeper=NO_SLEEP)
 
     assert result["patch_backfill"] is True
     # Старый файл слоя raw НЕ тронут (неизменность слоя).
     assert old_file.read_bytes() == old_bytes
-    # Новые поля лежат в отдельном backfill-файле.
-    backfill_files = sorted(src.glob("visits_backfill_*.csv.gz"))
+    # Backfill-файлы лежат в ПОДКАТАЛОГЕ backfill/ (вне глоба верхнего уровня).
+    assert sorted(src.glob("visits_backfill_*.csv.gz")) == []
+    backfill_files = sorted((src / "backfill").glob("visits_backfill_*.csv.gz"))
     assert len(backfill_files) == 1
     with gzip.open(backfill_files[0], "rt", encoding="utf-8") as fh:
         assert fh.read().startswith("ym:s:visitID")
+    # verify_metrika/transform глобят только верхний уровень -> backfill их не ломает.
+    assert sorted(src.glob("*.csv.gz")) == [old_file]
 
     entry = manifest_mod.load_manifest(paths.raw)["sources"]["metrika_logs"]
     assert entry["patch_backfill"] is True
     assert entry["patch_date"] == metrika_logs.PATCH_DATE
-    assert "ym:s:isRobot" in entry["patch_fields"]
+    assert entry["schema_version"] == metrika_logs.SCHEMA_VERSION
+    assert entry["backfill_dir"] == "metrika_logs/backfill"
+    assert "ym:s:lastTrafficSource" in entry["patch_fields"]
     assert "ym:s:visitID" not in entry["patch_fields"]  # ключ склейки — не «поле патча»
+    # Неподдерживаемые поля изолированы и в backfill.
+    assert set(entry["dropped_fields"]) == _METRIKA_BAD_FIELDS
 
 
 def test_metrika_logs_dead_token_raises_auth_error(paths):

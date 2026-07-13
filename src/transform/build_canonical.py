@@ -389,13 +389,138 @@ def _to_optional_str(value: Any) -> str | None:
 
 
 # ═══════════════════════════ Чтение сырья: visits ═══════════════════════════
+# Слой Logs API: базовые визиты — visits_*.csv.gz верхнего уровня; довыгруженные
+# патчем поля — в подкаталоге backfill/ (visits_backfill_*.csv.gz), склеиваются
+# по ym:s:visitID (см. build_visits). Разделение намеренное: базовый слой
+# неизменяем, backfill добавляет только новые колонки, не размножая строки.
+BACKFILL_SUBDIR = "backfill"
+
+# Соответствие полей backfill (ym:s:*) -> канонические колонки. is_robot сюда НЕ
+# входит: источник visits его не отдаёт (см. manifest.dropped_fields Метрики),
+# поэтому в canonical он присутствует как nullable-колонка без значения.
+_BACKFILL_COLUMNS = [
+    "last_traffic_source_naive",
+    "browser",
+    "os",
+    "screen_width",
+    "screen_height",
+    "screen_resolution",
+    "region_country",
+    "region_city",
+]
+
+
 def _read_metrika_logs_rows(raw_dir: Path) -> list[dict[str, str]]:
+    """Базовые визиты — только visits_*.csv.gz верхнего уровня (без backfill)."""
     rows: list[dict[str, str]] = []
-    for path in sorted(raw_dir.glob("*.csv.gz")):
+    for path in sorted(raw_dir.glob("visits_*.csv.gz")):
+        if path.name.startswith("visits_backfill_"):
+            continue  # backfill читается отдельно (_read_metrika_backfill)
         with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
             reader = csv.DictReader(fh, delimiter="\t")
             rows.extend(reader)
     return rows
+
+
+def _parse_backfill_int(raw: str | None) -> int | None:
+    """Числовое поле backfill (ширина/высота экрана) -> int | None (nullable)."""
+    value = (raw or "").strip()
+    if not value:
+        return None
+    try:
+        return int(float(value))
+    except ValueError:
+        return None
+
+
+def _parse_backfill_row(row: dict[str, str]) -> dict[str, Any] | None:
+    """Строка backfill (ym:s:* новые поля) -> канонические поля по visit_id."""
+    visit_id = (row.get("ym:s:visitID") or "").strip()
+    if not visit_id:
+        return None
+
+    def _s(key: str) -> str | None:
+        value = (row.get(key) or "").strip()
+        return value or None
+
+    width = _parse_backfill_int(row.get("ym:s:screenWidth"))
+    height = _parse_backfill_int(row.get("ym:s:screenHeight"))
+    resolution = f"{width}x{height}" if (width is not None and height is not None) else None
+
+    return {
+        "visit_id": visit_id,
+        # last_traffic_source_naive — ТОЛЬКО из наивной модели ym:s:lastTrafficSource;
+        # source_group/source_final (last-significant) этим НЕ трогаются.
+        "last_traffic_source_naive": _s("ym:s:lastTrafficSource"),
+        "browser": _s("ym:s:browser"),
+        "os": _s("ym:s:operatingSystem"),
+        "screen_width": width,
+        "screen_height": height,
+        "screen_resolution": resolution,
+        "region_country": _s("ym:s:regionCountry"),
+        "region_city": _s("ym:s:regionCity"),
+    }
+
+
+def _read_metrika_backfill(metrika_dir: Path) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+    """Прочитать backfill/visits_backfill_*.csv.gz в {visit_id: поля} + статистику.
+
+    Дедуп ключа детерминированный: файлы и строки обходятся в устойчивом порядке
+    (sorted по имени файла), при повторе visit_id побеждает ПОСЛЕДНЯЯ строка;
+    число отброшенных дублей возвращается в статистике.
+    """
+    backfill_dir = Path(metrika_dir) / BACKFILL_SUBDIR
+    by_visit: dict[str, dict[str, Any]] = {}
+    total = 0
+    dedup_dropped = 0
+    if backfill_dir.exists():
+        for path in sorted(backfill_dir.glob("visits_backfill_*.csv.gz")):
+            with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
+                for row in csv.DictReader(fh, delimiter="\t"):
+                    parsed = _parse_backfill_row(row)
+                    if parsed is None:
+                        continue
+                    total += 1
+                    vid = parsed["visit_id"]
+                    if vid in by_visit:
+                        dedup_dropped += 1
+                    by_visit[vid] = parsed  # последняя строка ключа побеждает
+    return by_visit, {"backfill_rows": total, "backfill_dedup_dropped": dedup_dropped}
+
+
+def _join_backfill(df: pd.DataFrame, metrika_dir: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Left join базовых визитов с backfill по visit_id (число строк не растёт).
+
+    Визит без backfill сохраняется (новые поля = null). Backfill-ключи, которых
+    нет среди базовых визитов (unmatched), в canonical не попадают, но их число
+    фиксируется в статистике (flags.metrika_backfill).
+    """
+    by_visit, stats = _read_metrika_backfill(metrika_dir)
+    base_ids = set(df["visit_id"])
+    matched = sum(1 for vid in by_visit if vid in base_ids)
+    stats.update({
+        "base_visits": int(len(df)),
+        "backfill_matched": matched,
+        "backfill_unmatched": len(by_visit) - matched,
+        "is_robot_available": False,  # источник visits не отдаёт флаг робота (D11)
+    })
+
+    columns = ["visit_id"] + _BACKFILL_COLUMNS
+    if by_visit:
+        bf_df = pd.DataFrame(list(by_visit.values()), columns=columns)
+    else:
+        bf_df = pd.DataFrame(columns=columns)
+
+    n_before = len(df)
+    merged = df.merge(bf_df, on="visit_id", how="left")
+    # Ключи backfill уникальны (дедуплицированы) -> left join не размножает строки.
+    if len(merged) != n_before:
+        raise AssertionError(
+            f"backfill join изменил число строк: {n_before} -> {len(merged)}"
+        )
+    # is_robot присутствует в схеме как nullable, но НЕ заполняется (API не отдаёт).
+    merged["is_robot"] = None
+    return merged, stats
 
 
 def _parse_visit_row(row: dict[str, str], goals_cfg: dict[str, Any]) -> dict[str, Any] | None:
@@ -431,15 +556,26 @@ def _parse_visit_row(row: dict[str, str], goals_cfg: dict[str, Any]) -> dict[str
     }
 
 
+def _empty_backfill_stats() -> dict[str, Any]:
+    return {
+        "backfill_rows": 0, "backfill_dedup_dropped": 0, "base_visits": 0,
+        "backfill_matched": 0, "backfill_unmatched": 0, "is_robot_available": False,
+    }
+
+
 def build_visits(
     raw_dir: Path, config: dict[str, Any], defaults: dict[str, Any],
-) -> tuple[pd.DataFrame, bool]:
-    """data/raw/metrika_logs/ -> DataFrame канонических визитов + utm_uncertain."""
+) -> tuple[pd.DataFrame, bool, dict[str, Any]]:
+    """data/raw/metrika_logs/ -> (визиты, utm_uncertain, статистика backfill).
+
+    Базовые визиты — из visits_*.csv.gz; новые поля патча (наивная атрибуция,
+    браузер/ОС/экран, гео) join-ятся из backfill/ по visit_id, не размножая строк.
+    """
     raw_rows = _read_metrika_logs_rows(raw_dir)
     goals_cfg = config.get("goals") or {}
     parsed = [r for r in (_parse_visit_row(row, goals_cfg) for row in raw_rows) if r is not None]
     if not parsed:
-        return pd.DataFrame(), False
+        return pd.DataFrame(), False, _empty_backfill_stats()
 
     df = pd.DataFrame(parsed)
     df = dedupe_visits(df)
@@ -450,7 +586,9 @@ def build_visits(
     )
     df["source_final"] = source_final
     df["is_ad"] = df["source_final"] == "ad"
-    return df, utm_uncertain
+
+    df, backfill_stats = _join_backfill(df, raw_dir)
+    return df, utm_uncertain, backfill_stats
 
 
 # ═══════════════════════════ Чтение сырья: costs / direct ═══════════════════
@@ -710,11 +848,24 @@ _ARROW_TYPES: dict[str, pa.DataType] = {
 
 SCHEMAS: dict[str, dict[str, str]] = {
     "visits": {
+        # ── Базовые 16 колонок (контракт до патча — НЕ менять) ──────────────
         "visit_id": "string", "client_id": "string", "dt": "timestamp", "date": "date",
         "device": "string", "source_group": "string", "utm_source_raw": "string",
         "source_final": "string", "is_ad": "bool", "entry_page": "string",
         "form_open": "bool", "form_submit": "bool", "call_click": "bool",
         "messenger_click": "bool", "form_submit_count": "int", "is_new_user": "bool",
+        # ── Поля патча (из backfill; отсутствие -> null) ────────────────────
+        "last_traffic_source_naive": "string",  # T02: наивная модель атрибуции
+        "browser": "string",                    # C21
+        "os": "string",                         # C21
+        "screen_width": "int",                  # C21 (nullable)
+        "screen_height": "int",                 # C21 (nullable)
+        "screen_resolution": "string",          # "<width>x<height>" при наличии обоих
+        "region_country": "string",             # A12 / S26
+        "region_city": "string",                # A12 / S26
+        # is_robot: источник visits его не отдаёт (D11) -> nullable, всегда null,
+        # НИКОГДА не false; недоступность фиксируется в flags.metrika_backfill.
+        "is_robot": "bool",
     },
     "costs": {
         "date": "date", "source_tag": "string", "campaign_id": "string",
@@ -811,11 +962,16 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
     flags: dict[str, Any] = {}
 
     if "metrika_logs" in sources:
-        visits_df, utm_uncertain = build_visits(raw_dir / "metrika_logs", config, defaults)
+        visits_df, utm_uncertain, backfill_stats = build_visits(
+            raw_dir / "metrika_logs", config, defaults
+        )
         if not visits_df.empty:
             write_canonical_table(visits_df, "visits", canonical_dir / "visits.parquet")
             built.append("visits")
             flags["utm_uncertain"] = utm_uncertain
+            # Статистика склейки base+backfill (в т.ч. unmatched и недоступность
+            # is_robot) — фиксируется для аналитика, а не «молча».
+            flags["metrika_backfill"] = backfill_stats
 
     direct_dir = raw_dir / "direct" if "direct" in sources else None
     direct_entry = sources.get("direct")

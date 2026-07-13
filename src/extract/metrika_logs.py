@@ -11,27 +11,34 @@
     LLM      — не используется.
 
 Механика Logs API (асинхронный):
-    1. POST logrequests   — создать запрос на выгрузку окна;
-    2. GET  logrequests/{id} — поллинг статуса до "processed";
-    3. GET  .../part/{n}/download — скачать части;
-    4. склейка — здесь не делаем: части кладём как есть (raw), склейка/парсинг
+    1. GET  logrequests/evaluate — согласовать состав полей (валидность + объём),
+       БЕЗ создания джобы (read-only). Так мы определяем реально поддерживаемые
+       поля до запуска выгрузки;
+    2. POST logrequests   — создать запрос на выгрузку окна принятыми полями;
+    3. GET  logrequests/{id} — поллинг статуса до "processed";
+    4. GET  .../part/{n}/download — скачать части;
+    5. склейка — здесь не делаем: части кладём как есть (raw), склейка/парсинг
        живут в слое transform.
 Большие окна делятся на календарные месяцы (по одному logrequest на месяц):
 Logs API ограничивает объём одного запроса.
 
-── Патч 0.3.0 (расширение полей под каталог угроз v2) ──────────────────────
-Добавлены поля визита для T02 (наивная vs last-significant атрибуция), D11
-(боты), C21 (браузер/ОС/разрешение) и A12/S26 (гео). Состав полей теперь
-согласовывается с API «лесенкой» (_FIELD_LADDER): наличие ОТДЕЛЬНОГО поля
-yclid/gclid в Logs API не гарантировано, поэтому такие поля ПРОБНЫЕ — при 400
-на состав полей запрос откатывается без них, а фактически принятый набор
-фиксируется в manifest.available_fields (принцип «проверь, не предполагай»).
+── Патч 0.3.x (расширение полей под каталог угроз v2) ──────────────────────
+Добавлены поля визита для T02 (наивная vs last-significant атрибуция), C21
+(браузер/ОС/размер экрана) и A12/S26 (гео). Состав полей согласуется с API
+рантайм-негоциацией через logrequests/evaluate: неподдерживаемое имя даёт
+HTTP 400 «Unknown field ... for the source visits». Негоциация бинарным
+делением ИЗОЛИРУЕТ конкретные неподдерживаемые поля (а не выбрасывает весь
+пакет) и фиксирует их в manifest.dropped_fields с причиной от API. Каждый
+отклонённый набор логируется безопасно (поля + status + code/message/errors),
+без токена и заголовка Authorization.
 
 Неизменность слоя raw (принцип 2): если окно уже было выгружено ДО патча
 (в манифесте нет patch_date), старые visits_* файлы не трогаются — недостающие
-поля довыгружаются отдельным проходом в visits_backfill_* и помечаются
-manifest.patch_backfill: true. Так по манифесту видно, за какой период данные
-полны сразу, а за какой полнота собирается склейкой основного и backfill-слоёв.
+поля довыгружаются отдельным проходом в ПОДКАТАЛОГ metrika_logs/backfill/ и
+помечаются manifest.patch_backfill: true. Подкаталог намеренно вне обычного
+`*.csv.gz`-глоба верхнего уровня: сверка (scripts/verify_metrika) и transform
+читают только базовые visits_* и не спотыкаются о backfill-файлы (в них нет
+ym:s:dateTime). Склейка base+backfill по ym:s:visitID — забота слоя transform.
 """
 
 from __future__ import annotations
@@ -43,22 +50,26 @@ from typing import Any, Callable
 
 from . import _common as C
 
-SCRIPT_VERSION = "0.3.0"
+SCRIPT_VERSION = "0.3.1"
 SOURCE = "metrika_logs"
 CANONICAL_TABLES = ["visits"]
 
-# Дата патча 0.3.0 (расширение полей). Пишется в manifest.patch_date — граница,
-# по которой видно, какие выгрузки уже содержат новые поля.
+# Версия схемы полей визита. v2 = базовый набор + поля патча (T02/C21/гео).
+# Пишется в manifest.schema_version — по нему видно, какой контракт полей
+# у выгрузки, независимо от версии кода.
+SCHEMA_VERSION = "visits-v2"
+
+# Дата патча расширения полей. Пишется в manifest.patch_date — граница, по
+# которой видно, какие выгрузки уже содержат новые поля.
 PATCH_DATE = "2026-07-13"
 
 # База management/logrequests API Метрики.
-# ВНИМАНИЕ (квирк Logs API): создание запроса — множественное число
+# ВНИМАНИЕ (квирк Logs API): создание запроса и evaluate — множественное число
 # /logrequests, а статус/скачивание/очистка — ЕДИНСТВЕННОЕ /logrequest/{id}.
 API_BASE = "https://api-metrika.yandex.net/management/v1/counter"
 
-# Базовый набор полей визита (до патча 0.3.0). Порядок фиксирован — на него
-# опирается transform. ym:s:lastSignDirectClickOrder доступен не на всех
-# счётчиках; при 400 на состав полей он отбрасывается последним звеном лесенки.
+# Базовый набор полей визита (до патча). Порядок фиксирован — на него опирается
+# transform. Все поля базы поддерживаются источником visits.
 VISIT_FIELDS_BASE = [
     "ym:s:visitID",
     "ym:s:clientID",
@@ -77,51 +88,41 @@ VISIT_FIELDS_BASE = [
     "ym:s:visitDuration",
 ]
 
-# Поля, добавленные патчем 0.3.0. Фиксируются в manifest.patch_fields, чтобы по
-# манифесту было видно, за какой период данные полны, а за какой (выгруженный
-# ДО патча) — их ещё нужно довыгрузить.
+# Поля, добавленные патчем. Валидность каждого проверяется рантайм-негоциацией
+# (logrequests/evaluate); принятые попадают в manifest.patch_fields, отклонённые —
+# в manifest.dropped_fields с причиной. Имена ниже сверены с боевым API Метрики:
+#   ym:s:screenWidth/Height — реальные поля (ym:s:screenResolution НЕ существует);
+#   ym:s:isRobot — ПРОБНОЕ: источник visits не отдаёт флаг робота (ни isRobot, ни
+#     robotness), поэтому обычно уходит в dropped — D11 по Logs этим полем закрыть
+#     нельзя, это фиксируется в манифесте честно, а не молча.
 PATCH_ADDED_FIELDS = [
-    "ym:s:isRobot",              # D11: доля ботов (на extract НЕ фильтруем)
     "ym:s:lastTrafficSource",    # T02: НАИВНАЯ модель атрибуции — ОТДЕЛЬНО от
                                  # ym:s:lastsignTrafficSource (last-significant).
                                  # Нужны ОБЕ: это разные модели атрибуции.
     "ym:s:browser",             # C21: проблема в конкретном браузере
     "ym:s:operatingSystem",     # C21: ... или ОС
-    "ym:s:screenResolution",    # C21: ... или разрешении экрана
+    "ym:s:screenWidth",         # C21: ширина экрана (замена screenResolution)
+    "ym:s:screenHeight",        # C21: высота экрана
     "ym:s:regionCountry",       # A12 (нецелевая гео) / S26 (гео-спрос)
     "ym:s:regionCity",          # A12 / S26
+    "ym:s:isRobot",             # ПРОБНОЕ (D11): у источника visits обычно нет
 ]
 
-# Click ID «в чистом виде» (yclid/gclid) как ОТДЕЛЬНОЕ поле визита в Logs API
-# НЕ гарантирован: доступность зависит от версии API и настроек счётчика. Поэтому
-# поля ПРОБНЫЕ — заказываем, а при 400 «неизвестное поле» откатываемся без них;
-# фактически принятый состав фиксируется в manifest.available_fields. Связка
-# визита с кампанией Директа через ym:s:lastSignDirectClickOrder уже есть в базе.
-VISIT_FIELDS_CLICKID_PROBE = [
-    "ym:s:lastSignYclid",   # ПРОБНОЕ: yandex click id, если счётчик его отдаёт
-    "ym:s:lastSignGclid",   # ПРОБНОЕ: google click id (кросс-плейсмент), если есть
-]
+# Отдельный clickID (yclid/gclid) в Logs API не гарантирован — ПРОБНЫЕ поля.
+# Связка визита с Директом идёт через ym:s:lastSignDirectClickOrder (в базе).
+PATCH_CLICKID_PROBE = ["ym:s:lastSignYclid", "ym:s:lastSignGclid"]
+
+# Все новые поля, которые ПЫТАЕМСЯ добавить (негоциация оставит поддерживаемые).
+PATCH_CANDIDATE_FIELDS = PATCH_ADDED_FIELDS + PATCH_CLICKID_PROBE
 
 # Полный желаемый состав (порядок: base -> patch -> clickid). Имя VISIT_FIELDS
-# сохранено: на него опирается transform (build_canonical) и смоук-тесты.
-VISIT_FIELDS = VISIT_FIELDS_BASE + PATCH_ADDED_FIELDS + VISIT_FIELDS_CLICKID_PROBE
+# сохранено: на него опираются transform (build_canonical) и смоук-тесты. Это
+# ЖЕЛАЕМЫЙ набор; фактически принятый API набор — в manifest.available_fields.
+VISIT_FIELDS = VISIT_FIELDS_BASE + PATCH_CANDIDATE_FIELDS
 
-# Лесенка отката состава полей: пробуем самый полный, при 400 на состав
-# отбрасываем сначала пробные clickid, затем и lastSignDirectClickOrder.
-_FIELD_LADDER = [
-    VISIT_FIELDS,
-    VISIT_FIELDS_BASE + PATCH_ADDED_FIELDS,
-    [f for f in (VISIT_FIELDS_BASE + PATCH_ADDED_FIELDS)
-     if f != "ym:s:lastSignDirectClickOrder"],
-]
-
-# Состав довыгрузки (backfill): ключ склейки + только новые поля патча.
-# visitID нужен, чтобы transform склеил довыгруженные поля со старыми файлами.
-_BACKFILL_FIELDS = ["ym:s:visitID"] + PATCH_ADDED_FIELDS + VISIT_FIELDS_CLICKID_PROBE
-_BACKFILL_LADDER = [
-    _BACKFILL_FIELDS,
-    ["ym:s:visitID"] + PATCH_ADDED_FIELDS,
-]
+# Ключ склейки backfill со старым слоем — обязателен в любом backfill-наборе.
+BACKFILL_JOIN_KEY = "ym:s:visitID"
+BACKFILL_SUBDIR = "backfill"
 
 # Поллинг готовности logrequest.
 POLL_MAX_ATTEMPTS = 60
@@ -186,7 +187,7 @@ def extract(
     ``backfill``:
         None (по умолчанию) — авто: довыгрузка новых полей патча, если окно уже
             было выгружено ДО патча (см. _should_backfill); иначе полная выгрузка.
-        True  — принудительная довыгрузка только новых полей в visits_backfill_*.
+        True  — принудительная довыгрузка только новых полей в backfill/.
         False — принудительная полная выгрузка (перезапись слоя целиком).
     """
     import requests
@@ -228,13 +229,16 @@ def _run_full(
     out_dir = C.reset_dir(src_dir)
     log(f"{SOURCE}: окно {C.fmt(date_from)}..{C.fmt(date_to)}, счётчик {counter_id} (полная выгрузка)")
 
+    chunks = C.month_chunks(date_from, date_to)
+    accepted, dropped_reasons = _negotiate_fields(
+        session, counter_id, headers, chunks, VISIT_FIELDS_BASE, PATCH_CANDIDATE_FIELDS, log,
+    )
+    fields = VISIT_FIELDS_BASE + accepted
+
     total_rows = 0
     parts_written = 0
-    used_fields: list[str] = list(VISIT_FIELDS)
-    for chunk_from, chunk_to in C.month_chunks(date_from, date_to):
-        request_id, used_fields = _create_log_request(
-            session, counter_id, headers, chunk_from, chunk_to, ladder=_FIELD_LADDER,
-        )
+    for chunk_from, chunk_to in chunks:
+        request_id = _create_log_request(session, counter_id, headers, chunk_from, chunk_to, fields)
         log(f"{SOURCE}: чанк {C.fmt(chunk_from)}..{C.fmt(chunk_to)} -> logrequest {request_id}")
         info = _poll_until_ready(session, counter_id, headers, request_id, sleeper=sleeper)
 
@@ -247,19 +251,18 @@ def _run_full(
             _write_gz(out_dir / fname, text)
             parts_written += 1
 
-    dropped = [f for f in VISIT_FIELDS if f not in used_fields]
-    if dropped:
-        log(f"{SOURCE}: API не принял поля {dropped} — выгружены без них")
     manifest = _record_manifest(paths, date_from, date_to, total_rows, extra={
-        "fields": used_fields,
-        "available_fields": used_fields,
-        "dropped_fields": dropped,
-        "patch_fields": [f for f in (PATCH_ADDED_FIELDS + VISIT_FIELDS_CLICKID_PROBE)
-                         if f in used_fields],
+        "schema_version": SCHEMA_VERSION,
+        "fields": fields,
+        "available_fields": fields,
+        "dropped_fields": sorted(dropped_reasons),
+        "dropped_reasons": dropped_reasons,
+        "patch_fields": accepted,
         "patch_date": PATCH_DATE,
         "patch_backfill": False,
     })
-    log(f"{SOURCE}: готово — {parts_written} частей, {total_rows} визитов")
+    log(f"{SOURCE}: готово — {parts_written} частей, {total_rows} визитов; "
+        f"полей принято {len(fields)}, отклонено {len(dropped_reasons)}")
 
     return {
         "source": SOURCE,
@@ -269,7 +272,9 @@ def _run_full(
         "date_to": C.fmt(date_to),
         "canonical_tables": CANONICAL_TABLES,
         "patch_backfill": False,
-        "dropped_fields": dropped,
+        "available_fields": fields,
+        "dropped_fields": sorted(dropped_reasons),
+        "dropped_reasons": dropped_reasons,
         "manifest": manifest,
     }
 
@@ -279,18 +284,27 @@ def _run_backfill(
     session, counter_id, headers, paths, src_dir,
     date_from, date_to, *, sleeper, log,
 ) -> dict[str, Any]:
-    """Выгрузить ТОЛЬКО новые поля патча в visits_backfill_*, не трогая старьё."""
-    out_dir = Path(src_dir)
+    """Выгрузить ТОЛЬКО новые поля патча в metrika_logs/backfill/, не трогая старьё."""
+    out_dir = Path(src_dir) / BACKFILL_SUBDIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    log(f"{SOURCE}: окно {C.fmt(date_from)}..{C.fmt(date_to)} — довыгрузка новых полей "
-        f"(старые visits_* не трогаем, принцип неизменности слоя)")
+    log(f"{SOURCE}: окно {C.fmt(date_from)}..{C.fmt(date_to)} — довыгрузка новых полей в "
+        f"{BACKFILL_SUBDIR}/ (старые visits_* не трогаем, принцип неизменности слоя)")
+
+    chunks = C.month_chunks(date_from, date_to)
+    # Обязательные поля backfill: ТОЛЬКО ключ склейки; кандидаты — новые поля.
+    # Никаких метрик/несовместимых полей: только visitID + поля патча.
+    mandatory = [BACKFILL_JOIN_KEY]
+    accepted, dropped_reasons = _negotiate_fields(
+        session, counter_id, headers, chunks, mandatory, PATCH_CANDIDATE_FIELDS, log,
+    )
+    backfill_fields = mandatory + accepted
+    _assert_backfill_composition(backfill_fields)
 
     total_rows = 0
     parts_written = 0
-    used_fields: list[str] = list(_BACKFILL_FIELDS)
-    for chunk_from, chunk_to in C.month_chunks(date_from, date_to):
-        request_id, used_fields = _create_log_request(
-            session, counter_id, headers, chunk_from, chunk_to, ladder=_BACKFILL_LADDER,
+    for chunk_from, chunk_to in chunks:
+        request_id = _create_log_request(
+            session, counter_id, headers, chunk_from, chunk_to, backfill_fields,
         )
         log(f"{SOURCE}: backfill чанк {C.fmt(chunk_from)}..{C.fmt(chunk_to)} -> logrequest {request_id}")
         info = _poll_until_ready(session, counter_id, headers, request_id, sleeper=sleeper)
@@ -304,31 +318,59 @@ def _run_backfill(
             _write_gz(out_dir / fname, text)
             parts_written += 1
 
-    patch_fields = [f for f in used_fields if f != "ym:s:visitID"]
+    available = VISIT_FIELDS_BASE + accepted   # полный набор после склейки base+backfill
     manifest = _record_manifest(paths, date_from, date_to, total_rows, extra={
-        # Полный логический набор доступен после склейки base + backfill.
-        "fields": VISIT_FIELDS_BASE + PATCH_ADDED_FIELDS,
-        "patch_fields": patch_fields,
+        "schema_version": SCHEMA_VERSION,
+        "fields": available,
+        "available_fields": available,
+        "backfill_fields": backfill_fields,
+        "dropped_fields": sorted(dropped_reasons),
+        "dropped_reasons": dropped_reasons,
+        "patch_fields": accepted,
         "patch_date": PATCH_DATE,
         "patch_backfill": True,
-        "backfill_files_prefix": "visits_backfill_",
-        "note": ("новые поля патча довыгружены отдельными visits_backfill_* файлами; "
-                 "старые visits_* не изменялись (неизменность слоя raw). Склейка по "
-                 "ym:s:visitID — в transform."),
+        "backfill_dir": f"{SOURCE}/{BACKFILL_SUBDIR}",
+        "backfill_rows": total_rows,
+        "note": ("новые поля патча довыгружены в подкаталог backfill/ "
+                 "(visits_backfill_*), старые visits_* не изменялись (неизменность "
+                 "слоя raw). Склейка по ym:s:visitID — в transform."),
     })
-    log(f"{SOURCE}: довыгрузка готова — {parts_written} backfill-частей, {total_rows} строк")
+    log(f"{SOURCE}: довыгрузка готова — {parts_written} backfill-частей, {total_rows} строк; "
+        f"принято полей {len(accepted)}, отклонено {len(dropped_reasons)} {sorted(dropped_reasons)}")
 
     return {
         "source": SOURCE,
         "rows": total_rows,
+        "backfill_rows": total_rows,
         "parts": parts_written,
         "date_from": C.fmt(date_from),
         "date_to": C.fmt(date_to),
         "canonical_tables": CANONICAL_TABLES,
         "patch_backfill": True,
-        "patch_fields": patch_fields,
+        "patch_fields": accepted,
+        "backfill_fields": backfill_fields,
+        "available_fields": available,
+        "dropped_fields": sorted(dropped_reasons),
+        "dropped_reasons": dropped_reasons,
         "manifest": manifest,
     }
+
+
+def _assert_backfill_composition(backfill_fields: list[str]) -> None:
+    """Инвариант backfill-набора: обязателен ключ склейки, есть новые поля,
+    нет базовых не-ключевых полей и нет метрик (только ym:s:* атрибуты визита).
+    """
+    if BACKFILL_JOIN_KEY not in backfill_fields:
+        raise C.SourceUnavailable(SOURCE, f"backfill-набор без ключа склейки {BACKFILL_JOIN_KEY}")
+    new_fields = [f for f in backfill_fields if f != BACKFILL_JOIN_KEY]
+    if not new_fields:
+        raise C.SourceUnavailable(
+            SOURCE, "backfill: ни одно новое поле не поддержано API — довыгружать нечего")
+    # Никаких базовых полей (кроме ключа) и никаких метрик ym:s:*<...>: в backfill
+    # идут только новые поля-кандидаты патча.
+    stray = [f for f in new_fields if f not in PATCH_CANDIDATE_FIELDS]
+    if stray:
+        raise C.SourceUnavailable(SOURCE, f"backfill: посторонние поля в наборе: {stray}")
 
 
 def _should_backfill(
@@ -339,7 +381,7 @@ def _should_backfill(
 
     Явный ``flag`` (True/False) уважается. В авто-режиме (None) довыгрузка —
     когда то же окно уже выгружено ДО патча (в манифесте нет patch_date), а на
-    диске лежат старые visits_* без backfill.
+    диске лежат старые visits_* (верхнего уровня, не backfill).
     """
     if flag is not None:
         return flag
@@ -349,48 +391,144 @@ def _should_backfill(
         return False
     if existing.get("patch_date"):        # выгрузка уже патченная — полнота есть
         return False
-    src_dir = Path(src_dir)
-    old_files = [p for p in src_dir.glob("visits_*.csv.gz")
+    old_files = [p for p in Path(src_dir).glob("visits_*.csv.gz")
                  if not p.name.startswith("visits_backfill_")]
     return bool(old_files)
 
 
-# ── Шаги Logs API ──────────────────────────────────────────────────────────
-def _create_log_request(
-    session, counter_id, headers, date_from, date_to, *, ladder,
-) -> tuple[Any, list[str]]:
-    """Создать logrequest, согласуя состав полей «лесенкой».
+# ── Согласование состава полей (logrequests/evaluate, read-only) ────────────
+def _negotiate_fields(
+    session, counter_id, headers, chunks, mandatory, candidates, log,
+) -> tuple[list[str], dict[str, str]]:
+    """Определить поддерживаемый API поднабор ``candidates`` (поверх ``mandatory``).
 
-    Пробуем составы из ``ladder`` по очереди; при 400 (Logs API не принял состав
-    полей) переходим к более короткому. Возвращает (request_id, принятые поля).
+    Через logrequests/evaluate (джоба НЕ создаётся). Если полный состав принят —
+    возвращаем все кандидаты. Иначе бинарным делением ИЗОЛИРУЕМ неподдерживаемые
+    поля и возвращаем (принятые, {поле: причина_отклонения}). Каждый отклонённый
+    набор логируется безопасно (без токена/заголовков).
     """
-    last_resp = None
-    for fields in ladder:
-        params = {
-            "date1": C.fmt(date_from),
-            "date2": C.fmt(date_to),
-            "source": "visits",
-            "fields": ",".join(fields),
-        }
-        resp = C.http_request(
-            session, "POST", f"{API_BASE}/{counter_id}/logrequests",
-            source=SOURCE, headers=headers, params=params, timeout=60,
-        )
-        if getattr(resp, "status_code", None) == 400:
-            # Состав полей не принят (напр. пробные yclid/gclid) — пробуем короче.
-            last_resp = resp
-            continue
-        C.ensure_ok(resp, SOURCE, "create logrequest")
-        log_request = resp.json().get("log_request") or {}
-        request_id = log_request.get("request_id")
-        if request_id is None:
-            raise C.SourceUnavailable(SOURCE, "Logs API не вернул request_id")
-        return request_id, list(fields)
+    candidates = list(candidates)
+    if not chunks:
+        return candidates, {}
+    # Евалюируем на маленьком окне (первый месяц) — валидность полей от окна не
+    # зависит, а объём заведомо мал (не спутаем 400-«поле» с отказом по размеру).
+    d1, d2 = C.fmt(chunks[0][0]), C.fmt(chunks[0][1])
 
-    # Все составы отклонены (400 на каждый) — падаем внятно.
-    if last_resp is not None:
-        C.ensure_ok(last_resp, SOURCE, "create logrequest (все составы полей отклонены)")
-    raise C.SourceUnavailable(SOURCE, "Logs API отклонил все составы полей")
+    ok, err = _evaluate_fields(session, counter_id, headers, d1, d2, list(mandatory) + candidates)
+    if ok:
+        return candidates, {}
+
+    _log_rejected(log, candidates, err)
+    dropped = _find_bad_fields(session, counter_id, headers, d1, d2, list(mandatory), candidates, log)
+    accepted = [f for f in candidates if f not in dropped]
+    return accepted, dropped
+
+
+def _find_bad_fields(
+    session, counter_id, headers, d1, d2, mandatory, group, log,
+) -> dict[str, str]:
+    """Бинарное деление: вернуть {неподдерживаемое поле: причина} внутри ``group``."""
+    ok, err = _evaluate_fields(session, counter_id, headers, d1, d2, mandatory + list(group))
+    if ok:
+        return {}
+    _log_rejected(log, group, err)
+    if len(group) == 1:
+        return {group[0]: _reason_text(err)}
+    mid = len(group) // 2
+    bad: dict[str, str] = {}
+    bad.update(_find_bad_fields(session, counter_id, headers, d1, d2, mandatory, group[:mid], log))
+    bad.update(_find_bad_fields(session, counter_id, headers, d1, d2, mandatory, group[mid:], log))
+    return bad
+
+
+def _evaluate_fields(session, counter_id, headers, d1, d2, fields) -> tuple[bool, dict[str, Any] | None]:
+    """logrequests/evaluate: (ok, err). ok=True — состав полей валиден (джоба НЕ
+    создаётся). 400 -> ok=False + безопасно извлечённая ошибка API.
+    """
+    resp = C.http_request(
+        session, "GET", f"{API_BASE}/{counter_id}/logrequests/evaluate",
+        source=SOURCE, headers=headers,
+        params={"date1": d1, "date2": d2, "source": "visits", "fields": ",".join(fields)},
+        timeout=30,
+    )
+    status = getattr(resp, "status_code", None)
+    if status == 200:
+        return True, None
+    return False, _safe_error(resp, status)
+
+
+def _safe_error(resp: Any, status: Any) -> dict[str, Any]:
+    """Безопасно извлечь тело ошибки API: status/code/message/errors[].
+
+    Ни токен, ни заголовок Authorization сюда не попадают (берём только тело
+    ответа, которое их не содержит).
+    """
+    info: dict[str, Any] = {"status": status}
+    try:
+        payload = resp.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        info["code"] = payload.get("code")
+        if payload.get("message"):
+            info["message"] = payload.get("message")
+        errs = payload.get("errors")
+        if isinstance(errs, list):
+            info["errors"] = [
+                {"error_type": e.get("error_type"), "message": e.get("message")}
+                for e in errs if isinstance(e, dict)
+            ]
+    return info
+
+
+def _reason_text(err: dict[str, Any] | None) -> str:
+    """Читаемая причина отклонения одного поля из тела ошибки API."""
+    err = err or {}
+    errs = err.get("errors") or []
+    if errs and errs[0].get("message"):
+        return str(errs[0]["message"])
+    if err.get("message"):
+        return str(err["message"])
+    return f"HTTP {err.get('status')}"
+
+
+def _log_rejected(log, fields, err: dict[str, Any] | None) -> None:
+    """Безопасно залогировать отклонённый набор полей (без токена/заголовков)."""
+    err = err or {}
+    errs = err.get("errors") or []
+    detail = "; ".join(
+        f"{e.get('error_type')}: {e.get('message')}" for e in errs
+    ) or err.get("message") or ""
+    log(f"{SOURCE}: evaluate отклонил состав {list(fields)} — "
+        f"HTTP {err.get('status')} code={err.get('code')} {detail}".rstrip())
+
+
+# ── Шаги Logs API ──────────────────────────────────────────────────────────
+def _create_log_request(session, counter_id, headers, date_from, date_to, fields) -> Any:
+    """Создать logrequest на выгрузку визитов принятым составом полей.
+
+    Состав уже согласован через evaluate; здесь 400 — нештатная ситуация,
+    падаем внятно (безопасно, без токена).
+    """
+    params = {
+        "date1": C.fmt(date_from),
+        "date2": C.fmt(date_to),
+        "source": "visits",
+        "fields": ",".join(fields),
+    }
+    resp = C.http_request(
+        session, "POST", f"{API_BASE}/{counter_id}/logrequests",
+        source=SOURCE, headers=headers, params=params, timeout=60,
+    )
+    if getattr(resp, "status_code", None) == 400:
+        err = _safe_error(resp, 400)
+        raise C.SourceUnavailable(SOURCE, f"Logs API отклонил создание запроса: {_reason_text(err)}")
+    C.ensure_ok(resp, SOURCE, "create logrequest")
+    log_request = resp.json().get("log_request") or {}
+    request_id = log_request.get("request_id")
+    if request_id is None:
+        raise C.SourceUnavailable(SOURCE, "Logs API не вернул request_id")
+    return request_id
 
 
 def _poll_until_ready(session, counter_id, headers, request_id, *, sleeper) -> dict[str, Any]:

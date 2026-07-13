@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.extract.metrika_logs import VISIT_FIELDS  # noqa: E402
+from src.extract.metrika_logs import VISIT_FIELDS, VISIT_FIELDS_BASE  # noqa: E402
 from src.pipeline import manifest as manifest_mod  # noqa: E402
 from src.transform import build_canonical as bc  # noqa: E402
 
@@ -294,12 +294,12 @@ def _write_metrika_logs_fixture(raw_dir: Path) -> None:
             "ym:s:isNewUser": "1",
             "ym:s:pageViews": "3",
             "ym:s:visitDuration": "120",
-            # Поля патча 0.3.0 — transform их пока не читает, но выгрузка их несёт.
-            "ym:s:isRobot": "0",
+            # Поля патча — transform их пока не читает, но выгрузка их несёт.
             "ym:s:lastTrafficSource": source,
             "ym:s:browser": "chrome",
             "ym:s:operatingSystem": "android",
-            "ym:s:screenResolution": "1080x2400",
+            "ym:s:screenWidth": "1080",
+            "ym:s:screenHeight": "2400",
             "ym:s:regionCountry": "225",
             "ym:s:regionCity": "213",
         }
@@ -396,6 +396,178 @@ def test_build_writes_only_tables_with_raw_source(tmp_path):
     canonical_manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
     assert set(canonical_manifest["tables"]) == set(built)
     assert canonical_manifest["flags"]["utm_uncertain"] is False
+
+
+# ═════════════════════ build_visits: склейка base + backfill ═══════════════
+_BACKFILL_HEADER = [
+    "ym:s:visitID", "ym:s:lastTrafficSource", "ym:s:browser", "ym:s:operatingSystem",
+    "ym:s:screenWidth", "ym:s:screenHeight", "ym:s:regionCountry", "ym:s:regionCity",
+]
+
+
+def _write_base_visits(metrika_dir: Path, visits: list[dict]) -> None:
+    """Базовый слой visits_*.csv.gz — ТОЛЬКО базовые поля (без полей патча)."""
+    metrika_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["\t".join(VISIT_FIELDS_BASE)]
+    for v in visits:
+        cells = {f: "" for f in VISIT_FIELDS_BASE}
+        cells["ym:s:visitID"] = v["id"]
+        cells["ym:s:clientID"] = v.get("cid", "c")
+        cells["ym:s:dateTime"] = v["dt"]
+        cells["ym:s:lastsignTrafficSource"] = v.get("src", "direct")
+        cells["ym:s:deviceCategory"] = v.get("dev", "2")
+        cells["ym:s:startURL"] = v.get("url", "https://site.ru/")
+        cells["ym:s:goalsID"] = v.get("goals", "")
+        cells["ym:s:isNewUser"] = v.get("new", "0")
+        cells["ym:s:pageViews"] = v.get("pv", "1")
+        cells["ym:s:visitDuration"] = v.get("dur", "10")
+        lines.append("\t".join(cells[f] for f in VISIT_FIELDS_BASE))
+    with gzip.open(metrika_dir / "visits_2026-06-01_2026-06-30_part000.csv.gz",
+                   "wt", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def _write_backfill(metrika_dir: Path, rows: list[dict],
+                    fname: str = "visits_backfill_2026-06-01_2026-06-30_part000.csv.gz") -> None:
+    """Backfill-слой в подкаталоге backfill/ (visits_backfill_*.csv.gz)."""
+    bf_dir = metrika_dir / "backfill"
+    bf_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["\t".join(_BACKFILL_HEADER)]
+    for r in rows:
+        lines.append("\t".join(str(r.get(h, "")) for h in _BACKFILL_HEADER))
+    with gzip.open(bf_dir / fname, "wt", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def test_build_visits_base_plus_backfill_integration(tmp_path):
+    """3 базовых визита + 3 backfill-строки (с дублем ключа) -> 3 строки, поля заполнены."""
+    metrika = tmp_path / "data" / "raw" / "metrika_logs"
+    _write_base_visits(metrika, [
+        {"id": "v1", "dt": "2026-06-01 10:00:00", "src": "ad"},
+        {"id": "v2", "dt": "2026-06-02 10:00:00", "src": "direct"},
+        {"id": "v3", "dt": "2026-06-03 10:00:00", "src": "search_engine"},  # без backfill
+    ])
+    _write_backfill(metrika, [
+        {"ym:s:visitID": "v1", "ym:s:lastTrafficSource": "ad", "ym:s:browser": "chrome",
+         "ym:s:operatingSystem": "android", "ym:s:screenWidth": "360", "ym:s:screenHeight": "780",
+         "ym:s:regionCountry": "Russia", "ym:s:regionCity": "Vladivostok"},
+        {"ym:s:visitID": "v2", "ym:s:lastTrafficSource": "internal", "ym:s:browser": "safari",
+         "ym:s:operatingSystem": "ios", "ym:s:screenWidth": "390", "ym:s:screenHeight": "844",
+         "ym:s:regionCountry": "Russia", "ym:s:regionCity": "Moscow"},
+        # Дубль ключа v2 -> детерминированно побеждает ПОСЛЕДНЯЯ строка.
+        {"ym:s:visitID": "v2", "ym:s:lastTrafficSource": "organic", "ym:s:browser": "firefox",
+         "ym:s:operatingSystem": "windows", "ym:s:screenWidth": "1920", "ym:s:screenHeight": "1080",
+         "ym:s:regionCountry": "Russia", "ym:s:regionCity": "Kazan"},
+    ])
+
+    df, _utm, stats = bc.build_visits(metrika, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+
+    # Итог 3 строки: дубль ключа НЕ размножает, визит без backfill сохранён.
+    assert len(df) == 3
+    assert set(df["visit_id"]) == {"v1", "v2", "v3"}
+
+    v1 = df[df.visit_id == "v1"].iloc[0]
+    assert v1["last_traffic_source_naive"] == "ad"
+    assert v1["browser"] == "chrome" and v1["os"] == "android"
+    assert v1["screen_width"] == 360 and v1["screen_height"] == 780
+    assert v1["screen_resolution"] == "360x780"
+    assert v1["region_country"] == "Russia" and v1["region_city"] == "Vladivostok"
+    # source_group (last-significant) НЕ трогается наивной моделью.
+    assert v1["source_group"] == "ad"
+
+    # v2: детерминированный дедуп -> победила последняя backfill-строка.
+    v2 = df[df.visit_id == "v2"].iloc[0]
+    assert v2["last_traffic_source_naive"] == "organic"
+    assert v2["screen_resolution"] == "1920x1080"
+    assert v2["source_group"] == "direct"   # lastsign нетронут
+
+    # v3 без backfill: новые поля null, сам визит на месте.
+    v3 = df[df.visit_id == "v3"].iloc[0]
+    assert pd.isna(v3["last_traffic_source_naive"])
+    assert pd.isna(v3["screen_width"]) and pd.isna(v3["screen_resolution"])
+    assert v3["source_group"] == "organic"
+
+    # is_robot присутствует, но НЕ заполнен (API не отдаёт) — нигде не false.
+    assert df["is_robot"].isna().all()
+
+    assert stats["backfill_rows"] == 3
+    assert stats["backfill_dedup_dropped"] == 1
+    assert stats["backfill_matched"] == 2
+    assert stats["backfill_unmatched"] == 0
+    assert stats["is_robot_available"] is False
+
+
+def test_build_visits_unmatched_backfill_recorded(tmp_path):
+    """Backfill-ключ без базового визита не добавляет строк, но фиксируется в статистике."""
+    metrika = tmp_path / "data" / "raw" / "metrika_logs"
+    _write_base_visits(metrika, [{"id": "v1", "dt": "2026-06-01 10:00:00", "src": "ad"}])
+    _write_backfill(metrika, [
+        {"ym:s:visitID": "v1", "ym:s:lastTrafficSource": "ad", "ym:s:browser": "chrome"},
+        {"ym:s:visitID": "ghost", "ym:s:lastTrafficSource": "direct"},  # нет в базовых
+    ])
+
+    df, _utm, stats = bc.build_visits(metrika, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+
+    assert len(df) == 1 and set(df["visit_id"]) == {"v1"}
+    assert stats["backfill_matched"] == 1
+    assert stats["backfill_unmatched"] == 1
+
+
+def test_build_visits_without_backfill_keeps_base_null_fields(tmp_path):
+    """Нет backfill/ -> новые колонки существуют и null, базовый визит сохранён."""
+    metrika = tmp_path / "data" / "raw" / "metrika_logs"
+    _write_base_visits(metrika, [{"id": "v1", "dt": "2026-06-01 10:00:00", "src": "ad"}])
+
+    df, _utm, stats = bc.build_visits(metrika, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+
+    assert len(df) == 1
+    for col in ("last_traffic_source_naive", "browser", "os", "screen_width",
+                "screen_height", "screen_resolution", "region_country", "region_city",
+                "is_robot"):
+        assert col in df.columns
+        assert pd.isna(df.iloc[0][col])
+    assert stats["backfill_rows"] == 0 and stats["backfill_unmatched"] == 0
+
+
+def test_build_visits_parquet_dtypes_and_original_columns(tmp_path):
+    """Сквозной build(): screen_* — int64 nullable, is_robot — bool nullable, 16 базовых на месте."""
+    import pyarrow.parquet as pq
+
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    metrika = paths.raw / "metrika_logs"
+    _write_base_visits(metrika, [{"id": "v1", "dt": "2026-06-01 10:00:00", "src": "ad"}])
+    _write_backfill(metrika, [
+        {"ym:s:visitID": "v1", "ym:s:lastTrafficSource": "ad",
+         "ym:s:screenWidth": "360", "ym:s:screenHeight": "780"},
+    ])
+    manifest_mod.update_source(
+        paths.raw, "metrika_logs", date_from="2026-06-01", date_to="2026-06-30",
+        rows=1, script_version="test", canonical_tables=["visits"],
+    )
+
+    built = bc.build(paths, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+    assert "visits" in built
+
+    schema = pq.read_schema(paths.canonical / "visits.parquet")
+    assert str(schema.field("screen_width").type) == "int64"
+    assert str(schema.field("screen_height").type) == "int64"
+    assert str(schema.field("is_robot").type) == "bool"
+
+    visits = pd.read_parquet(paths.canonical / "visits.parquet")
+    assert visits.iloc[0]["screen_width"] == 360
+    assert visits.iloc[0]["last_traffic_source_naive"] == "ad"
+    assert visits["is_robot"].isna().all()
+
+    # Исходные 16 колонок и их наличие не изменены.
+    for col in ("visit_id", "client_id", "dt", "date", "device", "source_group",
+                "utm_source_raw", "source_final", "is_ad", "entry_page", "form_open",
+                "form_submit", "call_click", "messenger_click", "form_submit_count",
+                "is_new_user"):
+        assert col in visits.columns
+
+    canonical_manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
+    assert canonical_manifest["flags"]["metrika_backfill"]["is_robot_available"] is False
 
 
 def test_build_costs_only_from_manual_fixtures_without_direct(tmp_path):
