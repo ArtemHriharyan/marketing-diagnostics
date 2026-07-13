@@ -1,9 +1,16 @@
 """Экстрактор: Яндекс.Вебмастер API v4 (поисковые запросы, позиции, CTR).
 
+Активен, когда config.sources.webmaster.mode == "api". Сейчас основной путь —
+ручной (webmaster_manual.py, mode: manual): API-доступа к Вебмастеру у клиента
+нет. Переключение mode: manual <-> api не должно требовать правок дальше по
+пайплайну: обе реализации кладут data/raw/webmaster/search_queries_popular.json
+в одном контракте, который читает transform.build_seo_queries_webmaster.
+
 Контракт:
     Читает   — config.sources.webmaster (host_id), WEBMASTER_TOKEN, окно дат.
     Пишет    — data/raw/webmaster/ (популярные запросы + история показов/кликов,
-               raw JSON) + manifest.json (canonical_tables: [seo_queries]).
+               raw JSON) + manifest.json (canonical_tables: [seo_queries],
+               source_mode: api).
     Деградация — опционален; вместе с GSC формирует seo_queries. Без обоих
                  проверки блока 5 с requires=[seo_queries] уходят в degradation.
     LLM      — не используется.
@@ -14,6 +21,11 @@
        AVG_SHOW_POSITION / AVG_CLICK_POSITION), постранично.
     2. search_queries_history.json — временной ряд суммарных показов и кликов
        (all/history). Тянем максимально длинное окно, какое отдаёт API.
+
+СТРУКТУРНОЕ ОГРАНИЧЕНИЕ (то же, что в ручном экспорте):
+    Отчёт «Популярные запросы» отдаёт только query-уровень (четыре индикатора
+    ниже) БЕЗ разбивки по page/device — это ограничение метода, а не режима.
+    То же ограничение зафиксировано в webmaster_manual.py.
 
 ЧЕСТНОСТЬ ПРО ГЛУБИНУ ИСТОРИИ:
     API Вебмастера отдаёт историю мельче, чем веб-интерфейс. Если API вернул
@@ -162,6 +174,7 @@ def extract(
         "date_from": C.fmt(date_from),
         "date_to": C.fmt(date_to),
         "notes": notes,
+        "source_mode": "api",
         "canonical_tables": CANONICAL_TABLES,
         "manifest": manifest,
     }
@@ -268,5 +281,6 @@ def _record_manifest(paths, date_from, date_to, rows, notes) -> dict[str, Any]:
         date_from=C.fmt(date_from), date_to=C.fmt(date_to),
         rows=rows, script_version=SCRIPT_VERSION,
         canonical_tables=CANONICAL_TABLES,
-        extra={"notes": notes},
+        extra={"notes": notes, "source_mode": "api",
+               "page_device_breakdown": False},
     )

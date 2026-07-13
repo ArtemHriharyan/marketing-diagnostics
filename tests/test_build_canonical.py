@@ -294,8 +294,17 @@ def _write_metrika_logs_fixture(raw_dir: Path) -> None:
             "ym:s:isNewUser": "1",
             "ym:s:pageViews": "3",
             "ym:s:visitDuration": "120",
+            # Поля патча 0.3.0 — transform их пока не читает, но выгрузка их несёт.
+            "ym:s:isRobot": "0",
+            "ym:s:lastTrafficSource": source,
+            "ym:s:browser": "chrome",
+            "ym:s:operatingSystem": "android",
+            "ym:s:screenResolution": "1080x2400",
+            "ym:s:regionCountry": "225",
+            "ym:s:regionCity": "213",
         }
-        return "\t".join(values[f] for f in VISIT_FIELDS)
+        # Недостающие (напр. пробные yclid/gclid) -> пустая ячейка.
+        return "\t".join(values.get(f, "") for f in VISIT_FIELDS)
 
     lines = [header]
     # v1 дублируется дважды -> должна остаться версия с более поздним dateTime.

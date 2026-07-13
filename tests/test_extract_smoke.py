@@ -24,7 +24,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.extract import _common as C  # noqa: E402
 from src.extract import direct, metrika_logs, metrika_reports  # noqa: E402
-from src.extract import crm_import, gsc, webmaster, wordstat  # noqa: E402
+from src.extract import crm_import, wordstat  # noqa: E402
+from src.extract import gsc_api, gsc_manual  # noqa: E402
+from src.extract import webmaster_api, webmaster_manual  # noqa: E402
+from src.extract import crux  # noqa: E402
 from src.pipeline import manifest as manifest_mod  # noqa: E402
 
 
@@ -70,15 +73,17 @@ def _contains(*needles):
 
 
 class Paths:
-    """Мини-дублёр ClientPaths: экстрактору нужен только .raw."""
+    """Мини-дублёр ClientPaths: экстрактору нужны .raw и .root (ручные экспорты)."""
 
-    def __init__(self, raw: Path):
+    def __init__(self, raw: Path, root: Path | None = None):
         self.raw = raw
+        # raw = <root>/data/raw -> root по умолчанию на два уровня выше.
+        self.root = root if root is not None else raw.parent.parent
 
 
 @pytest.fixture
 def paths(tmp_path):
-    return Paths(tmp_path / "data" / "raw")
+    return Paths(tmp_path / "data" / "raw", root=tmp_path)
 
 
 CONFIG_METRIKA = {
@@ -299,49 +304,166 @@ def _query_tsv():
             "купить окна\t1\t11\t2000000\t3\t1\n")
 
 
-def test_direct_writes_reports_strategies_and_manifest(paths):
-    """Оба TSV-отчёта + стратегии пишутся; manifest фиксирует cost_basis."""
-    strategies = {"result": {"Campaigns": [
-        {"Id": 1, "Name": "Поиск", "TextCampaign": {
-            "BiddingStrategy": {"Search": {"BiddingStrategyType": "HIGHEST_POSITION"}}}}]}}
+def _placement_tsv():
+    return ("Placement\tAdNetworkType\tCampaignId\tCost\tClicks\tConversions\n"
+            "avito.ru\tAD_NETWORK\t1\t1000000\t2\t0\n")
 
-    # Первый вызов /reports -> 202 (отчёт готовится), второй -> 200 с TSV-данными.
-    class ReportsResponder:
-        def __init__(self):
-            self.seen = 0
 
-        def __call__(self, n):
-            # n — индекс вызова этого маршрута; отдаём 202 на первый, затем 200.
-            # Тип отчёта берём из тела последнего запроса.
-            method, url, kwargs = session.calls[-1]
-            rt = kwargs["json"]["params"]["ReportType"]
-            body = _campaign_tsv() if rt == "CAMPAIGN_PERFORMANCE_REPORT" else _query_tsv()
-            if n == 0:
-                return FakeResponse(status_code=202, headers={"retryIn": "0"})
-            return FakeResponse(status_code=200, text=body)
+def _campaign_tsv_with_lost_is():
+    # Кампания с показами>0 и непустым LostImpressionShare (для A07).
+    return ("CampaignId\tCampaignName\tCost\tClicks\tImpressions\tDate"
+            "\tWeightedImpressions\tLostImpressionShare\n"
+            "1\tПоиск\t5000000\t10\t200\t2026-06-01\t180\t0.35\n")
 
-    routes = [
-        (_contains("/reports"), ReportsResponder()),
-        (_contains("/campaigns"), FakeResponse(json_data=strategies)),
+
+def _direct_routes(box, *, campaign_tsv=None, strategies=None, feeds=None,
+                   keywords=None):
+    """Полный набор HTTP-моков Директа (reports + все json-эндпоинты v5).
+
+    ``box["session"]`` заполняется вызывающим кодом после создания FakeSession —
+    ReportsResponder читает из него тело последнего запроса, чтобы вернуть TSV
+    нужного отчёта.
+    """
+    campaign_tsv = campaign_tsv or _campaign_tsv()
+    if strategies is None:
+        strategies = [{"Id": 1, "Name": "Поиск", "TextCampaign": {
+            "BiddingStrategy": {"Search": {"BiddingStrategyType": "HIGHEST_POSITION"}}}}]
+    feeds = [] if feeds is None else feeds
+    if keywords is None:
+        keywords = [{"Id": 501, "CampaignId": 1, "AdGroupId": 11, "Keyword": "аренда авто"}]
+
+    def reports(n):
+        _m, _u, kwargs = box["session"].calls[-1]
+        rt = kwargs["json"]["params"]["ReportType"]
+        if rt == "CAMPAIGN_PERFORMANCE_REPORT":
+            body = campaign_tsv
+        elif rt == "SEARCH_QUERY_PERFORMANCE_REPORT":
+            body = _query_tsv()
+        else:  # CUSTOM_REPORT -> площадки
+            body = _placement_tsv()
+        if n == 0:
+            return FakeResponse(status_code=202, headers={"retryIn": "0"})
+        return FakeResponse(status_code=200, text=body)
+
+    return [
+        (_contains("/reports"), reports),
+        (_contains("/campaigns"), FakeResponse(json_data={"result": {"Campaigns": strategies}})),
+        (_contains("/adgroups"), FakeResponse(json_data={"result": {"AdGroups": [
+            {"Id": 11, "CampaignId": 1, "Name": "grp", "RegionIds": [213]}]}})),
+        (_contains("/bidmodifiers"), FakeResponse(json_data={"result": {"BidModifiers": []}})),
+        (_contains("/adextensions"), FakeResponse(json_data={"result": {"AdExtensions": []}})),
+        (_contains("/ads"), FakeResponse(json_data={"result": {"Ads": [
+            {"Id": 101, "CampaignId": 1, "AdGroupId": 11,
+             "TextAd": {"Title": "Аренда", "Text": "Погнали"}}]}})),
+        (_contains("/keywords"), FakeResponse(json_data={"result": {"Keywords": keywords}})),
+        (_contains("/feeds"), FakeResponse(json_data={"result": {"Feeds": feeds}})),
     ]
-    session = FakeSession(routes)
+
+
+def test_direct_writes_reports_strategies_and_manifest(paths):
+    """Все отчёты Директа пишутся; manifest фиксирует cost_basis и приёмочные флаги."""
+    box = {}
+    session = FakeSession(_direct_routes(box))
+    box["session"] = session
 
     result = direct.extract(CONFIG_DIRECT, ENV, paths, session=session, sleeper=NO_SLEEP)
 
     src_dir = paths.raw / "direct"
     assert (src_dir / "campaign_performance.tsv").read_text("utf-8").startswith("CampaignId")
     assert (src_dir / "search_query_performance.tsv").exists()
+    assert (src_dir / "placements" / "placement_performance.tsv").exists()
     strat = json.loads((src_dir / "campaign_strategies.json").read_text("utf-8"))
     assert strat[0]["Id"] == 1
+    # Новые отчёты патча.
+    targeting = json.loads((src_dir / "campaign_targeting.json").read_text("utf-8"))
+    assert targeting["ad_groups"][0]["RegionIds"] == [213]
+    ad_texts = json.loads((src_dir / "ad_texts.json").read_text("utf-8"))
+    assert ad_texts["ads"][0]["Id"] == 101
+    assert (src_dir / "keywords.parquet").exists()
+    # Фида нет -> файл не создаётся.
+    assert not (src_dir / "product_feed.parquet").exists()
 
     assert result["campaign_rows"] == 2 and result["query_rows"] == 1
+    assert result["placement_rows"] == 1 and result["keyword_rows"] == 1
     assert result["cost_basis"] == "net_no_vat"
+    assert result["feed_used"] is False
 
     manifest = manifest_mod.load_manifest(paths.raw)
     entry = manifest["sources"]["direct"]
     assert entry["cost_basis"] == "net_no_vat"
     assert entry["cost_micros_per_rub"] == 1_000_000
     assert entry["canonical_tables"] == ["costs", "direct_queries"]
+    # Приёмочные флаги (у фикстуры базового отчёта нет LostImpressionShare и State).
+    assert entry["campaign_report_has_lost_impression_share"] is False
+    assert entry["archived_campaigns_retrievable"] is False
+    assert entry["feed_used"] is False
+
+
+def test_direct_lost_impression_share_flag_true(paths):
+    """Есть непустой LostImpressionShare у кампании с показами>0 -> флаг true (A07)."""
+    box = {}
+    session = FakeSession(_direct_routes(box, campaign_tsv=_campaign_tsv_with_lost_is()))
+    box["session"] = session
+
+    result = direct.extract(CONFIG_DIRECT, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    assert result["campaign_report_has_lost_impression_share"] is True
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["direct"]
+    assert entry["campaign_report_has_lost_impression_share"] is True
+
+
+def test_direct_archived_campaigns_retrievable_flag_true(paths):
+    """campaigns.get вернул ARCHIVED-кампанию -> archived_campaigns_retrievable=true (D08)."""
+    strategies = [
+        {"Id": 1, "Name": "Поиск", "State": "ON", "TextCampaign": {
+            "BiddingStrategy": {"Search": {"BiddingStrategyType": "HIGHEST_POSITION"}}}},
+        {"Id": 2, "Name": "Старая", "State": "ARCHIVED", "TextCampaign": {
+            "BiddingStrategy": {"Search": {"BiddingStrategyType": "AVERAGE_CPA"}}}},
+    ]
+    box = {}
+    session = FakeSession(_direct_routes(box, strategies=strategies))
+    box["session"] = session
+
+    result = direct.extract(CONFIG_DIRECT, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    assert result["archived_campaigns_retrievable"] is True
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["direct"]
+    assert entry["archived_campaigns_retrievable"] is True
+
+
+def test_direct_feed_used_writes_parquet(paths):
+    """Есть товарный фид -> product_feed.parquet + manifest.feed_used=true (A25)."""
+    feeds = [{"Id": 77, "Name": "Каталог", "BusinessType": "RETAIL",
+              "UrlFeedParameters": {"Url": "https://pognali.rent/feed.yml"},
+              "UpdateStatus": {"LastUpdate": "2026-06-27T03:00:00Z"}}]
+    box = {}
+    session = FakeSession(_direct_routes(box, feeds=feeds))
+    box["session"] = session
+
+    result = direct.extract(CONFIG_DIRECT, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    assert result["feed_used"] is True
+    assert (paths.raw / "direct" / "product_feed.parquet").exists()
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["direct"]
+    assert entry["feed_used"] is True
+
+
+def test_direct_keyword_match_type_classification():
+    """Тип соответствия ключевой фразы выводится по операторам Директа."""
+    assert direct._keyword_match_type("аренда авто") == "broad"
+    assert direct._keyword_match_type('"аренда авто"') == "exact"
+    assert direct._keyword_match_type("[аренда авто]") == "exact"
+    assert direct._keyword_match_type("!аренда +авто") == "exact"
+    assert direct._keyword_match_type("") == "unknown"
+
+
+def test_direct_has_lost_impression_share_helper():
+    """_has_lost_impression_share: непустое значение у строки с Impressions>0."""
+    assert direct._has_lost_impression_share(_campaign_tsv_with_lost_is(), True) is True
+    # Поля не запрашивались (API не принял) -> всегда false.
+    assert direct._has_lost_impression_share(_campaign_tsv_with_lost_is(), False) is False
+    # Колонки нет в базовом отчёте -> false.
+    assert direct._has_lost_impression_share(_campaign_tsv(), True) is False
 
 
 def test_direct_dead_token_raises(paths):
@@ -457,7 +579,7 @@ def test_month_chunks_splits_by_calendar_month():
     ]
 
 
-# ── gsc ──────────────────────────────────────────────────────────────────────
+# ── gsc_api (mode: api) ──────────────────────────────────────────────────────
 CONFIG_GSC = {
     "sources": {"gsc": {"enabled": True, "site_url": "https://pognali.rent/",
                         "raw_format": "csv"}},
@@ -474,7 +596,7 @@ def test_gsc_writes_monthly_files_and_manifest(paths):
                FakeResponse(json_data={"rows": [row]}))]
     session = FakeSession(routes)
 
-    result = gsc.extract(CONFIG_GSC, ENV_GSC, paths,
+    result = gsc_api.extract(CONFIG_GSC, ENV_GSC, paths,
                          session=session, access_token="fake-token", sleeper=NO_SLEEP)
 
     src_dir = paths.raw / "gsc"
@@ -492,7 +614,7 @@ def test_gsc_writes_monthly_files_and_manifest(paths):
 def test_gsc_paginates_by_start_row(paths):
     """Полная страница (ROW_LIMIT) -> тянем следующую по startRow, затем стоп."""
     full_page = [{"keys": ["q", "u", "MOBILE"], "clicks": 1, "impressions": 2,
-                  "ctr": 0.5, "position": 1.0}] * gsc.ROW_LIMIT
+                  "ctr": 0.5, "position": 1.0}] * gsc_api.ROW_LIMIT
 
     def responder(n):
         # Первый вызов на месяц — полная страница, второй — «добивка» из 1 строки.
@@ -501,23 +623,23 @@ def test_gsc_paginates_by_start_row(paths):
     session = FakeSession([(_contains("searchAnalytics/query"), responder)])
     cfg = {**CONFIG_GSC, "data_window": {"date_from": "2026-06-01", "date_to": "2026-06-30"}}
 
-    result = gsc.extract(cfg, ENV_GSC, paths,
+    result = gsc_api.extract(cfg, ENV_GSC, paths,
                          session=session, access_token="fake-token", sleeper=NO_SLEEP)
     # Один месяц: страница полная -> вторая страница -> стоп. Два запроса.
     assert len(session.calls) == 2
-    assert result["rows"] == gsc.ROW_LIMIT + 1
+    assert result["rows"] == gsc_api.ROW_LIMIT + 1
 
 
 def test_gsc_dead_token_raises(paths):
     routes = [(lambda m, u: True, FakeResponse(status_code=401))]
     session = FakeSession(routes)
     with pytest.raises(C.AuthError) as exc:
-        gsc.extract(CONFIG_GSC, ENV_GSC, paths,
+        gsc_api.extract(CONFIG_GSC, ENV_GSC, paths,
                     session=session, access_token="fake-token", sleeper=NO_SLEEP)
     assert exc.value.exit_code == C.EXIT_SOURCE_UNAVAILABLE
 
 
-# ── webmaster ────────────────────────────────────────────────────────────────
+# ── webmaster_api (mode: api) ────────────────────────────────────────────────
 CONFIG_WM = {
     "sources": {"webmaster": {"enabled": True, "host_id": "https:pognali.rent:443"}},
     "data_window": {"date_from": "2026-05-01", "date_to": "2026-06-30"},
@@ -542,7 +664,7 @@ def test_webmaster_writes_queries_history_and_notes(paths):
     ]
     session = FakeSession(routes)
 
-    result = webmaster.extract(CONFIG_WM, ENV_WM, paths, session=session)
+    result = webmaster_api.extract(CONFIG_WM, ENV_WM, paths, session=session)
 
     src_dir = paths.raw / "webmaster"
     pop = json.loads((src_dir / "search_queries_popular.json").read_text("utf-8"))
@@ -561,8 +683,248 @@ def test_webmaster_dead_token_raises(paths):
     routes = [(lambda m, u: True, FakeResponse(status_code=403))]
     session = FakeSession(routes)
     with pytest.raises(C.AuthError) as exc:
-        webmaster.extract(CONFIG_WM, ENV_WM, paths, session=session)
+        webmaster_api.extract(CONFIG_WM, ENV_WM, paths, session=session)
     assert exc.value.exit_code == C.EXIT_SOURCE_UNAVAILABLE
+
+
+# ── gsc_manual (mode: manual — ручная выгрузка CSV) ──────────────────────────
+CONFIG_GSC_MANUAL = {
+    "sources": {"gsc": {"enabled": True, "mode": "manual", "raw_format": "csv",
+                        "manual_export_dir": "inputs/manual_exports/gsc"}},
+}
+
+
+def _write_gsc_manual(paths, name, text, meta=None):
+    """Положить ручную выгрузку gsc_YYYY-MM.csv (+ опц. meta.yaml) в inputs/."""
+    manual_dir = paths.root / "inputs" / "manual_exports" / "gsc"
+    manual_dir.mkdir(parents=True, exist_ok=True)
+    (manual_dir / name).write_text(text, encoding="utf-8")
+    if meta is not None:
+        (manual_dir / (Path(name).stem + ".meta.yaml")).write_text(meta, encoding="utf-8")
+
+
+def test_gsc_manual_validates_and_writes_same_contract(paths):
+    """Норма: ручной CSV -> gsc_YYYY-MM.csv в контракте transform + manifest manual."""
+    _write_gsc_manual(paths, "gsc_2026-05.csv",
+        "query,page,device,clicks,impressions,ctr,position\n"
+        "аренда авто,https://pognali.rent/cars,DESKTOP,10,100,4.2%,3.1\n"
+        "прокат машин,https://pognali.rent/,MOBILE,5,80,,7.0\n"
+        ",https://pognali.rent/x,DESKTOP,1,10,1%,9.0\n",       # пустой query -> reject
+    )
+
+    result = gsc_manual.extract(CONFIG_GSC_MANUAL, {}, paths)
+
+    src_dir = paths.raw / "gsc"
+    out = src_dir / "gsc_2026-05.csv"
+    lines = out.read_text("utf-8").splitlines()
+    assert lines[0].startswith("month,query,page,device")   # тот же контракт, что у API
+    assert result["accepted"] == 2 and result["rejected"] == 1
+    assert result["rejected_reasons"] == {"missing_query": 1}
+    # CTR из процентов приведён к доле; месяц взят из имени файла.
+    first = lines[1].split(",")
+    assert first[0] == "2026-05"
+    assert first[6] == "0.042"                               # 4.2% -> 0.042
+
+    report = json.loads((src_dir / "validation_report.json").read_text("utf-8"))
+    assert report["source_mode"] == "manual"
+    assert report["completeness"] == "unverified"
+    assert report["device_missing_months"] == []
+
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["gsc"]
+    assert entry["canonical_tables"] == ["seo_queries"]
+    assert entry["source_mode"] == "manual"
+    assert entry["completeness"] == "unverified"
+
+
+def test_gsc_manual_total_clicks_ui_mismatch_becomes_caveat(paths):
+    """Расхождение суммы clicks с total_clicks_ui > 10% -> caveat в отчёте."""
+    _write_gsc_manual(paths, "gsc_2026-06.csv",
+        "query,page,device,clicks,impressions,ctr,position\n"
+        "аренда авто,https://pognali.rent/cars,DESKTOP,80,1000,8%,3.1\n"
+        "прокат авто,https://pognali.rent/,MOBILE,5,80,6%,7.0\n",   # сумма clicks = 85
+        meta="total_clicks_ui: 100\n",                             # UI: 100 -> расхождение 15%
+    )
+
+    result = gsc_manual.extract(CONFIG_GSC_MANUAL, {}, paths)
+
+    caveats = result["clicks_ui_caveats"]
+    assert len(caveats) == 1
+    assert caveats[0]["month"] == "2026-06"
+    assert caveats[0]["total_clicks_ui"] == 100
+    assert caveats[0]["sum_clicks"] == 85
+    assert caveats[0]["deviation_pct"] == 15.0
+
+    report = json.loads((paths.raw / "gsc" / "validation_report.json").read_text("utf-8"))
+    assert report["clicks_ui_caveats"][0]["deviation_pct"] == 15.0
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["gsc"]
+    assert any("total_clicks_ui" in n for n in entry["notes"])
+
+
+def test_gsc_manual_missing_device_column_flags_month(paths):
+    """Нет колонки device в экспорте -> device=unknown, месяц исключён из S20."""
+    _write_gsc_manual(paths, "gsc_2026-05.csv",
+        "query,page,clicks,impressions,ctr,position\n"          # без device
+        "аренда авто,https://pognali.rent/cars,10,100,4%,3.1\n",
+    )
+
+    result = gsc_manual.extract(CONFIG_GSC_MANUAL, {}, paths)
+
+    assert result["device_missing_months"] == ["2026-05"]
+    assert result["accepted"] == 1                              # строку НЕ отбрасываем
+    row = (paths.raw / "gsc" / "gsc_2026-05.csv").read_text("utf-8").splitlines()[1]
+    assert row.split(",")[3] == "unknown"                       # device -> unknown
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["gsc"]
+    assert entry["device_missing_months"] == ["2026-05"]
+    assert any("device" in n for n in entry["notes"])
+
+
+def test_gsc_manual_no_exports_raises_source_unavailable(paths):
+    with pytest.raises(C.SourceUnavailable):
+        gsc_manual.extract(CONFIG_GSC_MANUAL, {}, paths)
+
+
+# ── webmaster_manual (mode: manual — ручная выгрузка «Популярные запросы») ────
+CONFIG_WM_MANUAL = {
+    "sources": {"webmaster": {"enabled": True, "mode": "manual",
+                              "manual_export_dir": "inputs/manual_exports/webmaster"}},
+}
+
+
+def _write_wm_manual(paths, name, text):
+    manual_dir = paths.root / "inputs" / "manual_exports" / "webmaster"
+    manual_dir.mkdir(parents=True, exist_ok=True)
+    (manual_dir / name).write_text(text, encoding="utf-8")
+
+
+def test_webmaster_manual_aggregates_to_popular_contract(paths):
+    """Норма: помесячные CSV -> search_queries_popular.json в контракте transform."""
+    _write_wm_manual(paths, "webmaster_2026-05.csv",
+        "query,impressions,clicks,position,month\n"
+        "аренда авто,600,30,3.0,2026-05\n"
+        "прокат машин,100,5,7.0,2026-05\n",
+    )
+    _write_wm_manual(paths, "webmaster_2026-06.csv",
+        "query,impressions,clicks,position,month\n"
+        "аренда авто,400,20,5.0,2026-06\n",
+    )
+
+    result = webmaster_manual.extract(CONFIG_WM_MANUAL, {}, paths)
+
+    popular = json.loads(
+        (paths.raw / "webmaster" / "search_queries_popular.json").read_text("utf-8")
+    )
+    # «аренда авто» отсортирован первым (больше показов) и агрегирован за 2 месяца.
+    top = popular[0]
+    assert top["query_text"] == "аренда авто"
+    assert top["indicators"]["TOTAL_SHOWS"] == 1000        # 600 + 400
+    assert top["indicators"]["TOTAL_CLICKS"] == 50         # 30 + 20
+    # Позиция — средневзвешенная по показам: (3*600 + 5*400) / 1000 = 3.8.
+    assert top["indicators"]["AVG_SHOW_POSITION"] == pytest.approx(3.8)
+    assert result["rows"] == 2
+
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["webmaster"]
+    assert entry["canonical_tables"] == ["seo_queries"]
+    assert entry["source_mode"] == "manual"
+    assert entry["page_device_breakdown"] is False
+    assert entry["manual_no_page_breakdown_policy"] == "degrade"   # дефолт
+    # Ограничение метода зафиксировано явно (и для API тоже, не только ручного).
+    assert any("ограничение метода" in n for n in entry["notes"])
+
+
+def test_webmaster_manual_records_no_page_device_breakdown(paths):
+    """Экспорт без page/device -> зафиксировано ограничение + политика из конфига."""
+    _write_wm_manual(paths, "webmaster_2026-05.csv",
+        "query,impressions,clicks,position,month\n"
+        "аренда авто,600,30,3.0,2026-05\n",
+    )
+    cfg = {"sources": {"webmaster": {
+        "enabled": True, "mode": "manual",
+        "manual_export_dir": "inputs/manual_exports/webmaster",
+        "manual_no_page_breakdown_policy": "aggregate"}}}
+
+    result = webmaster_manual.extract(cfg, {}, paths)
+
+    assert result["page_device_breakdown"] is False
+    assert result["manual_no_page_breakdown_policy"] == "aggregate"
+    report = json.loads(
+        (paths.raw / "webmaster" / "validation_report.json").read_text("utf-8")
+    )
+    assert report["page_device_breakdown"] is False
+    assert "aggregate" in report["policy_effect"]
+    assert report["manual_no_page_breakdown_policy"] == "aggregate"
+
+
+def test_webmaster_manual_no_exports_raises(paths):
+    with pytest.raises(C.SourceUnavailable):
+        webmaster_manual.extract(CONFIG_WM_MANUAL, {}, paths)
+
+
+# ── crux (Chrome UX Report API) ──────────────────────────────────────────────
+CONFIG_CRUX = {
+    "sources": {"crux": {"enabled": True, "api_key_env": "CRUX_API_KEY",
+                         "origin": "https://pognali.rent",
+                         "key_urls": ["https://pognali.rent/cars"]}},
+}
+ENV_CRUX = {"CRUX_API_KEY": "fake-crux-key"}
+
+
+def _crux_record(origin="https://pognali.rent"):
+    return {"record": {
+        "key": {"origin": origin},
+        "metrics": {
+            "largest_contentful_paint": {"percentiles": {"p75": 2500}},
+            "cumulative_layout_shift": {"percentiles": {"p75": "0.08"}},
+            "interaction_to_next_paint": {"percentiles": {"p75": 180}},
+        },
+    }}
+
+
+def test_crux_writes_field_data_when_present(paths):
+    """Есть полевые данные: origin + ключевой URL -> cwv_field_data_available=true."""
+    routes = [(_contains("records:queryRecord"),
+               FakeResponse(json_data=_crux_record()))]
+    session = FakeSession(routes)
+
+    result = crux.extract(CONFIG_CRUX, ENV_CRUX, paths, session=session)
+
+    assert result["cwv_field_data_available"] is True
+    data = json.loads((paths.raw / "crux" / "crux.json").read_text("utf-8"))
+    assert data["cwv_field_data_available"] is True
+    # origin + один ключевой URL = две записи.
+    assert len(data["records"]) == 2
+    origin_rec = data["records"][0]
+    assert origin_rec["target_type"] == "origin"
+    assert origin_rec["p75"]["largest_contentful_paint"] == 2500
+
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["crux"]
+    assert entry["cwv_field_data_available"] is True
+    assert entry["source_mode"] == "api"
+
+
+def test_crux_missing_field_data_is_normal_not_error(paths):
+    """Нет данных (404): НЕ падаем, пишем cwv_field_data_available=false и идём дальше."""
+    routes = [(_contains("records:queryRecord"), FakeResponse(status_code=404))]
+    session = FakeSession(routes)
+
+    result = crux.extract(CONFIG_CRUX, ENV_CRUX, paths, session=session)
+
+    assert result["cwv_field_data_available"] is False
+    # origin пуст -> веерных запросов по URL не делаем: ровно один вызов.
+    assert len(session.calls) == 1
+    data = json.loads((paths.raw / "crux" / "crux.json").read_text("utf-8"))
+    assert data["cwv_field_data_available"] is False
+    assert data["records"][0]["field_data_available"] is False
+
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["crux"]
+    assert entry["cwv_field_data_available"] is False
+    assert any("порог" in n or "лаборатор" in n for n in entry["notes"])
+
+
+def test_crux_missing_api_key_raises(paths):
+    session = FakeSession([])
+    with pytest.raises(C.SourceUnavailable):
+        crux.extract(CONFIG_CRUX, {}, paths, session=session)
+    assert session.calls == []
 
 
 # ── wordstat ─────────────────────────────────────────────────────────────────

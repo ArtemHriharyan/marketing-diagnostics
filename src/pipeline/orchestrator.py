@@ -158,11 +158,25 @@ def run_intake(paths: ClientPaths, log: StageLogger) -> bool:
 EXTRACTORS: dict[str, list[str]] = {
     "metrika": ["metrika_reports", "metrika_logs"],
     "direct": ["direct"],
-    "webmaster": ["webmaster"],
-    "gsc": ["gsc"],
     "wordstat": ["wordstat"],
+    "crux": ["crux"],
     "crm_csv": ["crm_import"],
 }
+
+# Источники с переключаемым режимом api|manual (см. патч про source_mode):
+# выбор модуля <source>_<mode> делается по config.sources.<source>.mode.
+# Дефолт — manual (сейчас у GSC/Вебмастера нет API-доступа). Выходной контракт
+# сырья у обоих режимов одинаков, поэтому переключение не трогает transform.
+MODE_DISPATCH = ("gsc", "webmaster")
+
+
+def _modules_for_source(source: str, spec: dict[str, Any] | None) -> list[str]:
+    """Список модулей-экстракторов для источника с учётом режима api|manual."""
+    if source in MODE_DISPATCH:
+        mode = str((spec or {}).get("mode") or "manual").strip().lower()
+        suffix = "api" if mode == "api" else "manual"
+        return [f"{source}_{suffix}"]
+    return EXTRACTORS.get(source, [])
 
 
 def _call_extract(module: Any, config: dict[str, Any], env: dict[str, str],
@@ -210,7 +224,7 @@ def run_extract(paths: ClientPaths, log: StageLogger) -> None:
     for source, spec in sources.items():
         if not (spec or {}).get("enabled"):
             continue
-        for mod_name in EXTRACTORS.get(source, []):
+        for mod_name in _modules_for_source(source, spec):
             module = importlib.import_module(f"src.extract.{mod_name}")
             try:
                 log(f"extract[{mod_name}]: старт")

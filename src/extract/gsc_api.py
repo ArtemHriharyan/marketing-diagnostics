@@ -1,11 +1,18 @@
-"""Экстрактор: Google Search Console (searchanalytics.query).
+"""Экстрактор: Google Search Console API (searchanalytics.query).
+
+Активен, когда config.sources.gsc.mode == "api" (при появлении реального доступа:
+сервисный ключ в credentials_path / GSC_CREDENTIALS_PATH). Сейчас основной путь —
+ручной (gsc_manual.py, mode: manual). Переключение режима mode: manual <-> api
+не должно требовать правок ничего дальше по пайплайну: выходной контракт
+data/raw/gsc/gsc_YYYY-MM.{csv,parquet} у обоих экстракторов ОДИНАКОВ.
 
 Контракт:
     Читает   — config.sources.gsc (site_url, опц. raw_format), путь к сервисному
                ключу GSC_CREDENTIALS_PATH из .env, окно дат.
     Пишет    — data/raw/gsc/ (по одному файлу на месяц: срез
                (query, page, device) x (clicks, impressions, ctr, position),
-               parquet или csv) + manifest.json (canonical_tables: [seo_queries]).
+               parquet или csv) + manifest.json (canonical_tables: [seo_queries],
+               source_mode: api, completeness: verified).
     Деградация — опционален; дополняет seo_queries стороной Google (проверка 5.4).
     LLM      — не используется.
 
@@ -42,7 +49,8 @@ API_BASE = "https://searchconsole.googleapis.com/webmasters/v3/sites"
 ROW_LIMIT = 25000
 DIMENSIONS = ["query", "page", "device"]
 
-# Порядок колонок сырья фиксирован — на него опирается transform.
+# Порядок колонок сырья фиксирован — на него опирается transform (тот же, что у
+# gsc_manual.py).
 RAW_FIELDS = ["month", "query", "page", "device",
               "clicks", "impressions", "ctr", "position"]
 
@@ -167,6 +175,8 @@ def extract(
         "raw_format": fmt,
         "date_from": C.fmt(date_from),
         "date_to": C.fmt(date_to),
+        "source_mode": "api",
+        "completeness": "verified",
         "canonical_tables": CANONICAL_TABLES,
         "manifest": manifest,
     }
@@ -226,5 +236,6 @@ def _record_manifest(paths, date_from, date_to, rows, fmt) -> dict[str, Any]:
         date_from=C.fmt(date_from), date_to=C.fmt(date_to),
         rows=rows, script_version=SCRIPT_VERSION,
         canonical_tables=CANONICAL_TABLES,
-        extra={"engine": "google", "raw_format": fmt},
+        extra={"engine": "google", "raw_format": fmt,
+               "source_mode": "api", "completeness": "verified"},
     )
