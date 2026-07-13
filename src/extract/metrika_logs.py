@@ -105,12 +105,14 @@ PATCH_ADDED_FIELDS = [
     "ym:s:screenHeight",        # C21: высота экрана
     "ym:s:regionCountry",       # A12 (нецелевая гео) / S26 (гео-спрос)
     "ym:s:regionCity",          # A12 / S26
-    "ym:s:isRobot",             # ПРОБНОЕ (D11): у источника visits обычно нет
+    "ym:s:isRobotPro",          # D11: расширенный флаг робота (замена isRobot —
+                                # отклонён API для источника visits)
 ]
 
-# Отдельный clickID (yclid/gclid) в Logs API не гарантирован — ПРОБНЫЕ поля.
-# Связка визита с Директом идёт через ym:s:lastSignDirectClickOrder (в базе).
-PATCH_CLICKID_PROBE = ["ym:s:lastSignYclid", "ym:s:lastSignGclid"]
+# GCLID в Logs API: правильный регистр — GCLID (не Gclid).
+# Yclid (Яндекс) не нужен отдельно: связка с Директом идёт через
+# ym:s:lastSignDirectClickOrder, уже входящий в VISIT_FIELDS_BASE.
+PATCH_CLICKID_PROBE = ["ym:s:lastSignGCLID", "ym:s:lastSignhasGCLID"]
 
 # Все новые поля, которые ПЫТАЕМСЯ добавить (негоциация оставит поддерживаемые).
 PATCH_CANDIDATE_FIELDS = PATCH_ADDED_FIELDS + PATCH_CLICKID_PROBE
