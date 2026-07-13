@@ -1,0 +1,18 @@
+# Core data / storage
+pandas>=2.1
+pyarrow>=14.0
+duckdb>=0.10
+
+# Config / secrets
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# HTTP / API clients
+requests>=2.31
+tapi-yandex-metrika>=2022.4.8   # клиент Logs API / Reports API Метрики (или свой)
+
+# Stats
+scipy>=1.11
+
+# Tests
+pytest>=8.0

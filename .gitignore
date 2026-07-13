@@ -1,0 +1,53 @@
+@'
+# Секреты
+.env
+*.env
+!.env.example
+!clients/_template/.env.example
+
+# Реальные клиенты полностью исключены
+clients/*
+!clients/_template/
+!clients/_template/**
+
+# Сгенерированные данные даже внутри шаблона
+clients/**/data/raw/*
+clients/**/data/canonical/*
+clients/**/data/metrics/*
+clients/**/logs/*
+clients/**/report/*
+clients/**/findings/draft/*
+clients/**/findings/approved/*
+clients/**/inputs/manual_exports/*
+
+# Сохраняем структуру папок шаблона
+!clients/_template/data/raw/.gitkeep
+!clients/_template/data/canonical/.gitkeep
+!clients/_template/data/metrics/.gitkeep
+!clients/_template/logs/.gitkeep
+!clients/_template/report/.gitkeep
+!clients/_template/findings/draft/.gitkeep
+!clients/_template/findings/approved/.gitkeep
+!clients/_template/inputs/manual_exports/.gitkeep
+
+# Логи и временные файлы
+*.log
+*.tmp
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+'@ | Set-Content -Path .gitignore -Encoding utf8

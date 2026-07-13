@@ -1,0 +1,519 @@
+"""Тесты слоя transform: build_canonical.
+
+Юнит-тесты на чистые функции-правила (дедуп, UTM-порог, разворачивание
+фиксов, бренд-классификация и остальные правила преобразований) плюс
+один сквозной тест build() на минимальном сырье в формате, который
+реально пишут экстракторы (см. tests/test_extract_smoke.py).
+"""
+
+from __future__ import annotations
+
+import csv
+import gzip
+import json
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.extract.metrika_logs import VISIT_FIELDS  # noqa: E402
+from src.pipeline import manifest as manifest_mod  # noqa: E402
+from src.transform import build_canonical as bc  # noqa: E402
+
+
+# ═════════════════════════════ dedupe_visits ═════════════════════════════
+def test_dedupe_visits_keeps_last_by_dt():
+    df = pd.DataFrame([
+        {"visit_id": "v1", "dt": datetime(2026, 5, 1, 10, 0), "tag": "first"},
+        {"visit_id": "v1", "dt": datetime(2026, 5, 1, 12, 0), "tag": "last"},
+        {"visit_id": "v2", "dt": datetime(2026, 5, 2, 9, 0), "tag": "only"},
+    ])
+    out = bc.dedupe_visits(df)
+    assert len(out) == 2
+    v1 = out[out["visit_id"] == "v1"].iloc[0]
+    assert v1["tag"] == "last"
+
+
+def test_dedupe_visits_no_duplicates_is_noop():
+    df = pd.DataFrame([
+        {"visit_id": "v1", "dt": datetime(2026, 5, 1, 10, 0)},
+        {"visit_id": "v2", "dt": datetime(2026, 5, 2, 9, 0)},
+    ])
+    out = bc.dedupe_visits(df)
+    assert len(out) == 2
+
+
+def test_dedupe_visits_empty_df():
+    df = pd.DataFrame(columns=["visit_id", "dt"])
+    out = bc.dedupe_visits(df)
+    assert out.empty
+
+
+# ═════════════════════════════ apply_utm_threshold ═══════════════════════
+def test_utm_threshold_below_25_percent_stays_ad():
+    """3 из 20 ad-визитов (15%) без utm < порога 0.25 -> все остаются ad."""
+    source_group = pd.Series(["ad"] * 20 + ["organic"] * 5)
+    utm = pd.Series((["fb_camp"] * 17 + [""] * 3) + [""] * 5)
+    source_final, uncertain, frac = bc.apply_utm_threshold(source_group, utm, 0.25)
+
+    assert frac == pytest.approx(3 / 20)
+    assert uncertain is False
+    assert (source_final.iloc[:20] == "ad").all()
+    # неплатный трафик не трогаем правилом порога вовсе
+    assert (source_final.iloc[20:] == "organic").all()
+
+
+def test_utm_threshold_at_or_above_25_percent_marks_undefined():
+    """6 из 20 ad-визитов (30%) без utm >= порога 0.25 -> undefined + флаг."""
+    source_group = pd.Series(["ad"] * 20)
+    utm = pd.Series(["fb_camp"] * 14 + [""] * 6)
+    source_final, uncertain, frac = bc.apply_utm_threshold(source_group, utm, 0.25)
+
+    assert frac == pytest.approx(6 / 20)
+    assert uncertain is True
+    assert (source_final.iloc[:14] == "ad").all()
+    assert (source_final.iloc[14:] == "undefined").all()
+
+
+def test_utm_threshold_recognizes_ne_opredeleno_token():
+    source_group = pd.Series(["ad", "ad", "ad", "ad"])
+    utm = pd.Series(["camp", "Не определено", "  ", None])
+    source_final, uncertain, frac = bc.apply_utm_threshold(source_group, utm, 0.25)
+    assert frac == pytest.approx(3 / 4)
+    assert uncertain is True
+
+
+def test_utm_threshold_no_ad_visits_no_uncertainty():
+    source_group = pd.Series(["organic", "direct"])
+    utm = pd.Series(["", ""])
+    source_final, uncertain, frac = bc.apply_utm_threshold(source_group, utm, 0.25)
+    assert frac == 0.0
+    assert uncertain is False
+    assert list(source_final) == ["organic", "direct"]
+
+
+# ═════════════════════════════ expand_manual_costs ═══════════════════════
+def test_expand_manual_costs_splits_fee_across_days_in_month():
+    costs_manual = {"agency_fee_rub_month": 30000, "seo_fee_rub_month": 0, "other": []}
+    rows = bc.expand_manual_costs(costs_manual, date(2026, 6, 1), date(2026, 6, 30))
+    assert len(rows) == 30  # июнь — 30 дней, один фикс
+    assert all(r["source_tag"] == "agency_fee" for r in rows)
+    assert all(r["cost_rub"] == pytest.approx(1000.0) for r in rows)  # 30000/30
+    assert rows[0]["date"] == date(2026, 6, 1)
+    assert rows[0]["campaign_id"] is None
+
+
+def test_expand_manual_costs_multiple_fees_and_month_boundary():
+    costs_manual = {
+        "agency_fee_rub_month": 31000,   # июль — 31 день -> 1000/день
+        "seo_fee_rub_month": 28000,      # февраль (невисокосный) -> но тут окно июль -> 28000/31
+        "other": [{"name": "yandex.biz", "rub_month": 3100, "source_tag": "yandex_business"}],
+    }
+    rows = bc.expand_manual_costs(costs_manual, date(2026, 7, 1), date(2026, 7, 2))
+    assert len(rows) == 6  # 2 дня x 3 фикса
+    by_tag = {r["source_tag"]: r for r in rows if r["date"] == date(2026, 7, 1)}
+    assert by_tag["agency_fee"]["cost_rub"] == pytest.approx(1000.0)
+    assert by_tag["seo_fee"]["cost_rub"] == pytest.approx(28000 / 31)
+    assert by_tag["yandex_business"]["cost_rub"] == pytest.approx(100.0)
+    assert by_tag["yandex_business"]["campaign_name"] == "yandex.biz"
+
+
+def test_expand_manual_costs_invalid_source_tag_falls_back_to_other():
+    costs_manual = {"other": [{"name": "x", "rub_month": 1000, "source_tag": "garbage"}]}
+    rows = bc.expand_manual_costs(costs_manual, date(2026, 6, 1), date(2026, 6, 1))
+    assert rows[0]["source_tag"] == "other"
+
+
+def test_expand_manual_costs_no_fees_returns_empty():
+    rows = bc.expand_manual_costs({}, date(2026, 6, 1), date(2026, 6, 30))
+    assert rows == []
+
+
+def test_expand_manual_costs_zero_fees_are_skipped():
+    costs_manual = {"agency_fee_rub_month": 0, "seo_fee_rub_month": 0, "other": [{"rub_month": 0}]}
+    rows = bc.expand_manual_costs(costs_manual, date(2026, 6, 1), date(2026, 6, 30))
+    assert rows == []
+
+
+# ═════════════════════════════ is_brand_query ════════════════════════════
+def test_is_brand_query_case_insensitive_match():
+    assert bc.is_brand_query("Купить Погнали аренда", ["погнали"]) is True
+    assert bc.is_brand_query("ПОГНАЛИ.RENT отзывы", ["Погнали"]) is True
+
+
+def test_is_brand_query_no_match():
+    assert bc.is_brand_query("аренда авто спб", ["погнали"]) is False
+
+
+def test_is_brand_query_empty_terms_or_query():
+    assert bc.is_brand_query("аренда авто", []) is False
+    assert bc.is_brand_query(None, ["погнали"]) is False
+    assert bc.is_brand_query("погнали рент", [""]) is False
+
+
+# ═════════════════════════════ classify_traffic_source ═══════════════════
+@pytest.mark.parametrize("raw,expected", [
+    ("ad", "ad"),
+    ("cpa_network", "ad"),
+    ("search_engine", "organic"),
+    ("direct", "direct"),
+    ("link", "referral"),
+    ("recommendation_system", "referral"),
+    ("internal", "internal"),
+    ("social_network", "social"),
+    ("messenger", "messenger"),
+    ("email", "other"),
+    ("something_unknown", "other"),
+    ("", "other"),
+    (None, "other"),
+])
+def test_classify_traffic_source_mapping_table(raw, expected):
+    assert bc.classify_traffic_source(raw) == expected
+
+
+# ═════════════════════════════ map_device ═════════════════════════════════
+@pytest.mark.parametrize("raw,expected", [
+    ("1", "desktop"), ("2", "mobile"), ("3", "tablet"), ("4", "tv"),
+    ("99", "desktop"), ("", "desktop"), (None, "desktop"),
+])
+def test_map_device(raw, expected):
+    assert bc.map_device(raw) == expected
+
+
+# ═════════════════════════════ goal_flags / parse_goal_ids ═══════════════
+def test_parse_goal_ids_splits_on_common_delimiters():
+    assert bc.parse_goal_ids("1,2; 3|4") == ["1", "2", "3", "4"]
+    assert bc.parse_goal_ids("") == []
+    assert bc.parse_goal_ids(None) == []
+
+
+def test_goal_flags_marks_visit_level_achievements_and_counts_submits():
+    goals_cfg = {
+        "form_open_goal_ids": [10],
+        "form_submit_goal_ids": [20],
+        "call_click_goal_ids": [30],
+        "messenger_goal_ids": [40],
+    }
+    flags = bc.goal_flags(["10", "20", "20", "99"], goals_cfg)
+    assert flags == {
+        "form_open": True, "form_submit": True, "call_click": False,
+        "messenger_click": False, "form_submit_count": 2,
+    }
+
+
+def test_goal_flags_no_achievements():
+    goals_cfg = {"form_open_goal_ids": [10]}
+    flags = bc.goal_flags([], goals_cfg)
+    assert flags["form_open"] is False
+    assert flags["form_submit_count"] == 0
+
+
+# ═════════════════════════════ normalize_entry_page ═══════════════════════
+@pytest.mark.parametrize("raw,expected", [
+    ("https://site.ru/Cars/", "/cars"),
+    ("https://site.ru/", "/"),
+    ("https://site.ru", "/"),
+    ("https://site.ru/cars?utm_source=x#frag", "/cars"),
+    (None, "/"),
+])
+def test_normalize_entry_page(raw, expected):
+    assert bc.normalize_entry_page(raw) == expected
+
+
+# ═════════════════════════════ classify_strategy_optimize_for ════════════
+@pytest.mark.parametrize("raw,expected", [
+    ("HIGHEST_POSITION", "clicks"),
+    ("AVERAGE_CPC", "clicks"),
+    ("AVERAGE_CPA", "conversions"),
+    ("WB_MAXIMUM_CONVERSION_RATE", "conversions"),
+    ("SOME_NEW_STRATEGY", "unknown"),
+    (None, "unknown"),
+])
+def test_classify_strategy_optimize_for(raw, expected):
+    assert bc.classify_strategy_optimize_for(raw) == expected
+
+
+def test_extract_bidding_strategy_type_from_nested_search_scope():
+    campaign = {"Id": 1, "Name": "x", "TextCampaign": {
+        "BiddingStrategy": {"Search": {"BiddingStrategyType": "AVERAGE_CPA"}}}}
+    assert bc._extract_bidding_strategy_type(campaign) == "AVERAGE_CPA"
+
+
+def test_extract_bidding_strategy_type_missing_returns_none():
+    assert bc._extract_bidding_strategy_type({"Id": 1, "Name": "x"}) is None
+
+
+# ═════════════════════════════ crm normalization ══════════════════════════
+@pytest.mark.parametrize("raw,expected", [
+    ("won", "won"), ("lost", "lost"), ("in_progress", "in_progress"),
+    ("new", "new"), ("", "unknown"), (None, "unknown"), ("garbage", "unknown"),
+])
+def test_normalize_crm_status(raw, expected):
+    assert bc.normalize_crm_status(raw) == expected
+
+
+def test_normalize_crm_source_lowercases_and_strips():
+    assert bc.normalize_crm_source("  Яндекс.Директ  ") == "яндекс.директ"
+    assert bc.normalize_crm_source(None) == "unknown"
+    assert bc.normalize_crm_source("") == "unknown"
+
+
+# ═════════════════════════════ build(): сквозной тест ═════════════════════
+class _Paths:
+    def __init__(self, root: Path):
+        self.root = root
+        self.raw = root / "data" / "raw"
+        self.canonical = root / "data" / "canonical"
+
+
+def _write_metrika_logs_fixture(raw_dir: Path) -> None:
+    out_dir = raw_dir / "metrika_logs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    header = "\t".join(VISIT_FIELDS)
+
+    def row(visit_id, client_id, dt, source, utm_source, goals):
+        values = {
+            "ym:s:visitID": visit_id,
+            "ym:s:clientID": client_id,
+            "ym:s:dateTime": dt,
+            "ym:s:lastsignTrafficSource": source,
+            "ym:s:lastsignUTMSource": utm_source,
+            "ym:s:lastsignUTMMedium": "cpc",
+            "ym:s:lastsignUTMCampaign": "spring",
+            "ym:s:lastSignDirectClickOrder": "",
+            "ym:s:deviceCategory": "2",
+            "ym:s:startURL": "https://site.ru/Cars/?utm_source=x",
+            "ym:s:goalsID": goals,
+            "ym:s:referer": "",
+            "ym:s:isNewUser": "1",
+            "ym:s:pageViews": "3",
+            "ym:s:visitDuration": "120",
+        }
+        return "\t".join(values[f] for f in VISIT_FIELDS)
+
+    lines = [header]
+    # v1 дублируется дважды -> должна остаться версия с более поздним dateTime.
+    lines.append(row("v1", "c1", "2026-06-01 10:00:00", "ad", "", "20"))
+    lines.append(row("v1", "c1", "2026-06-01 15:00:00", "ad", "yandex", "20,20"))
+    lines.append(row("v2", "c2", "2026-06-02 09:00:00", "search_engine", "", ""))
+
+    text = "\n".join(lines) + "\n"
+    with gzip.open(out_dir / "visits_2026-06-01_2026-06-30_part000.csv.gz", "wt", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def _write_direct_fixture(raw_dir: Path) -> None:
+    out_dir = raw_dir / "direct"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "campaign_performance.tsv").write_text(
+        "CampaignId\tCampaignName\tCost\tClicks\tImpressions\tDate\n"
+        "1\tПоиск\t5000000\t10\t200\t2026-06-01\n",
+        encoding="utf-8",
+    )
+    (out_dir / "search_query_performance.tsv").write_text(
+        "Query\tCampaignId\tAdGroupId\tCost\tClicks\tConversions\n"
+        "купить машину\t1\t11\t2000000\t3\t1\n",
+        encoding="utf-8",
+    )
+    strategies = [{"Id": 1, "Name": "Поиск", "TextCampaign": {
+        "BiddingStrategy": {"Search": {"BiddingStrategyType": "AVERAGE_CPA"}}}}]
+    (out_dir / "campaign_strategies.json").write_text(
+        json.dumps(strategies, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def test_build_writes_only_tables_with_raw_source(tmp_path):
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    _write_metrika_logs_fixture(paths.raw)
+    _write_direct_fixture(paths.raw)
+
+    manifest_mod.update_source(
+        paths.raw, "metrika_logs", date_from="2026-06-01", date_to="2026-06-30",
+        rows=3, script_version="test", canonical_tables=["visits"],
+    )
+    manifest_mod.update_source(
+        paths.raw, "direct", date_from="2026-06-01", date_to="2026-06-30",
+        rows=2, script_version="test", canonical_tables=["costs", "direct_queries"],
+        extra={"cost_basis": "net_no_vat", "cost_micros_per_rub": 1_000_000},
+    )
+
+    config = {
+        "goals": {"form_submit_goal_ids": [20]},
+        "costs_manual": {"agency_fee_rub_month": 3000},
+        "data_window": {"date_from": "2026-06-01", "date_to": "2026-06-02"},
+        "brand_terms": [],
+    }
+    defaults = {"utm_undefined_threshold": 0.25}
+
+    built = bc.build(paths, config, defaults)
+
+    assert set(built) == {"visits", "costs", "direct_queries", "campaign_strategies"}
+    assert not (paths.canonical / "seo_queries.parquet").exists()
+    assert not (paths.canonical / "crm.parquet").exists()
+
+    visits = pd.read_parquet(paths.canonical / "visits.parquet")
+    assert len(visits) == 2  # v1 дедуп в одну строку
+    v1 = visits[visits["visit_id"] == "v1"].iloc[0]
+    assert v1["form_submit_count"] == 2       # goalsID "20,20" во второй (последней) версии v1
+    assert v1["source_group"] == "ad"
+    assert v1["utm_source_raw"] == "yandex"    # взята последняя по dateTime версия
+    assert v1["entry_page"] == "/cars"
+    v2 = visits[visits["visit_id"] == "v2"].iloc[0]
+    assert v2["source_group"] == "organic"
+    assert v2["is_ad"] == False
+
+    costs = pd.read_parquet(paths.canonical / "costs.parquet")
+    # 1 строка Директа (2026-06-01) + 2 дня ручного фикса (agency_fee).
+    assert len(costs) == 3
+    assert set(costs["source_tag"]) == {"direct", "agency_fee"}
+    direct_row = costs[costs["source_tag"] == "direct"].iloc[0]
+    assert direct_row["cost_rub"] == pytest.approx(5.0)
+
+    dq = pd.read_parquet(paths.canonical / "direct_queries.parquet")
+    assert dq.iloc[0]["query"] == "купить машину"
+    assert dq.iloc[0]["campaign_name"] == "Поиск"
+    assert dq.iloc[0]["date_month"] == "2026-06"
+
+    cs = pd.read_parquet(paths.canonical / "campaign_strategies.parquet")
+    assert cs.iloc[0]["optimize_for"] == "conversions"
+
+    canonical_manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
+    assert set(canonical_manifest["tables"]) == set(built)
+    assert canonical_manifest["flags"]["utm_uncertain"] is False
+
+
+def test_build_costs_only_from_manual_fixtures_without_direct(tmp_path):
+    """SEO-only клиент без Директа: costs строится только из costs_manual."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+
+    config = {
+        "costs_manual": {"seo_fee_rub_month": 3100},
+        "data_window": {"date_from": "2026-07-01", "date_to": "2026-07-02"},
+    }
+    defaults = {"utm_undefined_threshold": 0.25}
+
+    built = bc.build(paths, config, defaults)
+    assert built == ["costs"]
+
+    costs = pd.read_parquet(paths.canonical / "costs.parquet")
+    assert len(costs) == 2
+    assert (costs["source_tag"] == "seo_fee").all()
+    assert costs.iloc[0]["cost_rub"] == pytest.approx(100.0)  # 3100/31
+
+
+def test_build_no_raw_and_no_manual_costs_produces_nothing(tmp_path):
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    built = bc.build(paths, {}, {"utm_undefined_threshold": 0.25})
+    assert built == []
+
+
+# ═════════════════════════════ build_crm ═══════════════════════════════════
+def test_build_crm_reads_and_normalizes(tmp_path):
+    crm_dir = tmp_path / "crm"
+    crm_dir.mkdir(parents=True)
+    with (crm_dir / "leads.csv").open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=[
+            "lead_date", "source", "lead_kind", "lead_id", "phone_hash",
+            "status", "status_raw", "amount_rub", "is_new_client",
+        ])
+        writer.writeheader()
+        writer.writerow({
+            "lead_date": "2026-06-05", "source": "  Яндекс  ", "lead_kind": "phone",
+            "lead_id": "", "phone_hash": "abc123", "status": "won",
+            "status_raw": "успешно", "amount_rub": "15000.5", "is_new_client": "True",
+        })
+        writer.writerow({
+            "lead_date": "2026-06-06", "source": "google", "lead_kind": "id",
+            "lead_id": "ORDER-1", "phone_hash": "", "status": "",
+            "status_raw": "неизвестный", "amount_rub": "", "is_new_client": "",
+        })
+        writer.writerow({
+            "lead_date": "не дата", "source": "x", "lead_kind": "id",
+            "lead_id": "ORDER-2", "phone_hash": "", "status": "lost",
+            "status_raw": "отказ", "amount_rub": "100", "is_new_client": "False",
+        })
+
+    df = bc.build_crm(crm_dir)
+    assert len(df) == 2  # строка с нечитаемой датой отброшена
+
+    won = df[df["status_norm"] == "won"].iloc[0]
+    assert won["source_norm"] == "яндекс"
+    assert won["amount_rub"] == pytest.approx(15000.5)
+    assert won["is_new_client"] is True
+    assert won["phone_hash"] == "abc123"
+
+    unknown_status = df[df["source_norm"] == "google"].iloc[0]
+    assert unknown_status["status_norm"] == "unknown"
+    # amount_rub — колонка смешанного типа (float | None) -> pandas хранит
+    # отсутствующее значение как NaN; в parquet write_canonical_table пишет
+    # настоящий null (см. test_build_writes_only_tables_with_raw_source).
+    assert pd.isna(unknown_status["amount_rub"])
+    assert unknown_status["is_new_client"] is None
+
+
+def test_build_crm_missing_dir_returns_empty(tmp_path):
+    df = bc.build_crm(tmp_path / "nope")
+    assert df.empty
+
+
+# ═════════════════════════════ seo_queries builders ════════════════════════
+def test_build_seo_queries_gsc_aggregates_devices_and_flags_brand():
+    gsc_dir_content = (
+        "month,query,page,device,clicks,impressions,ctr,position\n"
+        "2026-05-01,аренда погнали,https://site.ru/cars,DESKTOP,5,50,0.1,3.0\n"
+        "2026-05-01,аренда погнали,https://site.ru/cars,MOBILE,3,30,0.1,5.0\n"
+        "2026-05-01,прокат авто,https://site.ru/cars,DESKTOP,1,10,0.1,8.0\n"
+    )
+
+    def _write(tmp_path):
+        gsc_dir = tmp_path / "gsc"
+        gsc_dir.mkdir(parents=True)
+        (gsc_dir / "gsc_2026-05-01.csv").write_text(gsc_dir_content, encoding="utf-8")
+        return gsc_dir
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        gsc_dir = _write(Path(td))
+        df = bc.build_seo_queries_gsc(gsc_dir, {"brand_terms": ["погнали"]})
+
+    assert set(df["engine"]) == {"google"}
+    assert df["month"].iloc[0] == "2026-05"
+    branded = df[df["query"] == "аренда погнали"].iloc[0]
+    assert branded["clicks"] == 8            # 5 + 3, device-срезы объединены
+    assert branded["impressions"] == 80      # 50 + 30
+    assert branded["position_avg"] == pytest.approx((3.0 * 50 + 5.0 * 30) / 80)
+    assert bool(branded["is_brand"]) is True
+    nonbrand = df[df["query"] == "прокат авто"].iloc[0]
+    assert bool(nonbrand["is_brand"]) is False
+
+
+def test_build_seo_queries_webmaster_uses_window_end_month():
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        wm_dir = Path(td) / "webmaster"
+        wm_dir.mkdir(parents=True)
+        popular = [{
+            "query_id": "q1", "query_text": "погнали аренда",
+            "indicators": {"TOTAL_SHOWS": 1000, "TOTAL_CLICKS": 50,
+                           "AVG_SHOW_POSITION": 3.1, "AVG_CLICK_POSITION": 2.2},
+        }]
+        (wm_dir / "search_queries_popular.json").write_text(
+            json.dumps(popular, ensure_ascii=False), encoding="utf-8"
+        )
+        entry = {"date_from": "2026-05-01", "date_to": "2026-06-30"}
+        df = bc.build_seo_queries_webmaster(wm_dir, entry, {"brand_terms": ["погнали"]})
+
+    assert df.iloc[0]["engine"] == "yandex"
+    assert df.iloc[0]["month"] == "2026-06"
+    assert df.iloc[0]["position_avg"] == pytest.approx(2.2)
+    assert bool(df.iloc[0]["is_brand"]) is True
+    assert df.iloc[0]["page"] is None

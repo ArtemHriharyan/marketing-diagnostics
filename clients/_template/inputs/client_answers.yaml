@@ -1,0 +1,72 @@
+# АНКЕТА УСТАНОВОЧНОГО СОЗВОНА.
+# Заполняется прямо во время звонка. Вопрос к каждому полю — в комментарии.
+# Факты «со слов клиента» идут в находки с уверенностью client-HIGH.
+
+meta:
+  date: ""            # дата созвона
+  respondent: ""      # кто отвечал (имя)
+  role: ""            # роль: владелец / маркетолог / другое
+
+business:
+  avg_check_rub: null       # средний чек, руб («со слов», не из CRM)
+  margin_share: null        # маржа, доля (0.30 = 30%)
+  seasonality: ""           # пики/провалы по месяцам
+  offline_lead_channels: [] # куда ещё приходят лиды: звонки, WhatsApp, карточки
+
+marketing_setup:
+  contractors: []           # [{role: "контекст", fee_rub_month: 0, since: ""}]
+  direct_strategy: ""       # на что оптимизированы кампании: клики / конверсии / не знает
+  yandex_business:
+    active: null            # активен ли Яндекс.Бизнес (true/false)
+    fee_rub_month: null     # стоимость ведения, руб/мес
+    budget_rub_month: null  # бюджет, руб/мес
+  other_paid_placements: [] # прочие платные размещения
+
+site_and_form:
+  what_counts_as_lead: ""       # что клиент считает заявкой
+  required_form_fields: []      # обязательные поля формы
+  price_shown_before_submit: null  # показывается ли цена до отправки (true/false)
+  deposit:
+    exists: null              # есть ли предоплата/депозит (true/false)
+    amount_rub: null          # сумма, руб
+
+crm:
+  exists: null                # есть ли CRM (true/false)
+  system: ""                  # какая система
+  can_export_csv: null        # можно ли выгрузить CSV (true/false)
+  crm_monthly_export_available: null  # Q07: есть ли простая помесячная выгрузка
+                              # числа обращений/продаж/выручки (true/false).
+                              # Только для sanity-сверки, без разбора менеджеров.
+
+# ── Ответы на минимальные вопросы клиенту (каталог v2, Q01–Q07) ────────────
+finance:
+  # Q01: расходы в счёте и рекламной системе — с НДС или без? По каждому
+  # источнику, чтобы привести все каналы к одной базе НДС.
+  vat_basis_by_source: []     # [{source: "direct", vat_included: null,
+                              #   evidence: "счёт|договор|ответ"}]
+  # Q02: обязательные расходы на маркетинг ВНЕ рекламного кабинета
+  # (ведение, сервисы, размещения, производство) — суммой по месяцам.
+  costs_outside_cabinet: []   # [{name: "", rub_month: 0, source_tag: ""}]
+
+# Q03: товарные/сервисные группы по маржинальности. Только классы —
+# высокая / средняя / низкая / неизвестно, без расчёта точной прибыли.
+product_groups: []            # [{group: "", margin_class: "высокая|средняя|низкая|неизвестно"}]
+
+# Q04: что бизнес сейчас НЕ может обслужить (товары, услуги, регионы, даты) —
+# чтобы не рекомендовать масштабировать непринимаемый спрос.
+capacity_limits: []           # [{limit: "", period: ""}]
+
+# Q05: ориентировочный общий уровень отмен и возвратов (оговорка к заказам).
+cancellations_returns_range: null  # "до 5%|5–15%|15–30%|более 30%|неизвестно"
+
+# Q06: изменения в анализируемом периоде (цены, ассортимент, сайт, подрядчик,
+# рекламная стратегия) — объясняют структурные разрывы в месячной динамике.
+changes_log: []               # [{date: "", change: ""}]
+
+directories:                  # карточки в справочниках
+  yandex_maps: {exists: null, stats_available: null}
+  gis2:        {exists: null, stats_available: null}
+  calltracking: {exists: null}
+
+client_facts: []              # факты со слов клиента -> в находки как client-HIGH
+                              # [{fact: "", date: "", topic: ""}]

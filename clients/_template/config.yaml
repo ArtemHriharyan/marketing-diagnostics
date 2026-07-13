@@ -1,0 +1,54 @@
+# Конфиг клиента. Копируется в clients/<name>/config.yaml и заполняется.
+# ВСЁ клиентское — здесь. Скрипты код не правят (принцип 1). Секреты — в .env.
+
+client:
+  name: ""            # имя клиента (для отчёта)
+  niche: ""           # ниша — используется в формулировках находок
+  geo: ""             # регион(ы) продвижения
+
+sources:              # что ЗАЯВЛЕНО; intake проверит фактическую доступность
+  metrika:   {enabled: true,  counter_id: null}
+  direct:    {enabled: false, client_login: null}
+  webmaster:
+    enabled: false
+    host_id: null
+    mode: "manual"        # api | manual — сейчас manual, переключаемо без правок кода
+    manual_export_dir: "inputs/manual_exports/webmaster"
+  gsc:
+    enabled: false
+    site_url: null
+    mode: "manual"        # api | manual
+    manual_export_dir: "inputs/manual_exports/gsc"
+    credentials_path: null   # используется только если mode: api
+  wordstat:  {enabled: false}
+  crux:      {enabled: true, api_key_env: "CRUX_API_KEY"}   # полевые CWV из CrUX
+  crm_csv:   {enabled: false, path: "inputs/crm_export.csv"}
+
+goals:                # маппинг id целей Метрики на сущности методологии
+  form_open_goal_ids: []
+  form_submit_goal_ids: []
+  call_click_goal_ids: []
+  messenger_goal_ids: []
+
+costs_manual:         # для клиентов без Директа или с ручными фиксами расходов
+  agency_fee_rub_month: 0     # ведение контекста, руб/мес
+  seo_fee_rub_month: 0        # ведение SEO, руб/мес
+  other: []                   # [{name: "", rub_month: 0, source_tag: ""}]
+
+data_window:
+  months: 12          # окно анализа; переопределяет config/defaults.yaml
+
+brand_terms: []       # слова бренда для классификации бренд/небренд
+
+wordstat_seeds: []    # маски запросов для Wordstat, напр. ["аренда авто", "прокат машин"]
+wordstat_geo: []      # GeoID регионов Яндекса; пусто = вся Россия (напр. [10231] — Приморье)
+
+crm_csv:              # правила разбора ручной выгрузки CRM (sources.crm_csv.path)
+  # canonical -> заголовок в CSV. Каноничные: lead_date, source, phone_or_id,
+  # status, amount_rub, is_new_client. Пусто = заголовки совпадают с каноничными.
+  column_map: {}      # напр. {lead_date: "Дата", phone_or_id: "Телефон", status: "Статус"}
+  status_map: {}      # сырой статус (нижний регистр) -> won|lost|in_progress|...
+                      # напр. {"успешно": "won", "отказ": "lost", "в работе": "in_progress"}
+  date_formats: []    # доп. форматы дат (strptime); пусто = встроенный набор
+  delimiter: ""       # разделитель CSV; пусто = автоопределение (';' у RU-Excel)
+  hash_salt: ""       # соль для хэша телефонов; НЕ менять — ломает будущую склейку

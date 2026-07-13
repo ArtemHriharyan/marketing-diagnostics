@@ -1,0 +1,1148 @@
+# Реестр проверок методологии диагностики (схема ID каталога угроз v2).
+#
+# Рабочий ID — буквенно-числовой из каталога (D/A/T/C/S + номер). Старый
+# числовой ID предыдущей методологии хранится в legacy_id ТОЛЬКО для сверки с
+# отчётом Pognali v2 и не участвует в compute/degradation/analyze. Соответствие
+# блоков и подробности схемы — в CLAUDE.md, раздел «Схема ID проверок».
+#
+# Формат записи:
+#   - id: "A07"                      рабочий ID (каталог v2)
+#     legacy_id: "2.2"               старый числовой ID или null
+#     block: 1                       0=D 1=A 2=T 3=C 4=S
+#     name: "..."                    краткая формулировка угрозы
+#     requires: [costs]              канонические таблицы, без которых нельзя
+#     optional: [site_crawl]         обогащающие таблицы (на runnable не влияют)
+#     outputs: [a07]                 артефакты в data/metrics/
+#     type_default: "A"              A|B|Q|A+B|A+Q — уровень проверяемости
+#     type_downgrade_if: "..."       условие пост-хок понижения типа или null
+#     type_downgraded: "B"           тип после понижения или null
+#
+# Уровни проверяемости (type): A — автоматически из выгрузок; B — ручная проверка
+# в интерфейсе/на сайте/в Вебвизоре/замером; Q — требует факта/документа клиента;
+# A+B, A+Q — комбинации.
+#
+# type_downgrade_if читает булевы флаги из data/raw/*/manifest.json (например
+# campaign_report_has_lost_impression_share). Если условие истинно, слой compute
+# берёт type_downgraded, иначе type_default. Отсутствующий флаг трактуется как
+# false. Карту деградации (type_effective, source_modes, confidence_cap) строит
+# src/pipeline/degradation.py.
+#
+# Канонические таблицы, на которые ссылаются requires/optional:
+#   visits             — визиты Метрики (Logs API)
+#   costs              — расходы (Директ + ручные из config.costs_manual)
+#   direct_queries     — поисковые запросы Директа
+#   campaign_strategies— стратегии/цели оптимизации кампаний Директа
+#   seo_queries        — поисковые запросы SEO (Вебмастер / GSC; mode: api|manual)
+#   wordstat           — частотность спроса Wordstat
+#   crux               — полевые Core Web Vitals из Chrome UX Report
+#   site_crawl         — обход сайта / ручная техническая проверка страниц
+#   crm                — выгрузка CRM (сделки/лиды)
+#   client_answers     — анкета установочного созвона (inputs/client_answers.yaml)
+#   webvisor_findings  — наблюдения аналитика из Вебвизора (inputs/…)
+#   degradation_report — отчёт о непокрытых проверках (мета-вход)
+
+checks:
+  # ── Блок 0 (D) — минимальное доверие к данным ─────────────────────────
+  - id: "D01"
+    legacy_id: "0.1"
+    block: 0
+    name: "Ключевая цель срабатывает несколько раз в одном визите"
+    requires: [visits]
+    optional: []
+    outputs: [d01]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D02"
+    legacy_id: null
+    block: 0
+    name: "Цель измеряет клик/открытие формы, а не успешную отправку"
+    requires: [visits]
+    optional: [site_crawl]
+    outputs: [d02]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D03"
+    legacy_id: "0.3"
+    block: 0
+    name: "В отчёте смешаны бизнес-цели и микроконверсии"
+    requires: [visits]
+    optional: [client_answers]
+    outputs: [d03]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D04"
+    legacy_id: null
+    block: 0
+    name: "Часть форм/страниц/устройств не покрыта корректным трекингом"
+    requires: [visits]
+    optional: [site_crawl]
+    outputs: [d04]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D05"
+    legacy_id: "0.2"
+    block: 0
+    name: "UTM, click ID или исходный источник теряются либо перезаписываются"
+    requires: [visits]
+    optional: []
+    outputs: [d05]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D06"
+    legacy_id: null
+    block: 0
+    name: "Расходы посчитаны на разной базе НДС"
+    requires: [costs, client_answers]
+    optional: []
+    outputs: [d06]
+    type_default: "A+Q"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D07"
+    legacy_id: "0.6"
+    block: 0
+    name: "Расходы неполные или задвоены"
+    requires: [costs, client_answers]
+    optional: []
+    outputs: [d07]
+    type_default: "A+Q"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D08"
+    legacy_id: null
+    block: 0
+    name: "Остановленные/архивные кампании исключены из исторической выгрузки"
+    requires: [costs]
+    optional: []
+    outputs: [d08]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D09"
+    legacy_id: null
+    block: 0
+    name: "Периоды, часовые пояса или даты событий не приведены к единому правилу"
+    requires: [visits]
+    optional: [costs]
+    outputs: [d09]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D10"
+    legacy_id: null
+    block: 0
+    name: "Выгрузка неполная из-за пагинации, лимитов, фильтров или семплирования"
+    requires: [visits]
+    optional: []
+    outputs: [d10]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D11"
+    legacy_id: null
+    block: 0
+    name: "В данные попали сотрудники, тесты, боты или спам"
+    requires: [visits]
+    optional: []
+    outputs: [d11]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "D12"
+    legacy_id: null
+    block: 0
+    name: "Таблицы соединяются на неверном уровне детализации"
+    requires: [visits]
+    optional: [costs]
+    outputs: [d12]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  # ── Блок 1 (A) — экономика и эффективность платной рекламы ────────────
+  - id: "A01"
+    legacy_id: "0.4"
+    block: 1
+    name: "Кампания оптимизируется на неверную цель"
+    requires: [campaign_strategies, visits]
+    optional: []
+    outputs: [a01]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A02"
+    legacy_id: null
+    block: 1
+    name: "Стратегия максимизации кликов там, где есть стабильная конверсионная цель"
+    requires: [campaign_strategies, visits]
+    optional: [costs]
+    outputs: [a02]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A03"
+    legacy_id: null
+    block: 1
+    name: "Автостратегия обучается на переотрабатывающей/смешанной цели"
+    requires: [campaign_strategies, visits]
+    optional: []
+    outputs: [a03]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A04"
+    legacy_id: null
+    block: 1
+    name: "Кампания расходует деньги и не даёт ни одной чистой конверсии"
+    requires: [costs, visits]
+    optional: []
+    outputs: [a04]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A05"
+    legacy_id: "2.2"
+    block: 1
+    name: "CPA кампании устойчиво хуже сопоставимых кампаний"
+    requires: [costs, visits]
+    optional: []
+    outputs: [a05]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A06"
+    legacy_id: null
+    block: 1
+    name: "Бюджет распределён не по эффективности"
+    requires: [costs, visits]
+    optional: []
+    outputs: [a06]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A07"
+    legacy_id: null
+    block: 1
+    name: "Эффективная кампания теряет показы из-за бюджета или ставок"
+    requires: [costs]
+    optional: []
+    outputs: [a07]
+    type_default: "A"
+    type_downgrade_if: "campaign_report_has_lost_impression_share == false"
+    type_downgraded: "B"
+
+  - id: "A08"
+    legacy_id: null
+    block: 1
+    name: "Структура раздроблена на слишком много малых кампаний"
+    requires: [costs, visits]
+    optional: []
+    outputs: [a08]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A09"
+    legacy_id: "2.3"
+    block: 1
+    name: "Оплачиваются нецелевые поисковые запросы"
+    requires: [direct_queries]
+    optional: []
+    outputs: [a09]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A10"
+    legacy_id: null
+    block: 1
+    name: "Не хватает минус-слов"
+    requires: [direct_queries]
+    optional: []
+    outputs: [a10]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A11"
+    legacy_id: null
+    block: 1
+    name: "Автотаргетинг/широкие соответствия расширяют семантику в мусор"
+    requires: [direct_queries, visits]
+    optional: []
+    outputs: [a11]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A12"
+    legacy_id: null
+    block: 1
+    name: "Реклама показывается в нерелевантной географии"
+    requires: [costs, visits]
+    optional: []
+    outputs: [a12]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A13"
+    legacy_id: null
+    block: 1
+    name: "День недели или время показа дают устойчиво слабую экономику"
+    requires: [costs, visits]
+    optional: []
+    outputs: [a13]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A14"
+    legacy_id: null
+    block: 1
+    name: "Устройства существенно различаются по CPA и конверсии"
+    requires: [costs, visits]
+    optional: []
+    outputs: [a14]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A15"
+    legacy_id: null
+    block: 1
+    name: "Площадки РСЯ/приложения/партнёрские источники дают мусорный трафик"
+    requires: [costs, visits]
+    optional: []
+    outputs: [a15]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A16"
+    legacy_id: null
+    block: 1
+    name: "Ретаргетинг имеет чрезмерную частоту или слишком широкую аудиторию"
+    requires: [costs, visits]
+    optional: []
+    outputs: [a16]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A17"
+    legacy_id: "2.5"
+    block: 1
+    name: "Брендовая реклама каннибализирует бесплатный спрос"
+    requires: [direct_queries, seo_queries]
+    optional: []
+    outputs: [a17]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A18"
+    legacy_id: null
+    block: 1
+    name: "Кампании конкурируют друг с другом за одинаковый спрос"
+    requires: [direct_queries]
+    optional: []
+    outputs: [a18]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A19"
+    legacy_id: null
+    block: 1
+    name: "CPC аномально высок относительно близких запросов и кампаний"
+    requires: [costs, direct_queries]
+    optional: []
+    outputs: [a19]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A20"
+    legacy_id: null
+    block: 1
+    name: "Низкий CTR у релевантных показов"
+    requires: [direct_queries]
+    optional: []
+    outputs: [a20]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A21"
+    legacy_id: null
+    block: 1
+    name: "Высокий CTR сочетается с низкой конверсией"
+    requires: [direct_queries, visits]
+    optional: []
+    outputs: [a21]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A22"
+    legacy_id: "2.4"
+    block: 1
+    name: "Запрос, объявление и посадочная страница не соответствуют друг другу"
+    requires: [direct_queries, visits]
+    optional: [site_crawl]
+    outputs: [a22]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A23"
+    legacy_id: null
+    block: 1
+    name: "Конкретный спрос ведётся на слишком общую страницу"
+    requires: [visits, costs]
+    optional: []
+    outputs: [a23]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A24"
+    legacy_id: null
+    block: 1
+    name: "В объявлении устаревшая цена, акция, срок или наличие"
+    requires: [direct_queries]
+    optional: [site_crawl]
+    outputs: [a24]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A25"
+    legacy_id: null
+    block: 1
+    name: "Товарный фид содержит ошибки, дубли, неверные цены или отсутствующие товары"
+    requires: [costs]
+    optional: [site_crawl]
+    outputs: [a25]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "A26"
+    legacy_id: null
+    block: 1
+    name: "Кампании оценены без учёта лага, сезонности или малого объёма"
+    requires: [costs, visits]
+    optional: [wordstat]
+    outputs: [a26]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  # ── Блок 2 (T) — трафик, каналы и атрибуция ───────────────────────────
+  - id: "T01"
+    legacy_id: null
+    block: 2
+    name: "Внешние ссылки не размечены UTM"
+    requires: [visits]
+    optional: []
+    outputs: [t01]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "T02"
+    legacy_id: "4.1"
+    block: 2
+    name: "Прямые/внутренние/реферальные переходы скрывают исходный источник"
+    requires: [visits]
+    optional: []
+    outputs: [t02]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "T03"
+    legacy_id: null
+    block: 2
+    name: "Переход между доменами/платёжкой/виджетом создаёт self-referral"
+    requires: [visits]
+    optional: [site_crawl]
+    outputs: [t03]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "T04"
+    legacy_id: null
+    block: 2
+    name: "Каналы сравниваются по разным моделям атрибуции"
+    requires: [visits, costs]
+    optional: []
+    outputs: [t04]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "T05"
+    legacy_id: null
+    block: 2
+    name: "Брендовый и небрендовый спрос смешаны"
+    requires: [seo_queries]
+    optional: [direct_queries]
+    outputs: [t05]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "T06"
+    legacy_id: "0.5"
+    block: 2
+    name: "Звонки, карты, мессенджеры и офлайн-обращения невидимы"
+    requires: [client_answers]
+    optional: [visits]
+    outputs: [t06]
+    type_default: "A+Q"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "T07"
+    legacy_id: null
+    block: 2
+    name: "Новый/вернувшийся посетитель трактуется как новый/повторный клиент"
+    requires: [visits]
+    optional: []
+    outputs: [t07]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "T08"
+    legacy_id: null
+    block: 2
+    name: "Слишком большая зависимость от одного канала или одной кампании"
+    requires: [visits]
+    optional: [costs]
+    outputs: [t08]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "T09"
+    legacy_id: null
+    block: 2
+    name: "Резкий рост/падение канала вызвано поломкой измерений"
+    requires: [visits]
+    optional: [costs]
+    outputs: [t09]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "T10"
+    legacy_id: null
+    block: 2
+    name: "Реферальный спам, боты или технические домены приняты за канал"
+    requires: [visits]
+    optional: []
+    outputs: [t10]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  # ── Блок 3 (C) — CRO, сайт и воронка до обращения ─────────────────────
+  - id: "C01"
+    legacy_id: "1.5"
+    block: 3
+    name: "Медленная загрузка на мобильных устройствах"
+    requires: [crux]
+    optional: [visits]
+    outputs: [c01]
+    type_default: "B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C02"
+    legacy_id: null
+    block: 3
+    name: "Отдельные шаблоны значительно медленнее среднего"
+    requires: [crux]
+    optional: [visits]
+    outputs: [c02]
+    type_default: "B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C03"
+    legacy_id: null
+    block: 3
+    name: "JavaScript-ошибки ломают форму, калькулятор, фильтр или корзину"
+    requires: [site_crawl]
+    optional: [webvisor_findings]
+    outputs: [c03]
+    type_default: "B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C04"
+    legacy_id: null
+    block: 3
+    name: "Реклама и поиск ведут на 404, 5xx или недоступные страницы"
+    requires: [visits]
+    optional: [site_crawl]
+    outputs: [c04]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C05"
+    legacy_id: null
+    block: 3
+    name: "Лишние редиректы и цепочки переходов"
+    requires: [visits]
+    optional: [site_crawl]
+    outputs: [c05]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C06"
+    legacy_id: "1.1"
+    block: 3
+    name: "Большой отвал между открытием и отправкой формы"
+    requires: [visits]
+    optional: []
+    outputs: [c06]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C07"
+    legacy_id: null
+    block: 3
+    name: "Форма содержит лишние обязательные поля"
+    requires: [visits]
+    optional: [webvisor_findings]
+    outputs: [c07]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C08"
+    legacy_id: null
+    block: 3
+    name: "Маски, валидация или CAPTCHA блокируют отправку"
+    requires: [site_crawl]
+    optional: [webvisor_findings]
+    outputs: [c08]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C09"
+    legacy_id: null
+    block: 3
+    name: "Мобильные элементы неудобны: клавиатура, календарь, кнопки, списки"
+    requires: [visits]
+    optional: [webvisor_findings]
+    outputs: [c09]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C10"
+    legacy_id: null
+    block: 3
+    name: "Нет понятного подтверждения успешной отправки"
+    requires: [visits]
+    optional: [webvisor_findings]
+    outputs: [c10]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C11"
+    legacy_id: null
+    block: 3
+    name: "Событие submit фиксируется, но форма фактически не доставляет данные"
+    requires: [site_crawl]
+    optional: []
+    outputs: [c11]
+    type_default: "B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C12"
+    legacy_id: null
+    block: 3
+    name: "На первом экране непонятно, что предлагает компания и кому"
+    requires: [visits]
+    optional: [webvisor_findings]
+    outputs: [c12]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C13"
+    legacy_id: null
+    block: 3
+    name: "Цена/условия/следующий шаг раскрываются слишком поздно"
+    requires: [visits]
+    optional: [webvisor_findings]
+    outputs: [c13]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C14"
+    legacy_id: null
+    block: 3
+    name: "Недостаточно доверия: гарантии, реквизиты, кейсы, отзывы, процесс"
+    requires: [site_crawl]
+    optional: [webvisor_findings]
+    outputs: [c14]
+    type_default: "B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C15"
+    legacy_id: null
+    block: 3
+    name: "Основной CTA незаметен, неоднозначен или меняется между страницами"
+    requires: [visits]
+    optional: [site_crawl]
+    outputs: [c15]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C16"
+    legacy_id: null
+    block: 3
+    name: "На странице слишком много конкурирующих действий"
+    requires: [visits]
+    optional: []
+    outputs: [c16]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C17"
+    legacy_id: null
+    block: 3
+    name: "Нет альтернативы основной форме (звонок, мессенджер)"
+    requires: [site_crawl]
+    optional: []
+    outputs: [c17]
+    type_default: "B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C18"
+    legacy_id: null
+    block: 3
+    name: "Навигация/категории/фильтры/поиск не помогают найти нужный объект"
+    requires: [visits]
+    optional: []
+    outputs: [c18]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C19"
+    legacy_id: null
+    block: 3
+    name: "Внутренний поиск часто даёт ноль результатов"
+    requires: [visits]
+    optional: []
+    outputs: [c19]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C20"
+    legacy_id: null
+    block: 3
+    name: "Попап/чат/cookie-баннер перекрывает контент и CTA"
+    requires: [visits]
+    optional: [webvisor_findings]
+    outputs: [c20]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C21"
+    legacy_id: null
+    block: 3
+    name: "Проблема существует только в конкретном браузере, ОС или разрешении"
+    requires: [visits]
+    optional: []
+    outputs: [c21]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C22"
+    legacy_id: null
+    block: 3
+    name: "Корзина/запись/бронирование теряют пользователей на конкретном шаге"
+    requires: [visits]
+    optional: []
+    outputs: [c22]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C23"
+    legacy_id: null
+    block: 3
+    name: "Платёжный или бронирующий модуль выдаёт ошибки"
+    requires: [site_crawl]
+    optional: [visits]
+    outputs: [c23]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C24"
+    legacy_id: null
+    block: 3
+    name: "Реклама/SEO ведут на отсутствующий товар или недоступную услугу"
+    requires: [visits]
+    optional: [site_crawl]
+    outputs: [c24]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "C25"
+    legacy_id: null
+    block: 3
+    name: "Информационные страницы получают трафик, но не ведут к коммерческому действию"
+    requires: [visits]
+    optional: []
+    outputs: [c25]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  # ── Блок 4 (S) — SEO и органический спрос ─────────────────────────────
+  - id: "S01"
+    legacy_id: "5.2"
+    block: 4
+    name: "Брендовый и небрендовый органический трафик смешаны"
+    requires: [seo_queries]
+    optional: []
+    outputs: [s01]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S02"
+    legacy_id: null
+    block: 4
+    name: "Запросы на позициях 4–10 недополучают клики"
+    requires: [seo_queries]
+    optional: []
+    outputs: [s02]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S03"
+    legacy_id: "5.1"
+    block: 4
+    name: "Запросы на позициях 11–20 не дожаты до первой страницы"
+    requires: [seo_queries]
+    optional: []
+    outputs: [s03]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S04"
+    legacy_id: "5.3"
+    block: 4
+    name: "CTR аномально низкий для текущей позиции"
+    requires: [seo_queries]
+    optional: []
+    outputs: [s04]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S05"
+    legacy_id: null
+    block: 4
+    name: "Отдельные страницы или кластеры теряют клики и позиции"
+    requires: [seo_queries]
+    optional: []
+    outputs: [s05]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S06"
+    legacy_id: "5.5"
+    block: 4
+    name: "Сезонность ошибочно принимается за рост или падение SEO"
+    requires: [seo_queries]
+    optional: [wordstat]
+    outputs: [s06]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S07"
+    legacy_id: null
+    block: 4
+    name: "Есть коммерческий спрос, под который нет релевантной посадочной"
+    requires: [wordstat, seo_queries]
+    optional: [site_crawl]
+    outputs: [s07]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S08"
+    legacy_id: null
+    block: 4
+    name: "Страница не соответствует намерению запроса"
+    requires: [seo_queries, visits]
+    optional: [site_crawl]
+    outputs: [s08]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S09"
+    legacy_id: null
+    block: 4
+    name: "Несколько страниц конкурируют по одному кластеру"
+    requires: [seo_queries]
+    optional: []
+    outputs: [s09]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S10"
+    legacy_id: null
+    block: 4
+    name: "По запросу ранжируется не та страница"
+    requires: [seo_queries]
+    optional: [visits]
+    outputs: [s10]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S11"
+    legacy_id: null
+    block: 4
+    name: "Важные страницы закрыты robots.txt/noindex или требуют недоступного рендеринга"
+    requires: [seo_queries]
+    optional: [site_crawl]
+    outputs: [s11]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S12"
+    legacy_id: null
+    block: 4
+    name: "Canonical указывает на неверную страницу"
+    requires: [seo_queries]
+    optional: [site_crawl]
+    outputs: [s12]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S13"
+    legacy_id: null
+    block: 4
+    name: "Sitemap неполный, устаревший или содержит ошибочные URL"
+    requires: [seo_queries]
+    optional: [site_crawl]
+    outputs: [s13]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S14"
+    legacy_id: null
+    block: 4
+    name: "Органический трафик ведёт на 404, soft 404 или удалённые страницы"
+    requires: [seo_queries]
+    optional: [site_crawl]
+    outputs: [s14]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S15"
+    legacy_id: null
+    block: 4
+    name: "Цепочки и массовые редиректы размывают сигнал"
+    requires: [site_crawl]
+    optional: [seo_queries]
+    outputs: [s15]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S16"
+    legacy_id: null
+    block: 4
+    name: "Индекс раздут дублями, параметрами и тонкими страницами"
+    requires: [seo_queries]
+    optional: [site_crawl]
+    outputs: [s16]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S17"
+    legacy_id: null
+    block: 4
+    name: "Title/description/H1 отсутствуют, дублируются или не соответствуют спросу"
+    requires: [seo_queries]
+    optional: [site_crawl]
+    outputs: [s17]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S18"
+    legacy_id: null
+    block: 4
+    name: "Важные страницы имеют мало внутренних ссылок или являются сиротами"
+    requires: [site_crawl]
+    optional: []
+    outputs: [s18]
+    type_default: "B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S19"
+    legacy_id: null
+    block: 4
+    name: "Архитектура сайта требует слишком много кликов до коммерческой страницы"
+    requires: [site_crawl]
+    optional: [visits]
+    outputs: [s19]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S20"
+    legacy_id: null
+    block: 4
+    name: "Мобильная производительность и CWV ухудшают органическую конверсию"
+    requires: [seo_queries, crux]
+    optional: [visits]
+    outputs: [s20]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S21"
+    legacy_id: "5.4"
+    block: 4
+    name: "Яндекс и Google показывают противоположную картину"
+    requires: [seo_queries]
+    optional: []
+    outputs: [s21]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S22"
+    legacy_id: "5.6"
+    block: 4
+    name: "Контент получает органику, но не переводит её в коммерческий раздел"
+    requires: [seo_queries, visits]
+    optional: []
+    outputs: [s22]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S23"
+    legacy_id: null
+    block: 4
+    name: "Органические посадочные имеют значительно худшую конверсию"
+    requires: [seo_queries, visits]
+    optional: []
+    outputs: [s23]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S24"
+    legacy_id: null
+    block: 4
+    name: "Высококонверсионные SEO-страницы теряют видимость"
+    requires: [seo_queries, visits]
+    optional: []
+    outputs: [s24]
+    type_default: "A"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S25"
+    legacy_id: null
+    block: 4
+    name: "Сниппет не использует доступные структурированные данные и элементы выдачи"
+    requires: [seo_queries]
+    optional: [site_crawl]
+    outputs: [s25]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S26"
+    legacy_id: null
+    block: 4
+    name: "Географический/локальный спрос не покрыт отдельными релевантными страницами"
+    requires: [wordstat, seo_queries]
+    optional: [site_crawl]
+    outputs: [s26]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
+
+  - id: "S27"
+    legacy_id: null
+    block: 4
+    name: "JavaScript-контент или ссылки недоступны поисковому роботу"
+    requires: [seo_queries]
+    optional: [site_crawl]
+    outputs: [s27]
+    type_default: "A+B"
+    type_downgrade_if: null
+    type_downgraded: null
