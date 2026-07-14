@@ -495,13 +495,18 @@ def _join_backfill(df: pd.DataFrame, metrika_dir: Path) -> tuple[pd.DataFrame, d
     нет среди базовых визитов (unmatched), в canonical не попадают, но их число
     фиксируется в статистике (flags.metrika_backfill).
 
-    Если patch-поля уже присутствуют в df (schema_version=visits-v2,
+    Если backfill-директория отсутствует или пуста (schema_version=visits-v2,
     patch_backfill=false — поля вшиты в базовый CSV), merge пропускается:
-    backfill-директория пуста или отсутствует, данные брать неоткуда.
+    данные брать неоткуда.
     """
-    # patch-поля уже в df -> skip merge, только добавляем is_robot и считаем stats
-    patch_already_present = all(col in df.columns for col in _BACKFILL_COLUMNS)
-    if patch_already_present:
+    # Backfill нужен только когда в backfill/ есть файлы. Проверять col in df.columns
+    # нельзя: _parse_visit_row всегда включает patch-колонки (с None) в dict, поэтому
+    # df всегда их содержит — независимо от того, вшиты поля в базовый CSV или нет.
+    backfill_dir = Path(metrika_dir) / BACKFILL_SUBDIR
+    no_backfill_files = not backfill_dir.exists() or not any(
+        backfill_dir.glob("visits_backfill_*.csv.gz")
+    )
+    if no_backfill_files:
         df = df.copy()
         df["is_robot"] = None
         stats = {
@@ -530,8 +535,11 @@ def _join_backfill(df: pd.DataFrame, metrika_dir: Path) -> tuple[pd.DataFrame, d
     else:
         bf_df = pd.DataFrame(columns=columns)
 
-    n_before = len(df)
-    merged = df.merge(bf_df, on="visit_id", how="left")
+    # Дропаем patch-колонки из базового df перед merge: _parse_visit_row всегда
+    # включает их (с None), иначе merge создаст суффиксы _x/_y.
+    df_base = df.drop(columns=[c for c in _BACKFILL_COLUMNS if c in df.columns])
+    n_before = len(df_base)
+    merged = df_base.merge(bf_df, on="visit_id", how="left")
     # Ключи backfill уникальны (дедуплицированы) -> left join не размножает строки.
     if len(merged) != n_before:
         raise AssertionError(
