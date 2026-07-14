@@ -698,3 +698,82 @@ def test_build_seo_queries_webmaster_uses_window_end_month():
     assert df.iloc[0]["position_avg"] == pytest.approx(2.2)
     assert bool(df.iloc[0]["is_brand"]) is True
     assert df.iloc[0]["page"] is None
+
+
+# ═════════════════ Новые поля visits: naive vs lastsign ══════════════════════
+
+def test_last_traffic_source_naive_does_not_affect_source_classification(tmp_path):
+    """last_traffic_source_naive НЕ влияет на source_group/source_final (lastsign).
+
+    При расхождении naive и lastsign — source_group определяется только
+    ym:s:lastsignTrafficSource; last_traffic_source_naive записывается как есть.
+    """
+    metrika = tmp_path / "metrika_logs"
+    # lastsign = "direct" → source_group = "direct"
+    _write_base_visits(metrika, [
+        {"id": "v1", "dt": "2026-06-01 10:00:00", "src": "direct"},
+    ])
+    # naive = "ad" (расходится с lastsign "direct")
+    _write_backfill(metrika, [
+        {"ym:s:visitID": "v1", "ym:s:lastTrafficSource": "ad",
+         "ym:s:browser": "chrome", "ym:s:operatingSystem": "android",
+         "ym:s:screenWidth": "360", "ym:s:screenHeight": "780",
+         "ym:s:regionCountry": "Russia", "ym:s:regionCity": "Moscow"},
+    ])
+    df, uncertain, _ = bc.build_visits(metrika, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+
+    v1 = df[df.visit_id == "v1"].iloc[0]
+    # lastsign → source_group (naive не меняет)
+    assert v1["source_group"] == "direct"
+    # naive — отдельное поле; может расходиться с source_group
+    assert v1["last_traffic_source_naive"] == "ad"
+    # source_final и is_ad определяются только через source_group
+    assert v1["source_final"] == "direct"
+    assert v1["is_ad"] == False  # noqa: E712 — numpy bool, `is` fails
+    assert uncertain is False
+
+
+def test_dedupe_new_fields_use_last_dt_row(tmp_path):
+    """Дедуп по visit_id: browser, os, region_city и прочие новые поля берутся
+    из строки с позднейшим dt (то же правило, что и для базовых полей).
+    """
+    import gzip as _gzip
+
+    metrika = tmp_path / "metrika_logs"
+    metrika.mkdir(parents=True, exist_ok=True)
+
+    lines = ["\t".join(VISIT_FIELDS)]
+    for dt, browser, city in [
+        ("2026-06-01 08:00:00", "chrome",  "Moscow"),  # ранняя строка
+        ("2026-06-01 12:00:00", "firefox", "Kazan"),   # поздняя → должна выжить
+    ]:
+        cells = {f: "" for f in VISIT_FIELDS}
+        cells.update({
+            "ym:s:visitID": "v1",
+            "ym:s:clientID": "c1",
+            "ym:s:dateTime": dt,
+            "ym:s:lastsignTrafficSource": "direct",
+            "ym:s:deviceCategory": "1",
+            "ym:s:startURL": "https://site.ru/",
+            "ym:s:lastTrafficSource": "direct",
+            "ym:s:browser": browser,
+            "ym:s:operatingSystem": "windows",
+            "ym:s:screenWidth": "1920",
+            "ym:s:screenHeight": "1080",
+            "ym:s:regionCountry": "Russia",
+            "ym:s:regionCity": city,
+        })
+        lines.append("\t".join(cells[f] for f in VISIT_FIELDS))
+
+    with _gzip.open(metrika / "visits_2026-06-01.csv.gz", "wt", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    df, _, _ = bc.build_visits(metrika, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+
+    assert len(df) == 1                        # дедуп: одна строка
+    v1 = df.iloc[0]
+    assert v1["browser"] == "firefox"          # из строки с позднейшим dt
+    assert v1["region_city"] == "Kazan"        # из строки с позднейшим dt
+    assert v1["screen_resolution"] == "1920x1080"
+    assert v1["os"] == "windows"
+    assert v1["region_country"] == "Russia"
