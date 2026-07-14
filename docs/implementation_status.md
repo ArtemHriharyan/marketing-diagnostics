@@ -1,7 +1,7 @@
 # Статус реализации — audit 2026-07-14
 
-Тесты: `pytest tests/test_smoke.py tests/test_extract_smoke.py tests/test_build_canonical.py tests/test_verify_metrika.py tests/test_gsc_manual.py`
-Результат: **146 passed, 3 failed** из 149 (после добавления 9 тестов gsc_manual 2026-07-14).
+Тесты: `pytest tests/test_smoke.py tests/test_extract_smoke.py tests/test_build_canonical.py tests/test_verify_metrika.py tests/test_gsc_manual.py tests/test_webmaster_manual.py`
+Результат: **155 passed** из 155 (после добавления 6 тестов webmaster_manual 2026-07-14).
 
 ---
 
@@ -18,7 +18,7 @@
 | **2C** | DONE    | — |
 | **2D** | DONE    | — |
 | **3A** | DONE    | build_canonical.py базовые преобразования. GSC manual path (task_id gsc-3A): gsc_manual.py полностью реализован 2026-07-14; добавлен tests/test_gsc_manual.py (9 тестов) — 9 pass. Диспетчеризация mode:manual↔api через MODE_DISPATCH в orchestrator. gsc_api.py: полная реализация из 2C (не stub — stub сломал бы 3 прошедших теста в test_extract_smoke.py). |
-| **3B** | DONE    | исправлено 2026-07-14: условие skip-merge и drop patch-колонок перед join |
+| **3B** | DONE    | webmaster_manual: фактическая детекция page/device-колонок; manifest хранит has_page_column, has_device_column, page_device_absence_reason=method_limitation; tests/test_webmaster_manual.py (6 тестов) — 6 pass 2026-07-14 |
 | **3C** | DONE    | — |
 | **3D** | DONE    | — |
 

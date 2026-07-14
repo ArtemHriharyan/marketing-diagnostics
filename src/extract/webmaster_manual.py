@@ -109,6 +109,8 @@ def extract(
     rejected_reasons: dict[str, int] = {}
     warnings: dict[str, int] = {}
     months: list[str] = []
+    has_page_overall = False
+    has_device_overall = False
     # Агрегат по запросу за всё окно: query -> [shows, clicks, pos*shows, pos_sum, n].
     agg: dict[str, list[float]] = {}
 
@@ -116,8 +118,21 @@ def extract(
         months.append(month)
         rows = _read_export(csv_path)
         total_rows += len(rows)
+        has_p, has_d = _detect_page_device_columns(rows, column_map)
+        if has_p:
+            has_page_overall = True
+        if has_d:
+            has_device_overall = True
         _accumulate(rows, column_map, agg, rejected_reasons, warnings)
         log(f"{SOURCE}[manual]: {month} — строк {len(rows)}")
+
+    # page_device_breakdown определяется из фактически найденных колонок.
+    # Если ни page, ни device не обнаружены — ограничение метода (не только ручного
+    # экспорта): API v4 search-queries/popular тоже не отдаёт эти измерения.
+    page_device_breakdown = has_page_overall and has_device_overall
+    page_device_absence_reason: str | None = (
+        "method_limitation" if not page_device_breakdown else None
+    )
 
     popular = _to_popular(agg)
     _dump(out_dir / "search_queries_popular.json", popular)
@@ -125,8 +140,16 @@ def extract(
     report = _write_validation_report(
         out_dir, month_files, months, total_rows, len(popular),
         rejected_reasons, warnings, policy, column_map,
+        has_page_column=has_page_overall,
+        has_device_column=has_device_overall,
+        page_device_absence_reason=page_device_absence_reason,
     )
-    manifest = _record_manifest(paths, months, len(popular), policy)
+    manifest = _record_manifest(
+        paths, months, len(popular), policy,
+        has_page_column=has_page_overall,
+        has_device_column=has_device_overall,
+        page_device_absence_reason=page_device_absence_reason,
+    )
     log(f"{SOURCE}[manual]: готово — уникальных запросов {len(popular)} "
         f"из {total_rows} строк (page/device-разреза нет — ограничение метода)")
 
@@ -140,7 +163,10 @@ def extract(
         "months": months,
         "source_mode": "manual",
         "completeness": "unverified",
-        "page_device_breakdown": False,
+        "has_page_column": has_page_overall,
+        "has_device_column": has_device_overall,
+        "page_device_breakdown": page_device_breakdown,
+        "page_device_absence_reason": page_device_absence_reason,
         "manual_no_page_breakdown_policy": policy,
         "canonical_tables": CANONICAL_TABLES,
         "manifest": manifest,
@@ -153,6 +179,22 @@ def _resolve_policy(value: Any) -> str:
     """Нормализовать manual_no_page_breakdown_policy; неизвестное -> дефолт."""
     policy = str(value or DEFAULT_POLICY).strip().lower()
     return policy if policy in POLICIES else DEFAULT_POLICY
+
+
+def _detect_page_device_columns(
+    rows: list[dict[str, str]], column_map: dict[str, str]
+) -> tuple[bool, bool]:
+    """Фактически проверить наличие колонок page/device в CSV — не предполагать заранее.
+
+    Смотрит на реальные ключи первой строки данных. column_map задаёт алиасы
+    (canonical -> csv_header), поэтому ищем именно mapped-заголовок.
+    """
+    if not rows:
+        return False, False
+    keys = rows[0].keys()
+    page_col = column_map.get("page", "page")
+    device_col = column_map.get("device", "device")
+    return page_col in keys, device_col in keys
 
 
 # ── Раскладка входных файлов ────────────────────────────────────────────────
@@ -297,7 +339,12 @@ def _policy_note(policy: str) -> str:
 def _write_validation_report(
     out_dir, month_files, months, total_rows, accepted, rejected_reasons,
     warnings, policy, column_map,
+    *,
+    has_page_column: bool,
+    has_device_column: bool,
+    page_device_absence_reason: str | None,
 ) -> dict[str, Any]:
+    page_device_breakdown = has_page_column and has_device_column
     report = {
         "source_mode": "manual",
         "completeness": "unverified",
@@ -308,7 +355,10 @@ def _write_validation_report(
         "rejected": sum(rejected_reasons.values()),
         "rejected_reasons": rejected_reasons,
         "warnings": warnings,
-        "page_device_breakdown": False,
+        "has_page_column": has_page_column,
+        "has_device_column": has_device_column,
+        "page_device_breakdown": page_device_breakdown,
+        "page_device_absence_reason": page_device_absence_reason,
         "structural_limitation": _limitation_note(),
         "manual_no_page_breakdown_policy": policy,
         "policy_effect": _policy_note(policy),
@@ -321,7 +371,13 @@ def _write_validation_report(
     return report
 
 
-def _record_manifest(paths, months, rows, policy):
+def _record_manifest(
+    paths, months, rows, policy,
+    *,
+    has_page_column: bool,
+    has_device_column: bool,
+    page_device_absence_reason: str | None,
+):
     from ..pipeline import manifest as manifest_mod
 
     date_from = f"{months[0]}-01" if months else ""
@@ -336,7 +392,10 @@ def _record_manifest(paths, months, rows, policy):
         extra={
             "source_mode": "manual",
             "completeness": "unverified",
-            "page_device_breakdown": False,
+            "has_page_column": has_page_column,
+            "has_device_column": has_device_column,
+            "page_device_breakdown": has_page_column and has_device_column,
+            "page_device_absence_reason": page_device_absence_reason,
             "manual_no_page_breakdown_policy": policy,
             "notes": notes,
         },
