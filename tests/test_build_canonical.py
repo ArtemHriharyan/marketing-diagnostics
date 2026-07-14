@@ -895,3 +895,136 @@ def test_costs_vat_mixed_sources(tmp_path):
     seo = costs[costs["source_tag"] == "seo_fee"].iloc[0]
     assert seo["cost_status"] == "net"
     assert seo["cost_normalized"] == pytest.approx(seo["cost_raw"])
+
+
+# ═════════════════════════════ normalize_url / dedupe_site_* ═════════════════
+
+@pytest.mark.parametrize("raw,expected", [
+    ("https://site.ru/cars/", "https://site.ru/cars"),
+    ("https://site.ru/", "https://site.ru/"),
+    ("https://SITE.RU/cars/", "https://site.ru/cars"),
+    ("/cars/", "/cars"),
+    ("/", "/"),
+    (None, None),
+    ("", ""),
+])
+def test_normalize_url(raw, expected):
+    assert bc.normalize_url(raw) == expected
+
+
+def test_dedupe_site_pages_normalizes_and_deduplicates():
+    """Дубль URL с trailing-slash нормализуется и дедуплицируется; первая строка побеждает."""
+    df = pd.DataFrame([
+        {
+            "url": "https://site.ru/cars/",
+            "http_status": 200, "redirect_chain": "[]", "final_url": None,
+            "canonical_url": None, "robots_directive": None, "in_sitemap": True,
+            "title": "Cars", "description": None, "h1": None,
+            "crawled_at": "2026-06-01T00:00:00Z", "js_content_diff": None,
+        },
+        {
+            "url": "https://site.ru/cars",  # то же что первая после нормализации
+            "http_status": 301, "redirect_chain": "[]", "final_url": None,
+            "canonical_url": None, "robots_directive": None, "in_sitemap": False,
+            "title": "Cars dup", "description": None, "h1": None,
+            "crawled_at": "2026-06-01T00:00:01Z", "js_content_diff": None,
+        },
+        {
+            "url": "https://site.ru/about",  # уникальный
+            "http_status": 200, "redirect_chain": "[]", "final_url": None,
+            "canonical_url": None, "robots_directive": None, "in_sitemap": True,
+            "title": "About", "description": None, "h1": None,
+            "crawled_at": "2026-06-01T00:00:02Z", "js_content_diff": None,
+        },
+    ])
+    out = bc.dedupe_site_pages(df)
+    assert len(out) == 2
+    assert out.iloc[0]["url"] == "https://site.ru/cars"  # нормализован, первый сохранён
+    assert out.iloc[0]["http_status"] == 200             # первая строка победила
+    assert "https://site.ru/about" in out["url"].values
+
+
+def test_dedupe_site_link_graph_normalizes_and_deduplicates():
+    df = pd.DataFrame([
+        {"from_url": "https://site.ru/", "to_url": "https://site.ru/cars/", "depth_from_home": 1},
+        {"from_url": "https://site.ru/", "to_url": "https://site.ru/cars", "depth_from_home": 1},
+        {"from_url": "https://site.ru/", "to_url": "https://site.ru/about", "depth_from_home": 1},
+    ])
+    out = bc.dedupe_site_link_graph(df)
+    assert len(out) == 2
+    to_urls = set(out["to_url"])
+    assert "https://site.ru/cars" in to_urls
+    assert "https://site.ru/about" in to_urls
+
+
+# ═════════════════════════════ seo_queries: source_mode и completeness ════════
+
+def test_build_seo_queries_gsc_manual_unverified(tmp_path):
+    """manifest_gsc_entry с source_mode=manual -> все строки получают manual/unverified."""
+    gsc_dir = tmp_path / "gsc"
+    gsc_dir.mkdir()
+    (gsc_dir / "gsc_2026-05.csv").write_text(
+        "month,query,page,device,clicks,impressions,ctr,position\n"
+        "2026-05-01,аренда авто,https://site.ru/cars,DESKTOP,5,50,0.1,3.0\n",
+        encoding="utf-8",
+    )
+    entry = {"source_mode": "manual", "completeness": "unverified"}
+    df = bc.build_seo_queries_gsc(gsc_dir, {"brand_terms": []}, entry)
+    assert len(df) == 1
+    assert df.iloc[0]["source_mode"] == "manual"
+    assert df.iloc[0]["completeness"] == "unverified"
+
+
+def test_build_seo_queries_gsc_defaults_to_api_verified(tmp_path):
+    """Без manifest_gsc_entry -> source_mode=api, completeness=verified."""
+    gsc_dir = tmp_path / "gsc"
+    gsc_dir.mkdir()
+    (gsc_dir / "gsc_2026-05.csv").write_text(
+        "month,query,page,device,clicks,impressions,ctr,position\n"
+        "2026-05-01,прокат,https://site.ru/,MOBILE,2,20,0.1,5.0\n",
+        encoding="utf-8",
+    )
+    df = bc.build_seo_queries_gsc(gsc_dir, {"brand_terms": []})
+    assert df.iloc[0]["source_mode"] == "api"
+    assert df.iloc[0]["completeness"] == "verified"
+
+
+def test_build_seo_queries_webmaster_manual_unverified():
+    """Вебмастер manual: source_mode/completeness передаются через manifest_webmaster_entry."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        wm_dir = Path(td) / "webmaster"
+        wm_dir.mkdir()
+        popular = [{"query_text": "погнали аренда",
+                    "indicators": {"TOTAL_SHOWS": 500, "TOTAL_CLICKS": 25,
+                                   "AVG_SHOW_POSITION": 3.0}}]
+        (wm_dir / "search_queries_popular.json").write_text(
+            json.dumps(popular, ensure_ascii=False), encoding="utf-8"
+        )
+        entry = {"date_from": "2026-05-01", "date_to": "2026-06-30",
+                 "source_mode": "manual", "completeness": "unverified"}
+        df = bc.build_seo_queries_webmaster(wm_dir, entry, {"brand_terms": []})
+
+    assert df.iloc[0]["source_mode"] == "manual"
+    assert df.iloc[0]["completeness"] == "unverified"
+
+
+def test_build_seo_queries_gsc_month_without_device_not_dropped(tmp_path):
+    """Месяц без device-колонки (или device='unknown') не удаляется из seo_queries.
+
+    device не входит в каноническую схему и не используется в группировке,
+    поэтому отсутствие разбивки по устройствам не приводит к потере строк.
+    """
+    gsc_dir = tmp_path / "gsc"
+    gsc_dir.mkdir()
+    # CSV без колонки device — ровно как после ручного экспорта без фильтра устройства
+    (gsc_dir / "gsc_2026-05.csv").write_text(
+        "month,query,page,clicks,impressions,ctr,position\n"
+        "2026-05-01,аренда авто,https://site.ru/cars,5,50,0.1,3.0\n"
+        "2026-05-01,прокат авто,https://site.ru/promo,2,20,0.1,7.0\n",
+        encoding="utf-8",
+    )
+    df = bc.build_seo_queries_gsc(gsc_dir, {"brand_terms": []})
+    assert len(df) == 2
+    assert set(df["month"]) == {"2026-05"}
+    assert set(df["engine"]) == {"google"}

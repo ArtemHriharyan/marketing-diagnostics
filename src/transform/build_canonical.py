@@ -10,6 +10,8 @@
                  direct_queries.parquet  — поисковые запросы Директа
                  campaign_strategies.parquet — стратегии кампаний Директа
                  seo_queries.parquet     — запросы Вебмастер + GSC
+                 site_pages.parquet      — страницы из кролера (URL-норм., дедуп)
+                 site_link_graph.parquet — граф внутренних ссылок
                  crm.parquet             — сделки/лиды
                и data/canonical/manifest.json — какие таблицы построены и
                оговорки к ним (сейчас единственная — utm_uncertain).
@@ -152,6 +154,34 @@ def parse_bool_flag(raw: str | None) -> bool:
     return (raw or "").strip().lower() in _TRUE_TOKENS
 
 
+def normalize_url(url: str | None) -> str | None:
+    """Нормализация URL: строчные scheme/netloc, без trailing-slash (кроме корня "/").
+
+    Применяется к site_pages.url и site_link_graph.from_url/to_url для дедупликации.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    if not url:
+        return url
+    raw = str(url).strip()
+    if not raw:
+        return raw
+    try:
+        parts = urlsplit(raw)
+        path = parts.path
+        if len(path) > 1 and path.endswith("/"):
+            path = path.rstrip("/")
+        return urlunsplit((
+            parts.scheme.lower() if parts.scheme else parts.scheme,
+            parts.netloc.lower() if parts.netloc else parts.netloc,
+            path,
+            parts.query,
+            parts.fragment,
+        ))
+    except Exception:
+        return raw
+
+
 def normalize_entry_page(start_url: str | None) -> str:
     """ym:s:startURL -> нормализованный path: без домена/query/фрагмента,
 
@@ -198,6 +228,25 @@ def goal_flags(goal_ids: list[str], goals_cfg: dict[str, Any]) -> dict[str, Any]
         "messenger_click": any(g in messenger_ids for g in goal_ids),
         "form_submit_count": sum(1 for g in goal_ids if g in form_submit_ids),
     }
+
+
+def dedupe_site_pages(df: pd.DataFrame) -> pd.DataFrame:
+    """Нормализация url и дедуп по url: при дублях первая строка побеждает."""
+    if df.empty:
+        return df
+    df = df.copy()
+    df["url"] = df["url"].apply(normalize_url)
+    return df.drop_duplicates(subset="url", keep="first").reset_index(drop=True)
+
+
+def dedupe_site_link_graph(df: pd.DataFrame) -> pd.DataFrame:
+    """Нормализация from_url/to_url и дедуп по паре (from_url, to_url)."""
+    if df.empty:
+        return df
+    df = df.copy()
+    df["from_url"] = df["from_url"].apply(normalize_url)
+    df["to_url"] = df["to_url"].apply(normalize_url)
+    return df.drop_duplicates(subset=["from_url", "to_url"], keep="first").reset_index(drop=True)
 
 
 def dedupe_visits(df: pd.DataFrame) -> pd.DataFrame:
@@ -804,12 +853,18 @@ def _read_gsc_frames(gsc_dir: Path) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def build_seo_queries_gsc(gsc_dir: Path, config: dict[str, Any]) -> pd.DataFrame:
+def build_seo_queries_gsc(
+    gsc_dir: Path,
+    config: dict[str, Any],
+    manifest_gsc_entry: dict[str, Any] | None = None,
+) -> pd.DataFrame:
     """data/raw/gsc/gsc_*.{csv,parquet} -> строки seo_queries (engine=google).
 
     GSC даёт срез (query, page, device); device в канонической схеме нет,
     поэтому агрегируем по (query, page, month), суммируя clicks/impressions
-    и беря средневзвешенную по impressions позицию.
+    и беря средневзвешенную по impressions позицию. Месяц без device («unknown»)
+    не отбрасывается — device не участвует в группировке.
+    source_mode/completeness берутся из manifest_gsc_entry (по умолчанию api/verified).
     """
     raw = _read_gsc_frames(gsc_dir)
     if raw.empty:
@@ -833,6 +888,8 @@ def build_seo_queries_gsc(gsc_dir: Path, config: dict[str, Any]) -> pd.DataFrame
     )
 
     brand_terms = config.get("brand_terms") or []
+    source_mode = (manifest_gsc_entry or {}).get("source_mode", "api")
+    completeness = (manifest_gsc_entry or {}).get("completeness", "verified")
     return pd.DataFrame({
         "engine": "google",
         "query": grouped["query"],
@@ -842,6 +899,8 @@ def build_seo_queries_gsc(gsc_dir: Path, config: dict[str, Any]) -> pd.DataFrame
         "clicks": grouped["clicks"].astype(int),
         "position_avg": grouped["position_avg"],
         "is_brand": grouped["query"].apply(lambda q: is_brand_query(q, brand_terms)),
+        "source_mode": source_mode,
+        "completeness": completeness,
     })
 
 
@@ -867,6 +926,8 @@ def build_seo_queries_webmaster(
     date_to = (manifest_webmaster_entry or {}).get("date_to") or ""
     month = date_to[:7] if len(date_to) >= 7 else ""
     brand_terms = config.get("brand_terms") or []
+    source_mode = (manifest_webmaster_entry or {}).get("source_mode", "api")
+    completeness = (manifest_webmaster_entry or {}).get("completeness", "verified")
 
     rows: list[dict[str, Any]] = []
     for item in queries:
@@ -884,8 +945,29 @@ def build_seo_queries_webmaster(
             "clicks": int(indicators.get("TOTAL_CLICKS") or 0),
             "position_avg": float(position_avg) if position_avg is not None else None,
             "is_brand": is_brand_query(query, brand_terms),
+            "source_mode": source_mode,
+            "completeness": completeness,
         })
     return pd.DataFrame(rows)
+
+
+# ═══════════════════════════ Чтение сырья: site_crawl ═══════════════════════
+def build_site_pages(site_crawl_dir: Path) -> pd.DataFrame:
+    """data/raw/site_crawl/pages.parquet -> site_pages (URL-нормализация и дедуп по url)."""
+    path = Path(site_crawl_dir) / "pages.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    return dedupe_site_pages(df)
+
+
+def build_site_link_graph(site_crawl_dir: Path) -> pd.DataFrame:
+    """data/raw/site_crawl/link_graph.parquet -> site_link_graph (URL-нормализация и дедуп)."""
+    path = Path(site_crawl_dir) / "link_graph.parquet"
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(path)
+    return dedupe_site_link_graph(df)
 
 
 # ═══════════════════════════ Чтение сырья: crm ═══════════════════════════════
@@ -975,6 +1057,17 @@ SCHEMAS: dict[str, dict[str, str]] = {
     "seo_queries": {
         "engine": "string", "query": "string", "page": "string", "month": "string",
         "impressions": "int", "clicks": "int", "position_avg": "float", "is_brand": "bool",
+        "source_mode": "string",    # api | manual
+        "completeness": "string",   # verified | unverified
+    },
+    "site_pages": {
+        "url": "string", "http_status": "int", "redirect_chain": "string",
+        "final_url": "string", "canonical_url": "string", "robots_directive": "string",
+        "in_sitemap": "bool", "title": "string", "description": "string",
+        "h1": "string", "crawled_at": "string", "js_content_diff": "string",
+    },
+    "site_link_graph": {
+        "from_url": "string", "to_url": "string", "depth_from_home": "int",
     },
     "crm": {
         "lead_date": "date", "source_norm": "string", "status_norm": "string",
@@ -1089,7 +1182,7 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
 
     seo_frames: list[pd.DataFrame] = []
     if "gsc" in sources:
-        seo_frames.append(build_seo_queries_gsc(raw_dir / "gsc", config))
+        seo_frames.append(build_seo_queries_gsc(raw_dir / "gsc", config, sources.get("gsc")))
     if "webmaster" in sources:
         seo_frames.append(
             build_seo_queries_webmaster(raw_dir / "webmaster", sources.get("webmaster"), config)
@@ -1105,6 +1198,17 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
         if not crm_df.empty:
             write_canonical_table(crm_df, "crm", canonical_dir / "crm.parquet")
             built.append("crm")
+
+    if "site_crawl" in sources:
+        site_crawl_dir = raw_dir / "site_crawl"
+        sp_df = build_site_pages(site_crawl_dir)
+        if not sp_df.empty:
+            write_canonical_table(sp_df, "site_pages", canonical_dir / "site_pages.parquet")
+            built.append("site_pages")
+        slg_df = build_site_link_graph(site_crawl_dir)
+        if not slg_df.empty:
+            write_canonical_table(slg_df, "site_link_graph", canonical_dir / "site_link_graph.parquet")
+            built.append("site_link_graph")
 
     _write_canonical_manifest(canonical_dir, built, flags)
     return built
