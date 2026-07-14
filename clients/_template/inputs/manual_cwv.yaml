@@ -1,0 +1,27 @@
+# Ручной замер Core Web Vitals (лабораторные данные).
+# Заполняется аналитиком по результатам PageSpeed Insights / Lighthouse.
+# Используется когда CrUX не отдаёт полевых данных (сайт ниже порога охвата Chrome).
+# Находки из этого файла получают confidence_cap = MED (defaults.crux_min_field_data).
+
+meta:
+  tested_at: ""           # дата замера (YYYY-MM-DD)
+  tool: ""                # инструмент: PageSpeed | Lighthouse | WebPageTest | другое
+  device: ""              # desktop | mobile (один замер = одно устройство)
+  url_tested: ""          # URL главной/ключевой страницы, если замер точечный
+
+patterns: []
+# Каждый элемент — результат по одному URL:
+# [{
+#   url: "",                   # проверяемый URL
+#   lcp_ms: null,              # Largest Contentful Paint, мс
+#   cls: null,                 # Cumulative Layout Shift (безразмерный, напр. 0.12)
+#   inp_ms: null,              # Interaction to Next Paint, мс (или tbt_ms если нет INP)
+#   fcp_ms: null,              # First Contentful Paint, мс
+#   ttfb_ms: null,             # Time to First Byte, мс (опционально)
+#   performance_score: null,   # итоговый балл Lighthouse 0–100
+#   rating: "",                # good | needs_improvement | poor (общая оценка)
+#   note: ""                   # наблюдение: что именно тормозит (напр. "изображение без lazy-load")
+# }]
+
+conclusions: []    # свободные выводы аналитика; уверенность MED по умолчанию
+# [{conclusion: "", confidence: "MED"}]
