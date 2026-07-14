@@ -1,0 +1,390 @@
+"""Тесты HTTP-обхода страниц: _parse_page_meta, fetch_sitemap, crawl_pages, pages.parquet.
+
+Фикстурный мини-сайт реализован через MockSession/MockResponse без сетевых запросов.
+Сценарии: 200, redirect (301→200), 404, canonical, robots noindex,
+          наличие/отсутствие в sitemap.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from src.extract.site_crawl import (
+    PAGES_SCHEMA,
+    _parse_page_meta,
+    _parse_sitemap_xml,
+    _resolve_base_url,
+    _to_absolute,
+    crawl_pages,
+    fetch_sitemap,
+    write_pages_parquet,
+)
+
+
+# ── Вспомогательные классы для мок-сессии ────────────────────────────────────
+
+class MockResponse:
+    """Минимальный аналог requests.Response для тестов."""
+
+    def __init__(
+        self,
+        status_code: int,
+        text: str = "",
+        url: str = "",
+        history: list | None = None,
+        content_type: str = "text/html; charset=utf-8",
+    ) -> None:
+        self.status_code = status_code
+        self.text = text
+        self.url = url
+        self.history = history or []
+        self.headers = {"content-type": content_type}
+
+
+class MockSession:
+    """Заглушка requests.Session: возвращает заранее заданные ответы по URL."""
+
+    def __init__(self, responses: dict[str, MockResponse]) -> None:
+        self._responses = responses
+
+    def get(self, url: str, **kwargs) -> MockResponse:
+        if url in self._responses:
+            return self._responses[url]
+        return MockResponse(404, "", url)
+
+
+# ── HTML-фикстуры мини-сайта ──────────────────────────────────────────────────
+
+_HTML_200 = """<!DOCTYPE html>
+<html>
+<head>
+  <title>Аренда авто во Владивостоке</title>
+  <meta name="description" content="Лучшая аренда автомобилей без водителя">
+  <link rel="canonical" href="https://example.com/">
+  <meta name="robots" content="index, follow">
+</head>
+<body>
+  <h1>Аренда авто без водителя</h1>
+</body>
+</html>"""
+
+_HTML_NOINDEX = """<!DOCTYPE html>
+<html>
+<head>
+  <title>Тех-страница</title>
+  <meta name="robots" content="noindex, nofollow">
+</head>
+<body><h1>Служебная</h1></body>
+</html>"""
+
+_HTML_NON_SELF_CANONICAL = """<!DOCTYPE html>
+<html>
+<head>
+  <title>Дублирующая страница</title>
+  <link rel="canonical" href="https://example.com/">
+</head>
+<body><h1>Дубль</h1></body>
+</html>"""
+
+_HTML_MINIMAL = """<html><head><title>Простая страница</title></head>
+<body><h1>Заголовок</h1></body></html>"""
+
+_SITEMAP_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://example.com</loc></url>
+  <url><loc>https://example.com/rooms</loc></url>
+</urlset>"""
+
+BASE = "https://example.com"
+
+
+@pytest.fixture()
+def mini_site_session() -> MockSession:
+    """Сессия, имитирующая мини-сайт со всеми сценариями."""
+    redirect_intermediate = MockResponse(301, "", url=f"{BASE}/old-path")
+    response_200 = MockResponse(200, _HTML_200, url=f"{BASE}/")
+
+    # Для редиректа: history содержит промежуточный ответ, финальный status=200.
+    redirect_final = MockResponse(
+        200, _HTML_200, url=f"{BASE}/",
+        history=[redirect_intermediate],
+    )
+
+    return MockSession({
+        f"{BASE}/sitemap.xml": MockResponse(200, _SITEMAP_XML, url=f"{BASE}/sitemap.xml",
+                                             content_type="application/xml"),
+        f"{BASE}/": response_200,
+        f"{BASE}/rooms": MockResponse(200, _HTML_MINIMAL, url=f"{BASE}/rooms"),
+        f"{BASE}/redirect": redirect_final,
+        f"{BASE}/noindex": MockResponse(200, _HTML_NOINDEX, url=f"{BASE}/noindex"),
+        f"{BASE}/dup": MockResponse(200, _HTML_NON_SELF_CANONICAL, url=f"{BASE}/dup"),
+        # /missing не добавлен → MockSession вернёт 404
+    })
+
+
+# ── _parse_page_meta ──────────────────────────────────────────────────────────
+
+def test_parse_meta_extracts_title():
+    meta = _parse_page_meta(_HTML_200)
+    assert meta["title"] == "Аренда авто во Владивостоке"
+
+
+def test_parse_meta_extracts_description():
+    meta = _parse_page_meta(_HTML_200)
+    assert meta["description"] == "Лучшая аренда автомобилей без водителя"
+
+
+def test_parse_meta_extracts_h1():
+    meta = _parse_page_meta(_HTML_200)
+    assert meta["h1"] == "Аренда авто без водителя"
+
+
+def test_parse_meta_extracts_canonical():
+    meta = _parse_page_meta(_HTML_200)
+    assert meta["canonical_url"] == "https://example.com/"
+
+
+def test_parse_meta_extracts_robots():
+    meta = _parse_page_meta(_HTML_200)
+    assert meta["robots_directive"] == "index, follow"
+
+
+def test_parse_meta_noindex_robots():
+    meta = _parse_page_meta(_HTML_NOINDEX)
+    assert meta["robots_directive"] == "noindex, nofollow"
+
+
+def test_parse_meta_non_self_canonical():
+    meta = _parse_page_meta(_HTML_NON_SELF_CANONICAL)
+    assert meta["canonical_url"] == "https://example.com/"
+
+
+def test_parse_meta_empty_html_returns_nones():
+    meta = _parse_page_meta("")
+    assert meta["title"] is None
+    assert meta["h1"] is None
+    assert meta["description"] is None
+    assert meta["canonical_url"] is None
+    assert meta["robots_directive"] is None
+
+
+# ── _parse_sitemap_xml ────────────────────────────────────────────────────────
+
+def test_parse_sitemap_returns_urls():
+    urls = _parse_sitemap_xml(_SITEMAP_XML)
+    assert "https://example.com" in urls
+    assert "https://example.com/rooms" in urls
+
+
+def test_parse_sitemap_strips_trailing_slash():
+    xml = """<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url><loc>https://example.com/rooms/</loc></url>
+    </urlset>"""
+    urls = _parse_sitemap_xml(xml)
+    assert "https://example.com/rooms" in urls
+    assert "https://example.com/rooms/" not in urls
+
+
+def test_parse_sitemap_invalid_xml_returns_empty():
+    assert _parse_sitemap_xml("not xml at all") == set()
+
+
+# ── fetch_sitemap ─────────────────────────────────────────────────────────────
+
+def test_fetch_sitemap_returns_urls(mini_site_session):
+    urls = fetch_sitemap(BASE, mini_site_session)
+    assert "https://example.com" in urls
+    assert "https://example.com/rooms" in urls
+
+
+def test_fetch_sitemap_404_returns_empty():
+    session = MockSession({})  # нет sitemap.xml → 404
+    urls = fetch_sitemap(BASE, session)
+    assert urls == set()
+
+
+def test_fetch_sitemap_network_error_returns_empty():
+    class ErrSession:
+        def get(self, url, **kwargs):
+            raise ConnectionError("network down")
+
+    assert fetch_sitemap(BASE, ErrSession()) == set()
+
+
+# ── _to_absolute ──────────────────────────────────────────────────────────────
+
+def test_to_absolute_relative_path():
+    assert _to_absolute("/rooms", BASE) == "https://example.com/rooms"
+
+
+def test_to_absolute_already_absolute():
+    assert _to_absolute("https://other.com/page", BASE) == "https://other.com/page"
+
+
+def test_to_absolute_root_slash():
+    assert _to_absolute("/", BASE) == "https://example.com/"
+
+
+# ── crawl_pages — фикстурный мини-сайт ───────────────────────────────────────
+
+@pytest.fixture()
+def sitemap_urls() -> set[str]:
+    return _parse_sitemap_xml(_SITEMAP_XML)
+
+
+def _crawl(urls: list[str], session: MockSession, sitemap: set[str]) -> list[dict]:
+    return crawl_pages(urls, BASE, sitemap, session=session)
+
+
+def test_crawl_200_status(mini_site_session, sitemap_urls):
+    pages = _crawl(["/"], mini_site_session, sitemap_urls)
+    assert pages[0]["http_status"] == 200
+
+
+def test_crawl_200_populates_metadata(mini_site_session, sitemap_urls):
+    pages = _crawl(["/"], mini_site_session, sitemap_urls)
+    p = pages[0]
+    assert p["title"] == "Аренда авто во Владивостоке"
+    assert p["description"] == "Лучшая аренда автомобилей без водителя"
+    assert p["h1"] == "Аренда авто без водителя"
+    assert p["canonical_url"] == "https://example.com/"
+    assert p["robots_directive"] == "index, follow"
+
+
+def test_crawl_404_status(mini_site_session, sitemap_urls):
+    pages = _crawl(["/missing"], mini_site_session, sitemap_urls)
+    assert pages[0]["http_status"] == 404
+    assert pages[0]["title"] is None
+
+
+def test_crawl_redirect_records_chain(mini_site_session, sitemap_urls):
+    pages = _crawl(["/redirect"], mini_site_session, sitemap_urls)
+    p = pages[0]
+    assert p["http_status"] == 200
+    chain = json.loads(p["redirect_chain"])
+    assert len(chain) == 1
+    assert chain[0] == f"{BASE}/old-path"
+
+
+def test_crawl_redirect_sets_final_url(mini_site_session, sitemap_urls):
+    pages = _crawl(["/redirect"], mini_site_session, sitemap_urls)
+    assert pages[0]["final_url"] == f"{BASE}/"
+
+
+def test_crawl_no_redirect_empty_chain(mini_site_session, sitemap_urls):
+    pages = _crawl(["/"], mini_site_session, sitemap_urls)
+    chain = json.loads(pages[0]["redirect_chain"])
+    assert chain == []
+
+
+def test_crawl_canonical_non_self(mini_site_session, sitemap_urls):
+    pages = _crawl(["/dup"], mini_site_session, sitemap_urls)
+    p = pages[0]
+    assert p["canonical_url"] == "https://example.com/"
+
+
+def test_crawl_robots_noindex(mini_site_session, sitemap_urls):
+    pages = _crawl(["/noindex"], mini_site_session, sitemap_urls)
+    assert pages[0]["robots_directive"] == "noindex, nofollow"
+
+
+def test_crawl_in_sitemap_true(mini_site_session, sitemap_urls):
+    # /rooms → final_url = https://example.com/rooms → есть в sitemap
+    pages = _crawl(["/rooms"], mini_site_session, sitemap_urls)
+    assert pages[0]["in_sitemap"] is True
+
+
+def test_crawl_not_in_sitemap(mini_site_session, sitemap_urls):
+    # /noindex не указан в sitemap
+    pages = _crawl(["/noindex"], mini_site_session, sitemap_urls)
+    assert pages[0]["in_sitemap"] is False
+
+
+def test_crawl_network_error_sets_status_zero(sitemap_urls):
+    class ErrSession:
+        def get(self, url, **kwargs):
+            raise ConnectionError("timeout")
+
+    pages = crawl_pages(["/"], BASE, sitemap_urls, session=ErrSession())
+    assert pages[0]["http_status"] == 0
+    assert pages[0]["title"] is None
+
+
+def test_crawl_crawled_at_is_iso_utc(mini_site_session, sitemap_urls):
+    import re
+    pages = _crawl(["/"], mini_site_session, sitemap_urls)
+    ts = pages[0]["crawled_at"]
+    assert re.match(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", ts)
+
+
+def test_crawl_url_field_preserves_original(mini_site_session, sitemap_urls):
+    pages = _crawl(["/rooms"], mini_site_session, sitemap_urls)
+    assert pages[0]["url"] == "/rooms"
+
+
+# ── write_pages_parquet ───────────────────────────────────────────────────────
+
+def test_write_pages_parquet_schema(tmp_path, mini_site_session, sitemap_urls):
+    try:
+        import pandas as pd
+    except ImportError:
+        pytest.skip("pandas недоступен")
+
+    pages = _crawl(["/", "/missing", "/redirect"], mini_site_session, sitemap_urls)
+    out = write_pages_parquet(pages, tmp_path)
+
+    assert out.exists()
+    df = pd.read_parquet(out)
+    assert list(df.columns) == PAGES_SCHEMA
+
+
+def test_write_pages_parquet_dtypes(tmp_path, mini_site_session, sitemap_urls):
+    try:
+        import pandas as pd
+    except ImportError:
+        pytest.skip("pandas недоступен")
+
+    pages = _crawl(["/", "/missing"], mini_site_session, sitemap_urls)
+    write_pages_parquet(pages, tmp_path)
+    df = pd.read_parquet(tmp_path / "pages.parquet")
+
+    assert df["in_sitemap"].dtype == bool
+    # http_status — nullable integer (Int64)
+    assert str(df["http_status"].dtype) in ("Int64", "int64")
+
+
+def test_write_pages_parquet_row_count(tmp_path, mini_site_session, sitemap_urls):
+    try:
+        import pandas as pd
+    except ImportError:
+        pytest.skip("pandas недоступен")
+
+    urls = ["/", "/rooms", "/missing"]
+    pages = _crawl(urls, mini_site_session, sitemap_urls)
+    write_pages_parquet(pages, tmp_path)
+    df = pd.read_parquet(tmp_path / "pages.parquet")
+    assert len(df) == len(urls)
+
+
+# ── _resolve_base_url ─────────────────────────────────────────────────────────
+
+def test_resolve_base_url_from_crawl_config():
+    config = {"crawl": {"base_url": "https://site.ru"}}
+    assert _resolve_base_url(config) == "https://site.ru"
+
+
+def test_resolve_base_url_strips_trailing_slash():
+    config = {"crawl": {"base_url": "https://site.ru/"}}
+    assert _resolve_base_url(config) == "https://site.ru"
+
+
+def test_resolve_base_url_from_webmaster_host_id():
+    config = {"sources": {"webmaster": {"host_id": "https:pognali.rent:443"}}}
+    assert _resolve_base_url(config) == "https://pognali.rent"
+
+
+def test_resolve_base_url_none_when_missing():
+    assert _resolve_base_url({}) is None
