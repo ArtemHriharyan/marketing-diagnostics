@@ -3,6 +3,9 @@
 Тесты: `pytest tests/`
 Результат: **289 passed** из 289 (после task 4D 2026-07-14).
 
+Регрессия transform (task 4E, 2026-07-14): `pytest tests/test_build_canonical.py` — **92 passed**, 0 failed, 0 errors.
+Все тестируемые группы: dedupe_visits (3), apply_utm_threshold (4), expand_manual_costs (5), is_brand_query (3), classify_traffic_source (13), map_device (7), goal_flags (2), normalize_entry_page (5), classify_strategy_optimize_for (6), crm normalization (9), build() сквозные (7), build_visits backfill (4), vat normalization (7), normalize_url (7), dedupe_site_* (2), seo_queries source_mode/completeness (4), 4A–4D новые тесты — все GREEN.
+
 ---
 
 ## Таблица статусов
@@ -28,6 +31,7 @@
 | **4A** | DONE    | last_traffic_source_naive, browser, os, screen_resolution, region_country, region_city в SCHEMAS["visits"] и build_visits (inline v2 + backfill join). Два новых теста: test_last_traffic_source_naive_does_not_affect_source_classification (naive≠source_group, source_final из lastsign); test_dedupe_new_fields_use_last_dt_row (browser/region_city берётся из строки с позднейшим dt). 72 passed из 72 (test_build_canonical.py). |
 | **4B** | DONE    | Ломающее изменение costs: cost_rub заменён на cost_raw + cost_normalized + cost_status. Нормализация по finance.vat_basis_by_source (из config["finance"]); при отсутствии базы НДС — normalized=null, status=vat_basis_unknown (не «молча»). Добавлены _vat_lookup, _apply_vat_to_rows; build_costs принимает vat_basis_by_source; build() читает config.get("finance"). 7 новых тестов (net/gross/unknown/фиксы/mixed). 79 passed (test_build_canonical.py), 276 passed всего. |
 | **4D** | DONE    | site_pages.parquet + site_link_graph.parquet в canonical; normalize_url (строчные scheme/netloc, без trailing-slash) + dedupe_site_pages/dedupe_site_link_graph; seo_queries.source_mode (api\|manual) и seo_queries.completeness (verified\|unverified) — из manifest-записи источника; build() проксирует sources.get("gsc") в build_seo_queries_gsc; бренд-классификация и объединение Google/Yandex сохранены. 13 новых тестов (normalize_url, URL-дедуп страниц/графа, manual/unverified GSC+Webmaster, defaults api/verified, месяц без device не удаляется). 92 passed (test_build_canonical.py), 289 passed всего. |
+| **4E** | DONE    | Регрессия всего transform/canonical (2026-07-14). pytest tests/test_build_canonical.py — 92 passed, 0 failed. Падений нет; задачам-владельцам нечего распределять. |
 
 ---
 
