@@ -37,6 +37,8 @@
 table_source_modes, collect_manifest_flags, available_tables_from_manifest.
 Все 17 тестов test_smoke.py — pass, включая downgrade A07 (A→B), confidence_cap
 по manual-источникам, гейт перед report.
+Добавлен `tests/test_degradation.py` — 6 выделенных тестов: недоступный источник,
+type downgrade true/false, один manual required -> MED, все api -> HIGH.
 
 **1C — `src/pipeline/manifest.py`** DONE
 update_source / load_manifest работают, используются всеми экстракторами.
