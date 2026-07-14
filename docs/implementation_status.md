@@ -12,7 +12,7 @@
 | **1A** | DONE    | — |
 | **1B** | DONE    | — |
 | **1C** | DONE    | — |
-| **1D** | DONE    | — |
+| **1D** | DONE    | проверка совместимости 2026-07-14: methodology×2 pass, degradation×6 pass, config×16 pass, intake _template exit=0, intake pognali.rent exit=0 |
 | **2A** | DONE    | — |
 | **2B** | DONE    | — |
 | **2C** | DONE    | — |
