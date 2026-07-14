@@ -20,7 +20,7 @@
 | **3A** | DONE    | build_canonical.py базовые преобразования. GSC manual path (task_id gsc-3A): gsc_manual.py полностью реализован 2026-07-14; добавлен tests/test_gsc_manual.py (9 тестов) — 9 pass. Диспетчеризация mode:manual↔api через MODE_DISPATCH в orchestrator. gsc_api.py: полная реализация из 2C (не stub — stub сломал бы 3 прошедших теста в test_extract_smoke.py). |
 | **3B** | DONE    | webmaster_manual: фактическая детекция page/device-колонок; manifest хранит has_page_column, has_device_column, page_device_absence_reason=method_limitation; tests/test_webmaster_manual.py (6 тестов) — 6 pass 2026-07-14 |
 | **3C** | DONE    | — |
-| **3D** | DONE    | — |
+| **3D** | DONE    | Побочных изменений нет: 3A/3B затрагивают build_canonical.py, 3C — scripts/verify_metrika.py; wordstat.py и crm_import.py не изменены. Git-репо отсутствует (проверка кодом). 39 тестов GSC/Webmaster/CrUX/Wordstat/CRM — 39 pass 2026-07-14. |
 
 ---
 
