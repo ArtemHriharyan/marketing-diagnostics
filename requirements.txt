@@ -9,6 +9,7 @@ python-dotenv>=1.0
 
 # HTTP / API clients
 requests>=2.31
+playwright>=1.40       # headless JS-рендеринг для js_content_diff; после pip install: playwright install chromium
 tapi-yandex-metrika>=2022.4.8   # клиент Logs API / Reports API Метрики (или свой)
 
 # Stats
