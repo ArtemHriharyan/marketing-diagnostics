@@ -494,7 +494,26 @@ def _join_backfill(df: pd.DataFrame, metrika_dir: Path) -> tuple[pd.DataFrame, d
     Визит без backfill сохраняется (новые поля = null). Backfill-ключи, которых
     нет среди базовых визитов (unmatched), в canonical не попадают, но их число
     фиксируется в статистике (flags.metrika_backfill).
+
+    Если patch-поля уже присутствуют в df (schema_version=visits-v2,
+    patch_backfill=false — поля вшиты в базовый CSV), merge пропускается:
+    backfill-директория пуста или отсутствует, данные брать неоткуда.
     """
+    # patch-поля уже в df -> skip merge, только добавляем is_robot и считаем stats
+    patch_already_present = all(col in df.columns for col in _BACKFILL_COLUMNS)
+    if patch_already_present:
+        df = df.copy()
+        df["is_robot"] = None
+        stats = {
+            "backfill_rows": 0,
+            "backfill_dedup_dropped": 0,
+            "base_visits": int(len(df)),
+            "backfill_matched": 0,
+            "backfill_unmatched": 0,
+            "is_robot_available": False,
+        }
+        return df, stats
+
     by_visit, stats = _read_metrika_backfill(metrika_dir)
     base_ids = set(df["visit_id"])
     matched = sum(1 for vid in by_visit if vid in base_ids)
@@ -538,6 +557,14 @@ def _parse_visit_row(row: dict[str, str], goals_cfg: dict[str, Any]) -> dict[str
     if source_group not in _VALID_SOURCE_GROUPS:
         source_group = "other"
 
+    def _s(key: str) -> str | None:
+        v = (row.get(key) or "").strip()
+        return v or None
+
+    width = _parse_backfill_int(row.get("ym:s:screenWidth"))
+    height = _parse_backfill_int(row.get("ym:s:screenHeight"))
+    resolution = f"{width}x{height}" if (width is not None and height is not None) else None
+
     return {
         "visit_id": visit_id,
         "client_id": (row.get("ym:s:clientID") or "").strip(),
@@ -553,6 +580,15 @@ def _parse_visit_row(row: dict[str, str], goals_cfg: dict[str, Any]) -> dict[str
         "messenger_click": flags["messenger_click"],
         "form_submit_count": flags["form_submit_count"],
         "is_new_user": parse_bool_flag(row.get("ym:s:isNewUser")),
+        # patch fields: present when schema_version=visits-v2 (patch_backfill=false)
+        "last_traffic_source_naive": _s("ym:s:lastTrafficSource"),
+        "browser": _s("ym:s:browser"),
+        "os": _s("ym:s:operatingSystem"),
+        "screen_width": width,
+        "screen_height": height,
+        "screen_resolution": resolution,
+        "region_country": _s("ym:s:regionCountry"),
+        "region_city": _s("ym:s:regionCity"),
     }
 
 

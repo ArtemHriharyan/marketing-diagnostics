@@ -105,8 +105,8 @@ PATCH_ADDED_FIELDS = [
     "ym:s:screenHeight",        # C21: высота экрана
     "ym:s:regionCountry",       # A12 (нецелевая гео) / S26 (гео-спрос)
     "ym:s:regionCity",          # A12 / S26
-    "ym:s:isRobotPro",          # D11: расширенный флаг робота (замена isRobot —
-                                # отклонён API для источника visits)
+    # D11 (флаг робота): isRobot — Unknown field; isRobotPro — тариф не позволяет.
+    # Поле удалено из пробных; D11 по Logs API недоступен для данного счётчика.
 ]
 
 # GCLID в Logs API: правильный регистр — GCLID (не Gclid).
@@ -217,6 +217,12 @@ def extract(
             session, counter_id, headers, paths, src_dir,
             date_from, date_to, sleeper=sleeper, log=log,
         )
+
+    # Полная выгрузка уже выполнена с текущим патчем — пропускаем.
+    if backfill is None and _already_extracted(existing, date_from, date_to, src_dir):
+        log(f"{SOURCE}: данные за {C.fmt(date_from)}..{C.fmt(date_to)} уже выгружены (patch_date={existing['patch_date']}), пропускаем")
+        return {k: v for k, v in existing.items() if k != "fetched_at"}
+
     return _run_full(
         session, counter_id, headers, paths, src_dir,
         date_from, date_to, sleeper=sleeper, log=log,
@@ -373,6 +379,22 @@ def _assert_backfill_composition(backfill_fields: list[str]) -> None:
     stray = [f for f in new_fields if f not in PATCH_CANDIDATE_FIELDS]
     if stray:
         raise C.SourceUnavailable(SOURCE, f"backfill: посторонние поля в наборе: {stray}")
+
+
+def _already_extracted(
+    existing: dict[str, Any] | None, date_from: Any, date_to: Any, src_dir: Path,
+) -> bool:
+    """True — данные за это окно уже выгружены с текущим патчем и лежат на диске."""
+    if not existing:
+        return False
+    if existing.get("date_from") != C.fmt(date_from) or existing.get("date_to") != C.fmt(date_to):
+        return False
+    if not existing.get("patch_date"):
+        return False
+    # Файлы должны реально существовать на диске.
+    files = [p for p in Path(src_dir).glob("visits_*.csv.gz")
+             if not p.name.startswith("visits_backfill_")]
+    return bool(files)
 
 
 def _should_backfill(

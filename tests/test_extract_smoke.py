@@ -99,9 +99,10 @@ NO_SLEEP = lambda _sec: None
 
 
 # ── metrika_logs ───────────────────────────────────────────────────────────
-# Пробные поля патча, которые API может отклонить (имена сверены с документацией;
-# isRobotPro и lastSignGCLID/lastSignhasGCLID — GCLID-зонды, статус по evaluate).
-_METRIKA_BAD_FIELDS = {"ym:s:isRobotPro", "ym:s:lastSignGCLID", "ym:s:lastSignhasGCLID"}
+# Синтетический "bad" для проверки алгоритма бинарного деления negotiate.
+# В реальном API все поля патча теперь принимаются; isRobotPro удалён из кандидатов
+# (тариф). Используем lastSignhasGCLID как симулируемое отклонение.
+_METRIKA_BAD_FIELDS = {"ym:s:lastSignhasGCLID"}
 
 
 def _evaluate_route(get_session, bad=frozenset()):
@@ -177,7 +178,7 @@ def test_metrika_logs_writes_raw_and_manifest(paths):
 
 
 def test_metrika_logs_negotiation_isolates_unsupported_fields(paths):
-    """evaluate отклоняет isRobotPro/lastSignGCLID/lastSignhasGCLID -> бинарное деление изолирует именно их."""
+    """evaluate отклоняет пробное поле -> бинарное деление изолирует именно его, остальные остаются."""
     cfg = {**CONFIG_METRIKA,
            "data_window": {"date_from": "2026-06-01", "date_to": "2026-06-30"}}
 
