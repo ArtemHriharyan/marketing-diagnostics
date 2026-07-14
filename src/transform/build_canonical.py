@@ -234,6 +234,47 @@ def apply_utm_threshold(
 
 
 # ═════════════════════════════ Правила: costs ═══════════════════════════════
+_VAT_RATE = 1.2  # НДС 20%
+
+
+def _vat_lookup(vat_basis_by_source: list[dict[str, Any]]) -> dict[str, bool | None]:
+    """finance.vat_basis_by_source -> {source_tag: vat_included | None}.
+
+    vat_included=True  — расходы в кабинете указаны с НДС (gross)
+    vat_included=False — без НДС (net)
+    vat_included=None  — не указано -> база НДС неизвестна
+    Источники, не упомянутые в списке, дают vat_basis_unknown.
+    """
+    out: dict[str, bool | None] = {}
+    for entry in (vat_basis_by_source or []):
+        src = (entry.get("source") or "").strip()
+        vat = entry.get("vat_included")
+        if src:
+            out[src] = None if vat is None else bool(vat)
+    return out
+
+
+def _apply_vat_to_rows(rows: list[dict[str, Any]], vat_map: dict[str, bool | None]) -> None:
+    """In-place: добавляет cost_normalized и cost_status к каждой строке расходов.
+
+    gross (vat_included=True)  -> normalized = raw / 1.2, status = "gross"
+    net   (vat_included=False) -> normalized = raw,       status = "net"
+    иначе                      -> normalized = null,      status = "vat_basis_unknown"
+    """
+    for row in rows:
+        basis = vat_map.get(row["source_tag"])
+        raw = row["cost_raw"]
+        if basis is True:
+            row["cost_normalized"] = round(raw / _VAT_RATE, 6)
+            row["cost_status"] = "gross"
+        elif basis is False:
+            row["cost_normalized"] = raw
+            row["cost_status"] = "net"
+        else:
+            row["cost_normalized"] = None
+            row["cost_status"] = "vat_basis_unknown"
+
+
 def _iter_days(date_from: date, date_to: date) -> Iterable[date]:
     cur = date_from
     while cur <= date_to:
@@ -282,7 +323,7 @@ def expand_manual_costs(
                 "source_tag": tag,
                 "campaign_id": None,
                 "campaign_name": name,
-                "cost_rub": round(rub_month / days_in_month, 6),
+                "cost_raw": round(rub_month / days_in_month, 6),
                 "clicks": None,
                 "impressions": None,
             })
@@ -648,11 +689,14 @@ def build_costs(
     manifest_direct_entry: dict[str, Any] | None,
     config: dict[str, Any],
     defaults: dict[str, Any],
+    vat_basis_by_source: list[dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """Директ (campaign_performance.tsv) + config.costs_manual -> costs.
 
     Строится, даже если Директа нет (SEO-only клиент): фиксы из
     costs_manual разворачиваются в дневные строки для всего окна анализа.
+    cost_normalized рассчитывается по vat_basis_by_source; при отсутствии
+    базы НДС — null, cost_status="vat_basis_unknown" (не "как есть" молча).
     """
     rows: list[dict[str, Any]] = []
 
@@ -664,13 +708,13 @@ def build_costs(
                 day = datetime.strptime(date_str, "%Y-%m-%d").date()
             except ValueError:
                 continue
-            cost_raw = _to_optional_float(row.get("Cost")) or 0.0
+            raw_cost = _to_optional_float(row.get("Cost")) or 0.0
             rows.append({
                 "date": day,
                 "source_tag": "direct",
                 "campaign_id": _to_optional_str(row.get("CampaignId")),
                 "campaign_name": _to_optional_str(row.get("CampaignName")),
-                "cost_rub": round(cost_raw / micros_per_rub, 6),
+                "cost_raw": round(raw_cost / micros_per_rub, 6),
                 "clicks": int(float(row["Clicks"])) if row.get("Clicks") not in (None, "") else None,
                 "impressions": int(float(row["Impressions"])) if row.get("Impressions") not in (None, "") else None,
             })
@@ -681,6 +725,9 @@ def build_costs(
 
     if not rows:
         return pd.DataFrame()
+
+    vat_map = _vat_lookup(vat_basis_by_source or [])
+    _apply_vat_to_rows(rows, vat_map)
     return pd.DataFrame(rows)
 
 
@@ -913,8 +960,9 @@ SCHEMAS: dict[str, dict[str, str]] = {
     },
     "costs": {
         "date": "date", "source_tag": "string", "campaign_id": "string",
-        "campaign_name": "string", "cost_rub": "float", "clicks": "int",
-        "impressions": "int",
+        "campaign_name": "string",
+        "cost_raw": "float", "cost_normalized": "float", "cost_status": "string",
+        "clicks": "int", "impressions": "int",
     },
     "direct_queries": {
         "query": "string", "campaign_id": "string", "campaign_name": "string",
@@ -1019,7 +1067,9 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
 
     direct_dir = raw_dir / "direct" if "direct" in sources else None
     direct_entry = sources.get("direct")
-    costs_df = build_costs(direct_dir, direct_entry, config, defaults)
+    finance_cfg = config.get("finance") or {}
+    vat_basis = finance_cfg.get("vat_basis_by_source") or []
+    costs_df = build_costs(direct_dir, direct_entry, config, defaults, vat_basis)
     if not costs_df.empty:
         write_canonical_table(costs_df, "costs", canonical_dir / "costs.parquet")
         built.append("costs")

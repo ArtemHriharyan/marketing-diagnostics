@@ -104,7 +104,7 @@ def test_expand_manual_costs_splits_fee_across_days_in_month():
     rows = bc.expand_manual_costs(costs_manual, date(2026, 6, 1), date(2026, 6, 30))
     assert len(rows) == 30  # июнь — 30 дней, один фикс
     assert all(r["source_tag"] == "agency_fee" for r in rows)
-    assert all(r["cost_rub"] == pytest.approx(1000.0) for r in rows)  # 30000/30
+    assert all(r["cost_raw"] == pytest.approx(1000.0) for r in rows)  # 30000/30
     assert rows[0]["date"] == date(2026, 6, 1)
     assert rows[0]["campaign_id"] is None
 
@@ -118,9 +118,9 @@ def test_expand_manual_costs_multiple_fees_and_month_boundary():
     rows = bc.expand_manual_costs(costs_manual, date(2026, 7, 1), date(2026, 7, 2))
     assert len(rows) == 6  # 2 дня x 3 фикса
     by_tag = {r["source_tag"]: r for r in rows if r["date"] == date(2026, 7, 1)}
-    assert by_tag["agency_fee"]["cost_rub"] == pytest.approx(1000.0)
-    assert by_tag["seo_fee"]["cost_rub"] == pytest.approx(28000 / 31)
-    assert by_tag["yandex_business"]["cost_rub"] == pytest.approx(100.0)
+    assert by_tag["agency_fee"]["cost_raw"] == pytest.approx(1000.0)
+    assert by_tag["seo_fee"]["cost_raw"] == pytest.approx(28000 / 31)
+    assert by_tag["yandex_business"]["cost_raw"] == pytest.approx(100.0)
     assert by_tag["yandex_business"]["campaign_name"] == "yandex.biz"
 
 
@@ -383,7 +383,10 @@ def test_build_writes_only_tables_with_raw_source(tmp_path):
     assert len(costs) == 3
     assert set(costs["source_tag"]) == {"direct", "agency_fee"}
     direct_row = costs[costs["source_tag"] == "direct"].iloc[0]
-    assert direct_row["cost_rub"] == pytest.approx(5.0)
+    assert direct_row["cost_raw"] == pytest.approx(5.0)
+    # no finance config in this test -> VAT basis unknown
+    assert direct_row["cost_status"] == "vat_basis_unknown"
+    assert pd.isna(direct_row["cost_normalized"])
 
     dq = pd.read_parquet(paths.canonical / "direct_queries.parquet")
     assert dq.iloc[0]["query"] == "купить машину"
@@ -587,7 +590,9 @@ def test_build_costs_only_from_manual_fixtures_without_direct(tmp_path):
     costs = pd.read_parquet(paths.canonical / "costs.parquet")
     assert len(costs) == 2
     assert (costs["source_tag"] == "seo_fee").all()
-    assert costs.iloc[0]["cost_rub"] == pytest.approx(100.0)  # 3100/31
+    assert costs.iloc[0]["cost_raw"] == pytest.approx(100.0)  # 3100/31
+    assert (costs["cost_status"] == "vat_basis_unknown").all()
+    assert costs["cost_normalized"].isna().all()
 
 
 def test_build_no_raw_and_no_manual_costs_produces_nothing(tmp_path):
@@ -777,3 +782,116 @@ def test_dedupe_new_fields_use_last_dt_row(tmp_path):
     assert v1["screen_resolution"] == "1920x1080"
     assert v1["os"] == "windows"
     assert v1["region_country"] == "Russia"
+
+
+# ═════════════════════════ costs: VAT-нормализация ═══════════════════════════
+
+def test_vat_lookup_maps_sources_correctly():
+    vat_basis = [
+        {"source": "direct", "vat_included": False, "evidence": "счёт"},
+        {"source": "agency_fee", "vat_included": True, "evidence": "договор"},
+        {"source": "seo_fee", "vat_included": None},
+    ]
+    lk = bc._vat_lookup(vat_basis)
+    assert lk["direct"] is False
+    assert lk["agency_fee"] is True
+    assert lk["seo_fee"] is None
+    assert "other" not in lk
+
+
+def test_vat_lookup_empty_returns_empty_dict():
+    assert bc._vat_lookup([]) == {}
+    assert bc._vat_lookup(None) == {}
+
+
+def test_costs_vat_net_status(tmp_path):
+    """vat_included=false → cost_normalized=cost_raw, cost_status='net'."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    config = {
+        "costs_manual": {"seo_fee_rub_month": 3100},
+        "data_window": {"date_from": "2026-07-01", "date_to": "2026-07-01"},
+        "finance": {"vat_basis_by_source": [
+            {"source": "seo_fee", "vat_included": False},
+        ]},
+    }
+    bc.build(paths, config, {"utm_undefined_threshold": 0.25})
+    costs = pd.read_parquet(paths.canonical / "costs.parquet")
+    row = costs.iloc[0]
+    assert row["cost_status"] == "net"
+    assert row["cost_normalized"] == pytest.approx(row["cost_raw"])
+
+
+def test_costs_vat_gross_status(tmp_path):
+    """vat_included=true → cost_normalized=cost_raw/1.2, cost_status='gross'."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    config = {
+        "costs_manual": {"agency_fee_rub_month": 12000},
+        "data_window": {"date_from": "2026-07-01", "date_to": "2026-07-01"},
+        "finance": {"vat_basis_by_source": [
+            {"source": "agency_fee", "vat_included": True},
+        ]},
+    }
+    bc.build(paths, config, {"utm_undefined_threshold": 0.25})
+    costs = pd.read_parquet(paths.canonical / "costs.parquet")
+    row = costs.iloc[0]
+    assert row["cost_status"] == "gross"
+    assert row["cost_normalized"] == pytest.approx(row["cost_raw"] / 1.2)
+
+
+def test_costs_vat_basis_unknown_when_source_not_in_config(tmp_path):
+    """Источник не указан в vat_basis_by_source → normalized=null, status=vat_basis_unknown."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    config = {
+        "costs_manual": {"seo_fee_rub_month": 3100},
+        "data_window": {"date_from": "2026-07-01", "date_to": "2026-07-01"},
+        "finance": {"vat_basis_by_source": []},
+    }
+    bc.build(paths, config, {"utm_undefined_threshold": 0.25})
+    costs = pd.read_parquet(paths.canonical / "costs.parquet")
+    assert (costs["cost_status"] == "vat_basis_unknown").all()
+    assert costs["cost_normalized"].isna().all()
+
+
+def test_costs_vat_basis_unknown_when_no_finance_config(tmp_path):
+    """Нет секции finance → status=vat_basis_unknown для всех строк (не 'молча как есть')."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    config = {
+        "costs_manual": {"agency_fee_rub_month": 10000},
+        "data_window": {"date_from": "2026-07-01", "date_to": "2026-07-01"},
+    }
+    bc.build(paths, config, {"utm_undefined_threshold": 0.25})
+    costs = pd.read_parquet(paths.canonical / "costs.parquet")
+    assert (costs["cost_status"] == "vat_basis_unknown").all()
+    assert costs["cost_normalized"].isna().all()
+
+
+def test_costs_vat_mixed_sources(tmp_path):
+    """Фиксы (manual costs): два источника с разными базами НДС в одной таблице."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    config = {
+        "costs_manual": {
+            "agency_fee_rub_month": 12000,   # будет gross: 12000/31 / 1.2
+            "seo_fee_rub_month": 9300,       # будет net: 9300/31
+        },
+        "data_window": {"date_from": "2026-07-01", "date_to": "2026-07-01"},
+        "finance": {"vat_basis_by_source": [
+            {"source": "agency_fee", "vat_included": True},
+            {"source": "seo_fee", "vat_included": False},
+        ]},
+    }
+    bc.build(paths, config, {"utm_undefined_threshold": 0.25})
+    costs = pd.read_parquet(paths.canonical / "costs.parquet")
+    assert len(costs) == 2
+
+    agency = costs[costs["source_tag"] == "agency_fee"].iloc[0]
+    assert agency["cost_status"] == "gross"
+    assert agency["cost_normalized"] == pytest.approx(agency["cost_raw"] / 1.2)
+
+    seo = costs[costs["source_tag"] == "seo_fee"].iloc[0]
+    assert seo["cost_status"] == "net"
+    assert seo["cost_normalized"] == pytest.approx(seo["cost_raw"])

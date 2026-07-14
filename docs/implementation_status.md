@@ -1,7 +1,7 @@
 # Статус реализации — audit 2026-07-14
 
 Тесты: `pytest tests/test_smoke.py tests/test_extract_smoke.py tests/test_build_canonical.py tests/test_verify_metrika.py tests/test_gsc_manual.py tests/test_webmaster_manual.py tests/test_site_crawl.py tests/test_site_crawl_pages.py tests/test_site_crawl_bfs.py`
-Результат: **289 passed** из 289 (после добавления 2 тестов 4A 2026-07-14).
+Результат: **276 passed** из 276 (после ломающего изменения costs 4B 2026-07-14).
 
 ---
 
@@ -26,6 +26,7 @@
 | **3.5C** | DONE  | JS-diff + внутренние ссылки + BFS + link_graph.parquet. _LinkParser, _TextParser, _extract_links (internal/external via urljoin+netloc), _visible_text, _render_headless (playwright, мягкая деградация при отсутствии), compute_js_diff ({raw_link_count, rendered_link_count, links_only_in_rendered, text_changed}), crawl_bfs (BFS depth≤3, цикло-защита через visited, рёбра записываются для уже посещённых URL), write_link_graph_parquet (from_url,to_url,depth_from_home). PAGES_SCHEMA расширена полем js_content_diff; LINK_GRAPH_SCHEMA добавлена. extract() запускает BFS и пишет link_graph.parquet. playwright>=1.40 добавлен в requirements.txt. 50 тестов test_site_crawl_bfs.py — 50 pass 2026-07-14. |
 | **3.5D** | DONE  | Приёмка краулера на локальном мини-сайте 2026-07-14. pytest test_site_crawl.py + test_site_crawl_pages.py + test_site_crawl_bfs.py — **87 passed** из 87. Схема pages.parquet (PAGES_SCHEMA, 12 колонок) подтверждена test_write_pages_parquet_schema; схема link_graph.parquet (LINK_GRAPH_SCHEMA, 3 колонки) — test_write_link_graph_parquet_schema. Типы: http_status=Int64, in_sitemap=bool, depth_from_home=Int64. Manifest: rows/date_from/date_to/fetched_at/extracted_at/canonical_tables проходят через update_source; extra-поля total_candidates, urls_queued, pages_crawled, bfs_edges записываются без потерь. Caveat частичного покрытия: test_caveat_set_when_truncated/test_no_caveat_when_within_limit — pass; текст кавета содержит max_urls и кол-во отброшенных кандидатов. Производственный код не изменён. |
 | **4A** | DONE    | last_traffic_source_naive, browser, os, screen_resolution, region_country, region_city в SCHEMAS["visits"] и build_visits (inline v2 + backfill join). Два новых теста: test_last_traffic_source_naive_does_not_affect_source_classification (naive≠source_group, source_final из lastsign); test_dedupe_new_fields_use_last_dt_row (browser/region_city берётся из строки с позднейшим dt). 72 passed из 72 (test_build_canonical.py). |
+| **4B** | DONE    | Ломающее изменение costs: cost_rub заменён на cost_raw + cost_normalized + cost_status. Нормализация по finance.vat_basis_by_source (из config["finance"]); при отсутствии базы НДС — normalized=null, status=vat_basis_unknown (не «молча»). Добавлены _vat_lookup, _apply_vat_to_rows; build_costs принимает vat_basis_by_source; build() читает config.get("finance"). 7 новых тестов (net/gross/unknown/фиксы/mixed). 79 passed (test_build_canonical.py), 276 passed всего. |
 
 ---
 
