@@ -74,7 +74,9 @@ archived_campaigns_retrievable, feed_used в manifest. cost_basis=net_no_vat.
 - CRM: нормализация дат/статусов/сумм, SHA-256 хэш телефона, validation_report.
 - CrUX: 404 = штатно, cwv_field_data_available, p75-сводка,
   URL-запросы только если у origin данные есть.
-6 тестов — все pass.
+- Задача 3C (точечный CrUX extractor): добавлен `tests/test_crux.py` — 3 теста
+  (данные есть, данных нет/404, временная 5xx → SourceUnavailable) — все pass.
+6 + 3 = 9 тестов CrUX — все pass.
 
 ---
 
