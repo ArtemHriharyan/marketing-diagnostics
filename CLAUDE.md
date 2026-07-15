@@ -112,6 +112,28 @@ src/report/        сборка отчёта
 clients/_template/ полный шаблон клиента; копируется в clients/<name>/
 ```
 
+## Миграция data_window (клиентские конфиги)
+
+Старый формат (до июля 2026):
+```yaml
+data_window:
+  months: 12
+```
+Новый формат:
+```yaml
+data_window:
+  mode: "explicit"        # explicit | months_back
+  date_from: "2025-07-01" # 1-е число месяца
+  date_to: "2026-06-30"   # последний день месяца ИЛИ "today"
+  months_back: null
+compare_previous_period:
+  enabled: false
+  offset_months: 12
+```
+Intake автоматически распознаёт старый `months` и выводит предупреждение.
+Для клиентов с плоским `date_from`/`date_to` без поля `mode` валидация
+пропускается с предупреждением (обратная совместимость).
+
 ## Уверенность находок
 
 - `client-HIGH` — факт со слов клиента (`inputs/client_answers.yaml: client_facts`).

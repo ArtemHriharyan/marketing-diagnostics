@@ -275,6 +275,48 @@ def test_metrika_logs_backfill_preserves_old_files(paths):
     assert set(entry["dropped_fields"]) == _METRIKA_BAD_FIELDS
 
 
+def test_metrika_logs_two_windows_writes_to_subdirs_and_manifest(paths):
+    """primary_window + compare_window -> primary/ и compare/ подпапки, две записи в manifest."""
+    manifest_mod.update_global(
+        paths.raw,
+        primary_window={"date_from": "2026-06-01", "date_to": "2026-06-30"},
+        compare_window={"date_from": "2025-06-01", "date_to": "2025-06-30"},
+    )
+
+    header = "\t".join(metrika_logs.VISIT_FIELDS)
+    part_text = header + "\n" + "\t".join(["v1", "c1", "2026-06-02 10:00:00"] +
+                                          ["x"] * (len(metrika_logs.VISIT_FIELDS) - 3)) + "\n"
+
+    def poll_ok(_n):
+        return FakeResponse(json_data={"log_request": {
+            "request_id": 1, "status": "processed", "parts": [{"part_number": 0}]}})
+
+    box = {}
+    routes = [
+        _evaluate_route(lambda: box["session"]),
+        (lambda m, u: m == "POST" and u.endswith("/logrequests"),
+         FakeResponse(json_data={"log_request": {"request_id": 1, "status": "created"}})),
+        (lambda m, u: m == "GET" and u.endswith("/logrequest/1"), poll_ok),
+        (_contains("/part/0/download"), FakeResponse(text=part_text)),
+    ]
+    session = FakeSession(routes)
+    box["session"] = session
+
+    cfg_no_window = {"sources": {"metrika": {"enabled": True, "counter_id": 12345}}}
+    metrika_logs.extract(cfg_no_window, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    src = paths.raw / "metrika_logs"
+    assert sorted(src.glob("primary/*.csv.gz")), "нет файлов в primary/"
+    assert sorted(src.glob("compare/*.csv.gz")), "нет файлов в compare/"
+
+    mf = manifest_mod.load_manifest(paths.raw)
+    for key, expected_from in [("metrika_logs", "2026-06-01"),
+                                ("metrika_logs/compare", "2025-06-01")]:
+        entry = mf["sources"][key]
+        assert entry["date_from"] == expected_from, f"{key}: неверный date_from"
+        assert "date_to" in entry and "rows" in entry
+
+
 def test_metrika_logs_dead_token_raises_auth_error(paths):
     """401 на любом шаге -> AuthError с кодом «источник недоступен»."""
     routes = [(lambda m, u: True, FakeResponse(status_code=401))]
@@ -323,6 +365,37 @@ def test_metrika_reports_writes_slices_and_manifest(paths):
     # Токен нигде не утёк в сохранённое сырьё.
     for f in src_dir.glob("*.json"):
         assert "fake-metrika" not in f.read_text("utf-8")
+
+
+def test_metrika_reports_two_windows_writes_to_subdirs_and_manifest(paths):
+    """primary_window + compare_window -> primary/ и compare/ подпапки, две записи в manifest."""
+    manifest_mod.update_global(
+        paths.raw,
+        primary_window={"date_from": "2026-06-01", "date_to": "2026-06-30"},
+        compare_window={"date_from": "2025-06-01", "date_to": "2025-06-30"},
+    )
+
+    goals = {"goals": [{"id": 101, "name": "Форма"}]}
+    stat = {"data": [{"dimensions": [], "metrics": [100, 5]}], "totals": [100, 5]}
+    routes = [
+        (_contains("/goals"), FakeResponse(json_data=goals)),
+        (_contains("/stat/v1/data"), FakeResponse(json_data=stat)),
+    ]
+    session = FakeSession(routes)
+
+    cfg_no_window = {"sources": {"metrika": {"enabled": True, "counter_id": 12345}}}
+    metrika_reports.extract(cfg_no_window, ENV, paths, session=session)
+
+    src = paths.raw / "metrika_reports"
+    assert (src / "primary" / "goals_list.json").exists()
+    assert (src / "compare" / "goals_list.json").exists()
+
+    mf = manifest_mod.load_manifest(paths.raw)
+    for key, expected_from in [("metrika_reports", "2026-06-01"),
+                                ("metrika_reports/compare", "2025-06-01")]:
+        entry = mf["sources"][key]
+        assert entry["date_from"] == expected_from, f"{key}: неверный date_from"
+        assert "date_to" in entry and "rows" in entry
 
 
 def test_metrika_reports_dead_token_raises(paths):
@@ -505,6 +578,33 @@ def test_direct_has_lost_impression_share_helper():
     assert direct._has_lost_impression_share(_campaign_tsv_with_lost_is(), False) is False
     # Колонки нет в базовом отчёте -> false.
     assert direct._has_lost_impression_share(_campaign_tsv(), True) is False
+
+
+def test_direct_two_windows_writes_to_subdirs_and_manifest(paths):
+    """primary_window + compare_window -> primary/ и compare/ подпапки, две записи в manifest."""
+    manifest_mod.update_global(
+        paths.raw,
+        primary_window={"date_from": "2026-06-01", "date_to": "2026-06-30"},
+        compare_window={"date_from": "2025-06-01", "date_to": "2025-06-30"},
+    )
+
+    box = {}
+    session = FakeSession(_direct_routes(box))
+    box["session"] = session
+
+    cfg_no_window = {"sources": {"direct": {"enabled": True, "client_login": "test-login"}}}
+    direct.extract(cfg_no_window, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    src = paths.raw / "direct"
+    assert (src / "primary" / "campaign_performance.tsv").exists()
+    assert (src / "compare" / "campaign_performance.tsv").exists()
+
+    mf = manifest_mod.load_manifest(paths.raw)
+    for key, expected_from in [("direct", "2026-06-01"),
+                                ("direct/compare", "2025-06-01")]:
+        entry = mf["sources"][key]
+        assert entry["date_from"] == expected_from, f"{key}: неверный date_from"
+        assert "date_to" in entry and "rows" in entry
 
 
 def test_direct_dead_token_raises(paths):
@@ -726,6 +826,153 @@ def test_webmaster_dead_token_raises(paths):
     with pytest.raises(C.AuthError) as exc:
         webmaster_api.extract(CONFIG_WM, ENV_WM, paths, session=session)
     assert exc.value.exit_code == C.EXIT_SOURCE_UNAVAILABLE
+
+
+def test_webmaster_actual_earliest_date_recorded_when_history_short(paths):
+    """История начинается позже date_from -> manifest фиксирует actual_earliest_date."""
+    popular = {"queries": [{"query_id": "q1", "query_text": "аренда авто",
+                            "indicators": {"TOTAL_SHOWS": 500, "TOTAL_CLICKS": 20,
+                                           "AVG_SHOW_POSITION": 4.0,
+                                           "AVG_CLICK_POSITION": 3.0}}]}
+    # История усечена: начинается с 2026-06-01, хотя запрошено с 2026-05-01.
+    history = {"indicators": {"TOTAL_SHOWS": [{"date": "2026-06-01", "value": 500}],
+                              "TOTAL_CLICKS": [{"date": "2026-06-01", "value": 20}]}}
+    routes = [
+        (lambda m, u: m == "GET" and u.endswith("/user"),
+         FakeResponse(json_data={"user_id": 555})),
+        (_contains("search-queries/popular"), FakeResponse(json_data=popular)),
+        (_contains("all/history"), FakeResponse(json_data=history)),
+    ]
+    session = FakeSession(routes)
+
+    webmaster_api.extract(CONFIG_WM, ENV_WM, paths, session=session)
+
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["webmaster"]
+    assert entry["actual_earliest_date"] == "2026-06-01"
+    assert entry["requested_date_from"] == "2026-05-01"
+    # Нет compare_window -> флаг не выставляется.
+    assert "compare_window_incomplete" not in entry
+
+
+def test_webmaster_compare_window_incomplete_when_history_short(paths):
+    """compare_window запрошен, API истории не покрывает его начало -> compare_window_incomplete: true."""
+    manifest_mod.update_global(
+        paths.raw,
+        primary_window={"date_from": "2026-05-01", "date_to": "2026-06-30"},
+        compare_window={"date_from": "2025-05-01", "date_to": "2025-06-30"},
+    )
+
+    popular = {"queries": [{"query_id": "q1", "query_text": "аренда авто",
+                            "indicators": {"TOTAL_SHOWS": 500, "TOTAL_CLICKS": 20,
+                                           "AVG_SHOW_POSITION": 4.0,
+                                           "AVG_CLICK_POSITION": 3.0}}]}
+    # Primary: история покрывает запрошенный период полностью.
+    primary_history = {"indicators": {
+        "TOTAL_SHOWS": [{"date": "2026-05-01", "value": 900}],
+        "TOTAL_CLICKS": [{"date": "2026-05-01", "value": 40}],
+    }}
+    # Compare: история усечена — начинается с 2025-06-01 вместо запрошенного 2025-05-01.
+    compare_history = {"indicators": {
+        "TOTAL_SHOWS": [{"date": "2025-06-01", "value": 500}],
+        "TOTAL_CLICKS": [{"date": "2025-06-01", "value": 20}],
+    }}
+
+    def history_resp(n):
+        return FakeResponse(json_data=primary_history if n == 0 else compare_history)
+
+    routes = [
+        (lambda m, u: m == "GET" and u.endswith("/user"),
+         FakeResponse(json_data={"user_id": 555})),
+        (_contains("search-queries/popular"), FakeResponse(json_data=popular)),
+        (_contains("all/history"), history_resp),
+    ]
+    session = FakeSession(routes)
+
+    cfg_no_window = {"sources": {"webmaster": {"enabled": True,
+                                               "host_id": "https:pognali.rent:443"}}}
+    webmaster_api.extract(cfg_no_window, ENV_WM, paths, session=session)
+
+    mf = manifest_mod.load_manifest(paths.raw)
+
+    # Primary: история начинается ровно с date_from -> actual_earliest_date не пишется.
+    primary_entry = mf["sources"]["webmaster"]
+    assert "compare_window_incomplete" not in primary_entry
+    assert "actual_earliest_date" not in primary_entry
+
+    # Compare: усечение -> compare_window_incomplete + actual_earliest_date.
+    compare_entry = mf["sources"]["webmaster/compare"]
+    assert compare_entry["compare_window_incomplete"] is True
+    assert compare_entry["actual_earliest_date"] == "2025-06-01"
+    assert compare_entry["requested_date_from"] == "2025-05-01"
+    assert compare_entry["date_from"] == "2025-05-01"   # requested_date_from в manifest.date_from
+
+
+def test_gsc_actual_earliest_date_when_first_months_empty(paths):
+    """Первый месяц GSC не возвращает строк -> actual_earliest_date = начало второго месяца."""
+    box: dict = {}
+
+    def responder(n):
+        body = box["session"].calls[-1][2]["json"]
+        if body["startDate"] <= "2026-05-31":
+            return FakeResponse(json_data={"rows": []})
+        return FakeResponse(json_data={"rows": [
+            {"keys": ["аренда авто", "https://pognali.rent/", "DESKTOP"],
+             "clicks": 5, "impressions": 50, "ctr": 0.1, "position": 3.0}
+        ]})
+
+    session = FakeSession([(_contains("searchAnalytics/query"), responder)])
+    box["session"] = session
+
+    gsc_api.extract(CONFIG_GSC, ENV_GSC, paths,
+                    session=session, access_token="fake-token", sleeper=NO_SLEEP)
+
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["gsc"]
+    assert entry["actual_earliest_date"] == "2026-06-01"
+    assert entry["requested_date_from"] == "2026-05-01"
+    # Нет compare_window -> флаг не выставляется.
+    assert "compare_window_incomplete" not in entry
+
+
+def test_gsc_compare_window_incomplete_when_history_short(paths):
+    """GSC compare_window: первые месяцы пусты -> compare_window_incomplete: true."""
+    manifest_mod.update_global(
+        paths.raw,
+        primary_window={"date_from": "2026-06-01", "date_to": "2026-06-30"},
+        compare_window={"date_from": "2025-06-01", "date_to": "2025-07-31"},
+    )
+
+    box: dict = {}
+
+    def responder(n):
+        body = box["session"].calls[-1][2]["json"]
+        start = body["startDate"]
+        # Primary (2026-06): данные есть.
+        # Compare 2025-06: пусто. Compare 2025-07: данные.
+        if start == "2025-06-01":
+            return FakeResponse(json_data={"rows": []})
+        return FakeResponse(json_data={"rows": [
+            {"keys": ["q", "p", "DESKTOP"], "clicks": 3, "impressions": 30,
+             "ctr": 0.1, "position": 5.0}
+        ]})
+
+    session = FakeSession([(_contains("searchAnalytics/query"), responder)])
+    box["session"] = session
+
+    cfg_no_window = {"sources": {"gsc": {"enabled": True, "site_url": "https://pognali.rent/",
+                                         "raw_format": "csv"}}}
+    gsc_api.extract(cfg_no_window, ENV_GSC, paths,
+                    session=session, access_token="fake-token", sleeper=NO_SLEEP)
+
+    mf = manifest_mod.load_manifest(paths.raw)
+
+    primary_entry = mf["sources"]["gsc"]
+    assert "compare_window_incomplete" not in primary_entry
+    assert "actual_earliest_date" not in primary_entry   # данные с первого месяца
+
+    compare_entry = mf["sources"]["gsc/compare"]
+    assert compare_entry["compare_window_incomplete"] is True
+    assert compare_entry["actual_earliest_date"] == "2025-07-01"
+    assert compare_entry["requested_date_from"] == "2025-06-01"
 
 
 # ── gsc_manual (mode: manual — ручная выгрузка CSV) ──────────────────────────

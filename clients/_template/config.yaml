@@ -50,8 +50,27 @@ costs_manual:         # для клиентов без Директа или с 
   seo_fee_rub_month: 0        # ведение SEO, руб/мес
   other: []                   # [{name: "", rub_month: 0, source_tag: ""}]
 
+# ── Окно анализа ───────────────────────────────────────────────────────────
+# mode: explicit      — задаёшь точные даты начала и конца периода.
+#                       date_from — обязательно 1-е число месяца (напр. 2025-07-01).
+#                       date_to   — обязательно последний день месяца (напр. 2026-06-30)
+#                                   ИЛИ строка "today": текущая дата, месяц будет
+#                                   помечен как неполный (current_month_is_partial: true
+#                                   в manifest.json).
+# mode: months_back   — скользящее окно: months_back полных месяцев до конца прошлого
+#                       месяца (дату вычисляет intake автоматически).
 data_window:
-  months: 12          # окно анализа; переопределяет config/defaults.yaml
+  mode: "explicit"        # explicit | months_back
+  date_from: "2025-07-01" # только 1-е число месяца (обязательно при mode: explicit)
+  date_to: "2026-06-30"   # последний день месяца ИЛИ строка "today"
+  months_back: null       # используется только при mode: months_back (напр. 12)
+
+# Сравнение с предыдущим периодом той же длины.
+# При enabled: true intake вычислит второе окно со сдвигом назад на offset_months
+# и запишет оба окна (primary_window, compare_window) в data/raw/manifest.json.
+compare_previous_period:
+  enabled: false
+  offset_months: 12       # 12 = год к году
 
 brand_terms: []       # слова бренда для классификации бренд/небренд
 

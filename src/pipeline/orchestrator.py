@@ -11,8 +11,9 @@ LLM вызывается только внутри слоя analyze; сам ор
 
 from __future__ import annotations
 
+import calendar
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +120,142 @@ def report_gate_message(paths: ClientPaths) -> str:
     )
 
 
+# ── Вспомогательные функции для работы с датами окна ──────────────────────
+def _last_day_of_month(year: int, month: int) -> date:
+    return date(year, month, calendar.monthrange(year, month)[1])
+
+
+def _add_months(d: date, n: int) -> date:
+    """Прибавить n месяцев к дате (n может быть отрицательным). День обрезается до конца месяца."""
+    total = d.year * 12 + d.month - 1 + n
+    y, m = divmod(total, 12)
+    m += 1
+    return date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
+
+
+def _compute_compare_window(
+    primary: dict[str, str],
+    compare_cfg: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not compare_cfg or not compare_cfg.get("enabled"):
+        return None
+    offset = int(compare_cfg.get("offset_months") or 12)
+    d_from = date.fromisoformat(primary["date_from"])
+    d_to = date.fromisoformat(primary["date_to"])
+    return {
+        "date_from": _add_months(d_from, -offset).isoformat(),
+        "date_to": _add_months(d_to, -offset).isoformat(),
+    }
+
+
+def _resolve_data_window(
+    data_window: dict[str, Any] | None,
+    compare_cfg: dict[str, Any] | None,
+    log: Any,
+    _today: date | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool, list[str]]:
+    """Разобрать и валидировать секции data_window + compare_previous_period.
+
+    Возвращает (primary_window, compare_window, current_month_is_partial, errors).
+    Непустой errors -> intake должен завершиться с ошибкой.
+    _today используется только в тестах для фиксации «сегодня».
+    """
+    errors: list[str] = []
+
+    if not data_window:
+        return None, None, False, []
+
+    today = _today or date.today()
+
+    # ── Обратная совместимость: старый формат data_window.months ─────────────
+    if "months" in data_window and "mode" not in data_window:
+        log(
+            "ПРЕДУПРЕЖДЕНИЕ: устаревший формат data_window (поле months), "
+            "см. миграцию в CLAUDE.md. Интерпретируется как mode: months_back."
+        )
+        months_back = int(data_window["months"])
+        prev_last = today.replace(day=1) - timedelta(days=1)
+        d_to = _last_day_of_month(prev_last.year, prev_last.month)
+        d_from = _add_months(d_to.replace(day=1), -(months_back - 1))
+        primary = {"date_from": d_from.isoformat(), "date_to": d_to.isoformat()}
+        return primary, _compute_compare_window(primary, compare_cfg), False, []
+
+    mode = str(data_window.get("mode") or "").strip()
+
+    # ── Нет mode, нет months — старый flat-формат без строгой валидации ──────
+    if not mode:
+        log(
+            "ПРЕДУПРЕЖДЕНИЕ: data_window не содержит поля mode — "
+            "валидация окна пропущена."
+        )
+        df = data_window.get("date_from")
+        dt = data_window.get("date_to")
+        if df and dt:
+            return {"date_from": str(df), "date_to": str(dt)}, None, False, []
+        return None, None, False, []
+
+    # ── mode: months_back ────────────────────────────────────────────────────
+    if mode == "months_back":
+        months_back = int(data_window.get("months_back") or 12)
+        prev_last = today.replace(day=1) - timedelta(days=1)
+        d_to = _last_day_of_month(prev_last.year, prev_last.month)
+        d_from = _add_months(d_to.replace(day=1), -(months_back - 1))
+        primary = {"date_from": d_from.isoformat(), "date_to": d_to.isoformat()}
+        return primary, _compute_compare_window(primary, compare_cfg), False, []
+
+    # ── mode: explicit ───────────────────────────────────────────────────────
+    if mode != "explicit":
+        errors.append(
+            f"data_window.mode: неизвестный режим {mode!r}. "
+            "Допустимые значения: explicit, months_back."
+        )
+        return None, None, False, errors
+
+    date_from_str = data_window.get("date_from")
+    date_to_str = data_window.get("date_to")
+
+    if not date_from_str:
+        errors.append("data_window.date_from обязателен при mode: explicit")
+        return None, None, False, errors
+    if not date_to_str:
+        errors.append("data_window.date_to обязателен при mode: explicit")
+        return None, None, False, errors
+
+    try:
+        d_from = date.fromisoformat(str(date_from_str))
+    except ValueError:
+        errors.append(f"date_from — невалидная дата: {date_from_str!r}")
+        return None, None, False, errors
+
+    if d_from.day != 1:
+        errors.append(
+            f"date_from должен быть первым числом месяца, получено: {date_from_str}"
+        )
+        return None, None, False, errors
+
+    partial = False
+    if str(date_to_str).lower() == "today":
+        d_to = today
+        partial = True
+    else:
+        try:
+            d_to = date.fromisoformat(str(date_to_str))
+        except ValueError:
+            errors.append(f"date_to — невалидная дата: {date_to_str!r}")
+            return None, None, False, errors
+
+        last_day = _last_day_of_month(d_to.year, d_to.month)
+        if d_to != last_day:
+            errors.append(
+                f'date_to должен быть последним днём месяца или строкой "today", '
+                f"получено: {date_to_str}"
+            )
+            return None, None, False, errors
+
+    primary = {"date_from": d_from.isoformat(), "date_to": d_to.isoformat()}
+    return primary, _compute_compare_window(primary, compare_cfg), partial, []
+
+
 # ── Этапы (каркас; тяжёлая логика — в слоях) ───────────────────────────────
 def run_intake(paths: ClientPaths, log: StageLogger) -> bool:
     """Валидация config.yaml и .env, лёгкий ping заявленных API.
@@ -148,6 +285,28 @@ def run_intake(paths: ClientPaths, log: StageLogger) -> bool:
         log(f"{name:<14}{('да' if enabled else 'нет'):<10}{available:<10}")
 
     log("")
+
+    # ── Валидация data_window ────────────────────────────────────────────────
+    data_window = config.get("data_window") or {}
+    compare_cfg = config.get("compare_previous_period") or {}
+    primary_window, compare_window, partial, errors = _resolve_data_window(
+        data_window, compare_cfg, log
+    )
+
+    if errors:
+        for err in errors:
+            log(f"ОШИБКА (data_window): {err}")
+        log("intake: завершён с ошибкой — пайплайн не запущен.")
+        return False
+
+    if primary_window:
+        global_fields: dict[str, Any] = {"primary_window": primary_window}
+        if compare_window:
+            global_fields["compare_window"] = compare_window
+        if partial:
+            global_fields["current_month_is_partial"] = True
+        manifest_mod.update_global(paths.raw, **global_fields)
+
     log("intake: структура конфига валидна (ping токенов — TODO в extract).")
     return True
 

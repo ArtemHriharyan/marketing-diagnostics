@@ -81,7 +81,12 @@ def extract(
     today: Any = None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Выгрузить агрегаты для сверки в data/raw/metrika_reports/."""
+    """Выгрузить агрегаты для сверки в data/raw/metrika_reports/.
+
+    Если manifest.json содержит primary_window + compare_window (записал intake),
+    выгрузка выполняется дважды: primary -> .../primary/, compare -> .../compare/.
+    Без compare_window — единственная выгрузка в .../metrika_reports/ (обратная совместимость).
+    """
     import requests
 
     log = log or (lambda _msg: None)
@@ -95,55 +100,73 @@ def extract(
     token = C.get_token(env, "METRIKA_TOKEN", SOURCE)
     headers = _auth_headers(token)
 
-    date_from, date_to = C.resolve_window(config, defaults, today=today)
-    out_dir = C.reset_dir(C.source_dir(paths, SOURCE))
-    log(f"{SOURCE}: окно {C.fmt(date_from)}..{C.fmt(date_to)}, счётчик {counter_id}")
+    (date_from, date_to), compare_window = C.resolve_windows(
+        paths.raw, config, defaults, today=today
+    )
+    has_compare = compare_window is not None
+    base_dir = C.source_dir(paths, SOURCE)
 
-    # 1. Список целей счётчика.
-    goals = _fetch_goals(session, counter_id, headers)
-    _dump(out_dir / "goals_list.json", goals)
-    goal_ids = [g.get("id") for g in goals if g.get("id") is not None]
-    log(f"{SOURCE}: целей у счётчика — {len(goal_ids)}")
+    windows: list[tuple] = [(date_from, date_to, "primary")]
+    if has_compare:
+        windows.append((compare_window[0], compare_window[1], "compare"))
 
-    # 2. Визиты + достижения по целям, помесячно. Цели режем на батчи по 19
-    #    (лимит Stat API — 20 метрик на запрос вместе с ym:s:visits).
-    goals_by_month: list[dict[str, Any]] = []
-    for start in range(0, len(goal_ids), GOAL_BATCH):
-        batch = goal_ids[start:start + GOAL_BATCH]
-        metrics = ["ym:s:visits"] + [f"ym:s:goal{gid}reaches" for gid in batch]
-        part = _stat_by_month(
-            session, counter_id, headers, date_from, date_to,
-            metrics=metrics, dimensions=[],
+    last_result: dict[str, Any] = {}
+    for win_from, win_to, slot in windows:
+        if has_compare:
+            out_dir = C.reset_dir(base_dir / slot)
+            source_key = SOURCE if slot == "primary" else f"{SOURCE}/compare"
+        else:
+            out_dir = C.reset_dir(base_dir)
+            source_key = SOURCE
+
+        log(f"{SOURCE}: окно {C.fmt(win_from)}..{C.fmt(win_to)}, счётчик {counter_id}")
+
+        # 1. Список целей счётчика.
+        goals = _fetch_goals(session, counter_id, headers)
+        _dump(out_dir / "goals_list.json", goals)
+        goal_ids = [g.get("id") for g in goals if g.get("id") is not None]
+        log(f"{SOURCE}: целей у счётчика — {len(goal_ids)}")
+
+        # 2. Визиты + достижения по целям, помесячно.
+        goals_by_month: list[dict[str, Any]] = []
+        for start in range(0, len(goal_ids), GOAL_BATCH):
+            batch = goal_ids[start:start + GOAL_BATCH]
+            metrics = ["ym:s:visits"] + [f"ym:s:goal{gid}reaches" for gid in batch]
+            part = _stat_by_month(
+                session, counter_id, headers, win_from, win_to,
+                metrics=metrics, dimensions=[],
+            )
+            for row in part:
+                row["goal_ids"] = batch
+            goals_by_month.extend(part)
+        _dump(out_dir / "goals_by_month.json", goals_by_month)
+
+        # 3. Источники трафика, помесячно.
+        sources_by_month = _stat_by_month(
+            session, counter_id, headers, win_from, win_to,
+            metrics=["ym:s:visits"], dimensions=["ym:s:lastsignTrafficSource"],
         )
-        for entry in part:
-            entry["goal_ids"] = batch     # какие цели в этом батче (для transform)
-        goals_by_month.extend(part)
-    _dump(out_dir / "goals_by_month.json", goals_by_month)
+        _dump(out_dir / "sources_by_month.json", sources_by_month)
 
-    # 3. Источники трафика, помесячно.
-    sources_by_month = _stat_by_month(
-        session, counter_id, headers, date_from, date_to,
-        metrics=["ym:s:visits"], dimensions=["ym:s:lastsignTrafficSource"],
-    )
-    _dump(out_dir / "sources_by_month.json", sources_by_month)
+        rows = (
+            len(goals)
+            + sum(len(m["data"].get("data", [])) for m in goals_by_month)
+            + sum(len(m["data"].get("data", [])) for m in sources_by_month)
+        )
+        manifest = _record_manifest(paths, source_key, win_from, win_to, rows)
+        log(f"{SOURCE}: готово — {rows} строк агрегатов")
 
-    rows = (
-        len(goals)
-        + sum(len(m["data"].get("data", [])) for m in goals_by_month)
-        + sum(len(m["data"].get("data", [])) for m in sources_by_month)
-    )
-    manifest = _record_manifest(paths, date_from, date_to, rows)
-    log(f"{SOURCE}: готово — {rows} строк агрегатов")
+        last_result = {
+            "source": SOURCE,
+            "rows": rows,
+            "goals": len(goals),
+            "date_from": C.fmt(win_from),
+            "date_to": C.fmt(win_to),
+            "canonical_tables": CANONICAL_TABLES,
+            "manifest": manifest,
+        }
 
-    return {
-        "source": SOURCE,
-        "rows": rows,
-        "goals": len(goals),
-        "date_from": C.fmt(date_from),
-        "date_to": C.fmt(date_to),
-        "canonical_tables": CANONICAL_TABLES,
-        "manifest": manifest,
-    }
+    return last_result
 
 
 # ── Шаги Reports/Management API ────────────────────────────────────────────
@@ -192,11 +215,11 @@ def _dump(path: Path, obj: Any) -> None:
         json.dump(obj, fh, ensure_ascii=False, indent=2)
 
 
-def _record_manifest(paths, date_from, date_to, rows) -> dict[str, Any]:
+def _record_manifest(paths, source_key, date_from, date_to, rows) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
     return manifest_mod.update_source(
-        Path(paths.raw), SOURCE,
+        Path(paths.raw), source_key,
         date_from=C.fmt(date_from), date_to=C.fmt(date_to),
         rows=rows, script_version=SCRIPT_VERSION,
         canonical_tables=CANONICAL_TABLES,

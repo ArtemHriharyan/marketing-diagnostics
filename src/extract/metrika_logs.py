@@ -191,6 +191,10 @@ def extract(
             было выгружено ДО патча (см. _should_backfill); иначе полная выгрузка.
         True  — принудительная довыгрузка только новых полей в backfill/.
         False — принудительная полная выгрузка (перезапись слоя целиком).
+
+    Если manifest.json содержит primary_window + compare_window (записал intake),
+    выгрузка выполняется дважды: primary -> .../primary/, compare -> .../compare/.
+    Логика backfill, чанкинга и ретраев применяется к каждому окну независимо.
     """
     import requests
 
@@ -205,34 +209,47 @@ def extract(
     token = C.get_token(env, "METRIKA_TOKEN", SOURCE)
     headers = _auth_headers(token)
 
-    date_from, date_to = C.resolve_window(config, defaults, today=today)
-    raw_root = Path(paths.raw)
-    src_dir = C.source_dir(paths, SOURCE)
-
-    existing = (manifest_load(raw_root).get("sources") or {}).get(SOURCE)
-    do_backfill = _should_backfill(backfill, existing, date_from, date_to, src_dir)
-
-    if do_backfill:
-        return _run_backfill(
-            session, counter_id, headers, paths, src_dir,
-            date_from, date_to, sleeper=sleeper, log=log,
-        )
-
-    # Полная выгрузка уже выполнена с текущим патчем — пропускаем.
-    if backfill is None and _already_extracted(existing, date_from, date_to, src_dir):
-        log(f"{SOURCE}: данные за {C.fmt(date_from)}..{C.fmt(date_to)} уже выгружены (patch_date={existing['patch_date']}), пропускаем")
-        return {k: v for k, v in existing.items() if k != "fetched_at"}
-
-    return _run_full(
-        session, counter_id, headers, paths, src_dir,
-        date_from, date_to, sleeper=sleeper, log=log,
+    (date_from, date_to), compare_window = C.resolve_windows(
+        paths.raw, config, defaults, today=today
     )
+    raw_root = Path(paths.raw)
+    base_src_dir = C.source_dir(paths, SOURCE)
+    has_compare = compare_window is not None
+
+    windows: list[tuple] = [(date_from, date_to, "primary")]
+    if has_compare:
+        windows.append((compare_window[0], compare_window[1], "compare"))
+
+    last_result: dict[str, Any] = {}
+    for win_from, win_to, slot in windows:
+        src_dir = base_src_dir / slot if has_compare else base_src_dir
+        source_key = SOURCE if slot == "primary" else f"{SOURCE}/compare"
+        existing = (manifest_load(raw_root).get("sources") or {}).get(source_key)
+        do_backfill = _should_backfill(backfill, existing, win_from, win_to, src_dir)
+
+        if do_backfill:
+            result = _run_backfill(
+                session, counter_id, headers, paths, src_dir,
+                win_from, win_to, sleeper=sleeper, log=log, source_key=source_key,
+            )
+        elif backfill is None and _already_extracted(existing, win_from, win_to, src_dir):
+            log(f"{SOURCE}: данные за {C.fmt(win_from)}..{C.fmt(win_to)} уже выгружены "
+                f"(patch_date={existing['patch_date']}), пропускаем")
+            result = {k: v for k, v in existing.items() if k != "fetched_at"}
+        else:
+            result = _run_full(
+                session, counter_id, headers, paths, src_dir,
+                win_from, win_to, sleeper=sleeper, log=log, source_key=source_key,
+            )
+        last_result = result
+
+    return last_result
 
 
 # ── Полная выгрузка (перезапись слоя целиком) ──────────────────────────────
 def _run_full(
     session, counter_id, headers, paths, src_dir,
-    date_from, date_to, *, sleeper, log,
+    date_from, date_to, *, sleeper, log, source_key=SOURCE,
 ) -> dict[str, Any]:
     out_dir = C.reset_dir(src_dir)
     log(f"{SOURCE}: окно {C.fmt(date_from)}..{C.fmt(date_to)}, счётчик {counter_id} (полная выгрузка)")
@@ -259,7 +276,7 @@ def _run_full(
             _write_gz(out_dir / fname, text)
             parts_written += 1
 
-    manifest = _record_manifest(paths, date_from, date_to, total_rows, extra={
+    manifest = _record_manifest(paths, source_key, date_from, date_to, total_rows, extra={
         "schema_version": SCHEMA_VERSION,
         "fields": fields,
         "available_fields": fields,
@@ -290,9 +307,9 @@ def _run_full(
 # ── Довыгрузка новых полей (неизменность старого слоя) ──────────────────────
 def _run_backfill(
     session, counter_id, headers, paths, src_dir,
-    date_from, date_to, *, sleeper, log,
+    date_from, date_to, *, sleeper, log, source_key=SOURCE,
 ) -> dict[str, Any]:
-    """Выгрузить ТОЛЬКО новые поля патча в metrika_logs/backfill/, не трогая старьё."""
+    """Выгрузить ТОЛЬКО новые поля патча в <src_dir>/backfill/, не трогая старьё."""
     out_dir = Path(src_dir) / BACKFILL_SUBDIR
     out_dir.mkdir(parents=True, exist_ok=True)
     log(f"{SOURCE}: окно {C.fmt(date_from)}..{C.fmt(date_to)} — довыгрузка новых полей в "
@@ -327,7 +344,9 @@ def _run_backfill(
             parts_written += 1
 
     available = VISIT_FIELDS_BASE + accepted   # полный набор после склейки base+backfill
-    manifest = _record_manifest(paths, date_from, date_to, total_rows, extra={
+    # backfill_dir — путь относительно data/raw/ (для transform/verify_metrika).
+    backfill_dir = (Path(src_dir).relative_to(Path(paths.raw)) / BACKFILL_SUBDIR).as_posix()
+    manifest = _record_manifest(paths, source_key, date_from, date_to, total_rows, extra={
         "schema_version": SCHEMA_VERSION,
         "fields": available,
         "available_fields": available,
@@ -337,7 +356,7 @@ def _run_backfill(
         "patch_fields": accepted,
         "patch_date": PATCH_DATE,
         "patch_backfill": True,
-        "backfill_dir": f"{SOURCE}/{BACKFILL_SUBDIR}",
+        "backfill_dir": backfill_dir,
         "backfill_rows": total_rows,
         "note": ("новые поля патча довыгружены в подкаталог backfill/ "
                  "(visits_backfill_*), старые visits_* не изменялись (неизменность "
@@ -598,11 +617,11 @@ def manifest_load(raw_root: Path) -> dict[str, Any]:
     return manifest_mod.load_manifest(Path(raw_root))
 
 
-def _record_manifest(paths, date_from, date_to, rows, *, extra=None) -> dict[str, Any]:
+def _record_manifest(paths, source_key, date_from, date_to, rows, *, extra=None) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
     return manifest_mod.update_source(
-        Path(paths.raw), SOURCE,
+        Path(paths.raw), source_key,
         date_from=C.fmt(date_from), date_to=C.fmt(date_to),
         rows=rows, script_version=SCRIPT_VERSION,
         canonical_tables=CANONICAL_TABLES,

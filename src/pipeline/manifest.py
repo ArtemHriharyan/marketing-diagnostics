@@ -82,3 +82,22 @@ def update_source(
     with path.open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
     return manifest
+
+
+def update_global(raw_dir: Path, **fields: Any) -> dict[str, Any]:
+    """Записать глобальные поля верхнего уровня в manifest.json, не трогая sources.
+
+    Используется intake для записи primary_window, compare_window,
+    current_month_is_partial до старта extract.
+    """
+    manifest = load_manifest(raw_dir)
+    manifest.setdefault("sources", {})
+    for key, value in fields.items():
+        if key != "sources":
+            manifest[key] = value
+    manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
+    path = manifest_path(raw_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2)
+    return manifest

@@ -141,6 +141,41 @@ def resolve_window(
     return _months_back(today, months), today
 
 
+def resolve_windows(
+    raw_dir: Path,
+    config: dict[str, Any],
+    defaults: dict[str, Any] | None = None,
+    today: date | None = None,
+) -> tuple[tuple[date, date], tuple[date, date] | None]:
+    """Читать primary_window (и compare_window при наличии) из manifest.json intake.
+
+    Если манифест не содержит primary_window — откат на resolve_window(config, …).
+    Возвращает ((date_from, date_to), compare_or_None).
+    """
+    try:
+        from ..pipeline import manifest as manifest_mod  # локальный импорт — нет цикла
+        mf = manifest_mod.load_manifest(Path(raw_dir))
+    except Exception:
+        mf = {}
+
+    pw = mf.get("primary_window") or {}
+    cw = mf.get("compare_window") or {}
+
+    if pw.get("date_from") and pw.get("date_to"):
+        primary: tuple[date, date] = (
+            _parse_date(pw["date_from"]),
+            _parse_date(pw["date_to"]),
+        )
+    else:
+        primary = resolve_window(config, defaults, today=today)
+
+    compare: tuple[date, date] | None = None
+    if cw.get("date_from") and cw.get("date_to"):
+        compare = (_parse_date(cw["date_from"]), _parse_date(cw["date_to"]))
+
+    return primary, compare
+
+
 def month_chunks(date_from: date, date_to: date) -> list[tuple[date, date]]:
     """Разбить окно по календарным месяцам (Logs API не любит большие окна).
 

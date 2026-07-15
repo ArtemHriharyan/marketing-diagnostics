@@ -27,6 +27,17 @@ data/raw/gsc/gsc_YYYY-MM.{csv,parquet} у обоих экстракторов О
     {startDate, endDate, dimensions, rowLimit, startRow}. Пагинация: тянем
     страницами по ROW_LIMIT строк, увеличивая startRow, пока страница полная.
     Большое окно режем на календарные месяцы (помесячная разбивка сырья).
+
+Окна primary / compare:
+    Если intake записал в manifest.json primary_window + compare_window, выгрузка
+    выполняется дважды: primary -> .../primary/, compare -> .../compare/.
+    Для одиночного окна subdirectory не создаётся (обратная совместимость).
+
+Проверка покрытия:
+    После каждого окна сравниваем запрошенный date_from с самой ранней датой,
+    реально пришедшей в ответе (первый непустой месячный чанк). При расхождении
+    запись manifest содержит actual_earliest_date и requested_date_from.
+    Для compare-окна — дополнительный флаг compare_window_incomplete: true.
 """
 
 from __future__ import annotations
@@ -133,6 +144,9 @@ def extract(
 ) -> dict[str, Any]:
     """Выгрузить поисковую аналитику Google помесячно в data/raw/gsc/.
 
+    Поддерживает primary_window + compare_window: при наличии обоих данные
+    выгружаются дважды (в подкаталоги primary/ и compare/).
+
     ``access_token`` — если передан, минт токена пропускается (используется в
     тестах). Иначе токен берётся у сервисного аккаунта по GSC_CREDENTIALS_PATH.
     """
@@ -150,36 +164,62 @@ def extract(
     headers = _auth_headers(token)
     fmt = C.resolve_raw_format(gsc)
 
-    date_from, date_to = C.resolve_window(config, defaults, today=today)
-    out_dir = C.reset_dir(C.source_dir(paths, SOURCE))
+    (date_from, date_to), compare_window = C.resolve_windows(
+        paths.raw, config, defaults, today=today
+    )
+    has_compare = compare_window is not None
+    base_dir = C.source_dir(paths, SOURCE)
     query_url = f"{API_BASE}/{_site_url_path(site_url)}/searchAnalytics/query"
-    log(f"{SOURCE}: окно {C.fmt(date_from)}..{C.fmt(date_to)}, сайт {site_url}, формат {fmt}")
 
-    total_rows = 0
-    files_written = 0
-    for chunk_from, chunk_to in C.month_chunks(date_from, date_to):
-        rows = _query_window(session, query_url, headers, chunk_from, chunk_to, sleeper)
-        records = _to_records(rows, C.fmt(chunk_from))
-        out = C.write_table(out_dir / f"gsc_{C.fmt(chunk_from)}", records, RAW_FIELDS, fmt)
-        total_rows += len(records)
-        files_written += 1
-        log(f"{SOURCE}: месяц {C.fmt(chunk_from)} — {len(records)} строк -> {out.name}")
+    windows: list[tuple[Any, Any, str]] = [(date_from, date_to, "primary")]
+    if has_compare:
+        windows.append((compare_window[0], compare_window[1], "compare"))
 
-    manifest = _record_manifest(paths, date_from, date_to, total_rows, fmt)
-    log(f"{SOURCE}: готово — {files_written} файлов, {total_rows} строк")
+    last_result: dict[str, Any] = {}
+    for win_from, win_to, slot in windows:
+        if has_compare:
+            out_dir = C.reset_dir(base_dir / slot)
+            source_key = SOURCE if slot == "primary" else f"{SOURCE}/compare"
+        else:
+            out_dir = C.reset_dir(base_dir)
+            source_key = SOURCE
 
-    return {
-        "source": SOURCE,
-        "rows": total_rows,
-        "files": files_written,
-        "raw_format": fmt,
-        "date_from": C.fmt(date_from),
-        "date_to": C.fmt(date_to),
-        "source_mode": "api",
-        "completeness": "verified",
-        "canonical_tables": CANONICAL_TABLES,
-        "manifest": manifest,
-    }
+        log(f"{SOURCE}: окно {C.fmt(win_from)}..{C.fmt(win_to)}, сайт {site_url}, формат {fmt}")
+
+        total_rows = 0
+        files_written = 0
+        # Самый ранний месячный чанк, по которому API вернул непустые строки.
+        actual_earliest: str | None = None
+        for chunk_from, chunk_to in C.month_chunks(win_from, win_to):
+            rows = _query_window(session, query_url, headers, chunk_from, chunk_to, sleeper)
+            if rows and actual_earliest is None:
+                actual_earliest = C.fmt(chunk_from)
+            records = _to_records(rows, C.fmt(chunk_from))
+            out = C.write_table(out_dir / f"gsc_{C.fmt(chunk_from)}", records, RAW_FIELDS, fmt)
+            total_rows += len(records)
+            files_written += 1
+            log(f"{SOURCE}: месяц {C.fmt(chunk_from)} — {len(records)} строк -> {out.name}")
+
+        manifest = _record_manifest(
+            paths, source_key, win_from, win_to, total_rows, fmt,
+            actual_earliest, is_compare=(slot == "compare"),
+        )
+        log(f"{SOURCE}: готово — {files_written} файлов, {total_rows} строк")
+
+        last_result = {
+            "source": SOURCE,
+            "rows": total_rows,
+            "files": files_written,
+            "raw_format": fmt,
+            "date_from": C.fmt(win_from),
+            "date_to": C.fmt(win_to),
+            "source_mode": "api",
+            "completeness": "verified",
+            "canonical_tables": CANONICAL_TABLES,
+            "manifest": manifest,
+        }
+
+    return last_result
 
 
 # ── Search Analytics API ────────────────────────────────────────────────────
@@ -228,14 +268,36 @@ def _to_records(rows: list[dict[str, Any]], month: str) -> list[dict[str, Any]]:
     return records
 
 
-def _record_manifest(paths, date_from, date_to, rows, fmt) -> dict[str, Any]:
+def _record_manifest(
+    paths: Any,
+    source_key: str,
+    date_from: Any,
+    date_to: Any,
+    rows: int,
+    fmt: str,
+    actual_earliest: str | None,
+    *,
+    is_compare: bool,
+) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
+    extra: dict[str, Any] = {
+        "engine": "google",
+        "raw_format": fmt,
+        "source_mode": "api",
+        "completeness": "verified",
+    }
+    requested_str = C.fmt(date_from)
+    if actual_earliest and actual_earliest > requested_str:
+        extra["requested_date_from"] = requested_str
+        extra["actual_earliest_date"] = actual_earliest
+        if is_compare:
+            extra["compare_window_incomplete"] = True
+
     return manifest_mod.update_source(
-        Path(paths.raw), SOURCE,
-        date_from=C.fmt(date_from), date_to=C.fmt(date_to),
+        Path(paths.raw), source_key,
+        date_from=requested_str, date_to=C.fmt(date_to),
         rows=rows, script_version=SCRIPT_VERSION,
         canonical_tables=CANONICAL_TABLES,
-        extra={"engine": "google", "raw_format": fmt,
-               "source_mode": "api", "completeness": "verified"},
+        extra=extra,
     )

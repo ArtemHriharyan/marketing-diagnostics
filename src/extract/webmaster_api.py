@@ -32,6 +32,17 @@
     ряд короче запрошенного окна (усечён слева), это НЕ ошибка — фиксируем
     ограничение честно в manifest.notes, чтобы аналитик не принял усечённые
     данные за реальный старт трафика.
+
+Окна primary / compare:
+    Если intake записал в manifest.json primary_window + compare_window, выгрузка
+    выполняется дважды: primary -> .../primary/, compare -> .../compare/.
+    Для одиночного окна subdirectory не создаётся (обратная совместимость).
+
+Проверка покрытия:
+    После каждого окна сравниваем запрошенный date_from с самой ранней датой
+    в ряде history. При расхождении manifest содержит actual_earliest_date и
+    requested_date_from. Для compare-окна — дополнительный флаг
+    compare_window_incomplete: true. Пайплайн НЕ прерывается.
 """
 
 from __future__ import annotations
@@ -131,7 +142,11 @@ def extract(
     today: Any = None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Выгрузить популярные запросы и историю в data/raw/webmaster/."""
+    """Выгрузить популярные запросы и историю в data/raw/webmaster/.
+
+    Поддерживает primary_window + compare_window: при наличии обоих данные
+    выгружаются дважды (в подкаталоги primary/ и compare/).
+    """
     import requests
 
     log = log or (lambda _msg: None)
@@ -145,39 +160,62 @@ def extract(
     token = C.get_token(env, "WEBMASTER_TOKEN", SOURCE)
     headers = _auth_headers(token)
 
-    date_from, date_to = C.resolve_window(config, defaults, today=today)
-    out_dir = C.reset_dir(C.source_dir(paths, SOURCE))
+    (date_from, date_to), compare_window = C.resolve_windows(
+        paths.raw, config, defaults, today=today
+    )
+    has_compare = compare_window is not None
+    base_dir = C.source_dir(paths, SOURCE)
 
     user_id = _fetch_user_id(session, headers)
     host_base = f"{API_BASE}/user/{user_id}/hosts/{_host_segment(host_id)}"
-    log(f"{SOURCE}: окно {C.fmt(date_from)}..{C.fmt(date_to)}, host {host_id}")
 
-    # 1. Популярные запросы за окно (постранично).
-    popular = _fetch_popular(session, host_base, headers, date_from, date_to)
-    _dump(out_dir / "search_queries_popular.json", popular)
-    log(f"{SOURCE}: популярных запросов — {len(popular)}")
+    windows: list[tuple[Any, Any, str]] = [(date_from, date_to, "primary")]
+    if has_compare:
+        windows.append((compare_window[0], compare_window[1], "compare"))
 
-    # 2. Временной ряд суммарных показов/кликов (максимум истории).
-    history = _fetch_history(session, host_base, headers, date_from, date_to)
-    _dump(out_dir / "search_queries_history.json", history)
+    last_result: dict[str, Any] = {}
+    for win_from, win_to, slot in windows:
+        if has_compare:
+            out_dir = C.reset_dir(base_dir / slot)
+            source_key = SOURCE if slot == "primary" else f"{SOURCE}/compare"
+        else:
+            out_dir = C.reset_dir(base_dir)
+            source_key = SOURCE
 
-    # Честная отметка об ограничении глубины истории.
-    notes = _history_notes(history, date_from)
-    manifest = _record_manifest(paths, date_from, date_to, len(popular), notes)
-    if notes:
-        log(f"{SOURCE}: ограничение истории — {notes[0]}")
-    log(f"{SOURCE}: готово — {len(popular)} запросов, история из {len(history.get('indicators', {}))} рядов")
+        log(f"{SOURCE}: окно {C.fmt(win_from)}..{C.fmt(win_to)}, host {host_id}")
 
-    return {
-        "source": SOURCE,
-        "rows": len(popular),
-        "date_from": C.fmt(date_from),
-        "date_to": C.fmt(date_to),
-        "notes": notes,
-        "source_mode": "api",
-        "canonical_tables": CANONICAL_TABLES,
-        "manifest": manifest,
-    }
+        # 1. Популярные запросы за окно (постранично).
+        popular = _fetch_popular(session, host_base, headers, win_from, win_to)
+        _dump(out_dir / "search_queries_popular.json", popular)
+        log(f"{SOURCE}: популярных запросов — {len(popular)}")
+
+        # 2. Временной ряд суммарных показов/кликов (максимум истории).
+        history = _fetch_history(session, host_base, headers, win_from, win_to)
+        _dump(out_dir / "search_queries_history.json", history)
+
+        actual_earliest = _earliest_history_date(history)
+        notes = _history_notes(history, win_from)
+        manifest = _record_manifest(
+            paths, source_key, win_from, win_to, len(popular), notes,
+            actual_earliest, is_compare=(slot == "compare"),
+        )
+        if notes:
+            log(f"{SOURCE}: ограничение истории — {notes[0]}")
+        log(f"{SOURCE}: готово — {len(popular)} запросов, "
+            f"история из {len(history.get('indicators', {}))} рядов")
+
+        last_result = {
+            "source": SOURCE,
+            "rows": len(popular),
+            "date_from": C.fmt(win_from),
+            "date_to": C.fmt(win_to),
+            "notes": notes,
+            "source_mode": "api",
+            "canonical_tables": CANONICAL_TABLES,
+            "manifest": manifest,
+        }
+
+    return last_result
 
 
 # ── Шаги Webmaster API ──────────────────────────────────────────────────────
@@ -235,7 +273,7 @@ def _fetch_history(session, host_base, headers, date_from, date_to) -> dict[str,
     return resp.json() or {}
 
 
-def _history_notes(history: dict[str, Any], requested_from) -> list[str]:
+def _history_notes(history: dict[str, Any], requested_from: Any) -> list[str]:
     """Сформировать честные заметки об ограничении глубины истории.
 
     Вебмастер API отдаёт историю мельче веб-интерфейса. Если самый ранний
@@ -273,14 +311,35 @@ def _dump(path: Path, obj: Any) -> None:
         json.dump(obj, fh, ensure_ascii=False, indent=2)
 
 
-def _record_manifest(paths, date_from, date_to, rows, notes) -> dict[str, Any]:
+def _record_manifest(
+    paths: Any,
+    source_key: str,
+    date_from: Any,
+    date_to: Any,
+    rows: int,
+    notes: list[str],
+    actual_earliest: str | None,
+    *,
+    is_compare: bool,
+) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
+    extra: dict[str, Any] = {
+        "notes": notes,
+        "source_mode": "api",
+        "page_device_breakdown": False,
+    }
+    requested_str = C.fmt(date_from)
+    if actual_earliest and actual_earliest > requested_str:
+        extra["requested_date_from"] = requested_str
+        extra["actual_earliest_date"] = actual_earliest
+        if is_compare:
+            extra["compare_window_incomplete"] = True
+
     return manifest_mod.update_source(
-        Path(paths.raw), SOURCE,
-        date_from=C.fmt(date_from), date_to=C.fmt(date_to),
+        Path(paths.raw), source_key,
+        date_from=requested_str, date_to=C.fmt(date_to),
         rows=rows, script_version=SCRIPT_VERSION,
         canonical_tables=CANONICAL_TABLES,
-        extra={"notes": notes, "source_mode": "api",
-               "page_device_breakdown": False},
+        extra=extra,
     )

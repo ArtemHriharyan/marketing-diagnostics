@@ -28,8 +28,9 @@ def test_intake_template_does_not_crash(tmp_path, monkeypatch):
     paths = orchestrator.ClientPaths("_template")
     assert paths.exists(), "шаблон clients/_template/config.yaml должен существовать"
 
-    # Не засорять clients/_template/logs/ во время тестов.
+    # Не засорять clients/_template/logs/ и data/raw/ во время тестов.
     monkeypatch.setattr(paths, "logs", tmp_path / "logs")
+    monkeypatch.setattr(paths, "raw", tmp_path / "raw")
 
     with orchestrator.StageLogger(paths, "intake") as log:
         ok = orchestrator.run_intake(paths, log)

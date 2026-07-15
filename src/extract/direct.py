@@ -219,6 +219,10 @@ def extract(
 ) -> dict[str, Any]:
     """Выгрузить расходы, запросы, площадки, стратегии, таргетинг, тексты,
     ключевые фразы и товарный фид в data/raw/direct/.
+
+    Если manifest.json содержит primary_window + compare_window (записал intake),
+    выгрузка выполняется дважды: primary -> .../primary/, compare -> .../compare/.
+    Все шаги (ретраи, чанкинг отчётов) применяются к каждому окну независимо.
     """
     import requests
 
@@ -231,10 +235,36 @@ def extract(
     token = C.get_token(env, "DIRECT_TOKEN", SOURCE)
     headers = _auth_headers(token, client_login)
 
-    date_from, date_to = C.resolve_window(config, defaults, today=today)
-    out_dir = C.reset_dir(C.source_dir(paths, SOURCE))
-    log(f"{SOURCE}: окно {C.fmt(date_from)}..{C.fmt(date_to)}, логин {client_login or '—'}")
+    (date_from, date_to), compare_window = C.resolve_windows(
+        paths.raw, config, defaults, today=today
+    )
+    has_compare = compare_window is not None
+    base_dir = C.source_dir(paths, SOURCE)
 
+    windows: list[tuple] = [(date_from, date_to, "primary")]
+    if has_compare:
+        windows.append((compare_window[0], compare_window[1], "compare"))
+
+    last_result: dict[str, Any] = {}
+    for win_from, win_to, slot in windows:
+        if has_compare:
+            out_dir = C.reset_dir(base_dir / slot)
+            source_key = SOURCE if slot == "primary" else f"{SOURCE}/compare"
+        else:
+            out_dir = C.reset_dir(base_dir)
+            source_key = SOURCE
+        log(f"{SOURCE}: окно {C.fmt(win_from)}..{C.fmt(win_to)}, логин {client_login or '—'}")
+        last_result = _run_window_extract(
+            session, headers, sleeper, win_from, win_to, out_dir, source_key, paths, log,
+        )
+
+    return last_result
+
+
+def _run_window_extract(
+    session, headers, sleeper, date_from, date_to, out_dir, source_key, paths, log,
+) -> dict[str, Any]:
+    """Выгрузить все отчёты одного временного окна в out_dir."""
     notes: list[str] = []
 
     # 1. Расходы по кампаниям по дням (+ ПРОБНЫЕ поля доли потерянных показов).
@@ -345,7 +375,7 @@ def extract(
 
     rows = campaign_rows + query_rows
     manifest = _record_manifest(
-        paths, date_from, date_to, rows,
+        paths, source_key, date_from, date_to, rows,
         has_lost_is=has_lost_is,
         archived_retrievable=archived_retrievable,
         feed_used=feed_used,
@@ -671,7 +701,7 @@ def _fetch_feed(session, headers) -> list[dict[str, Any]]:
 
 
 def _record_manifest(
-    paths, date_from, date_to, rows, *,
+    paths, source_key, date_from, date_to, rows, *,
     has_lost_is: bool, archived_retrievable: bool, feed_used: bool,
     notes: list[str],
 ) -> dict[str, Any]:
@@ -689,7 +719,7 @@ def _record_manifest(
     if notes:
         extra["notes"] = notes
     return manifest_mod.update_source(
-        Path(paths.raw), SOURCE,
+        Path(paths.raw), source_key,
         date_from=C.fmt(date_from), date_to=C.fmt(date_to),
         rows=rows, script_version=SCRIPT_VERSION,
         canonical_tables=CANONICAL_TABLES,
