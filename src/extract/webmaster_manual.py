@@ -82,7 +82,10 @@ def extract(
             SOURCE, f"файл выгрузки не найден: {export_path}"
         )
 
-    out_dir = C.reset_dir(C.source_dir(paths, SOURCE))
+    # Не сбрасываем директорию: input-CSV лежит рядом с output-JSON
+    # в том же data/raw/webmaster/, reset_dir удалил бы его.
+    out_dir = C.source_dir(paths, SOURCE)
+    out_dir.mkdir(parents=True, exist_ok=True)
     log(f"{SOURCE}[manual]: файл {export_path}")
 
     rows = _read_export(export_path)
