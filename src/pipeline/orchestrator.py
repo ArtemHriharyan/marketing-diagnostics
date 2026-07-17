@@ -399,6 +399,23 @@ def run_extract(paths: ClientPaths, log: StageLogger) -> None:
                 log(f"extract[{mod_name}]: экстрактор ещё не реализован — пропуск")
                 skipped.append(mod_name)
 
+    # site_crawl — опциональный; вызывается при наличии crawl.base_url (принцип 4)
+    if (config.get("crawl") or {}).get("base_url"):
+        _sc = "site_crawl"
+        _sc_module = importlib.import_module(f"src.extract.{_sc}")
+        try:
+            log(f"extract[{_sc}]: старт")
+            _sc_result = _call_extract(_sc_module, config, env, paths, log, defaults)
+            _sc_rows = _sc_result.get("rows", 0)
+            log(f"extract[{_sc}]: готово — {_sc_rows} строк -> data/raw/{_sc_result.get('source', _sc)}/")
+            extracted.append(_sc)
+        except extract_common.SourceUnavailable as exc:
+            log(f"extract[{_sc}]: ИСТОЧНИК НЕДОСТУПЕН — {exc} (код {exc.exit_code})")
+            unavailable.append(_sc)
+        except NotImplementedError:
+            log(f"extract[{_sc}]: экстрактор ещё не реализован — пропуск")
+            skipped.append(_sc)
+
     log("")
     log(f"extract: выгружено {len(extracted)}, недоступно {len(unavailable)}, "
         f"пропущено {len(skipped)}.")

@@ -1,39 +1,24 @@
 """Экстрактор: РУЧНАЯ выгрузка Google Search Console (без API).
 
-Активен, когда config.sources.gsc.mode == "manual" (сейчас всегда — API-доступа
-к GSC у клиента нет). НЕ вызывает никакой API: только читает, валидирует и
-нормализует CSV-файлы, которые аналитик выгрузил из интерфейса GSC и положил в
-inputs/manual_exports/gsc/.
+Формат входных данных: папки YYYY-MM в manual_export_dir.
+Каждая папка содержит отдельные CSV-файлы по срезам:
+    Диаграмма.csv   — временной ряд по дням (обязательно)
+    Запросы.csv     — топ запросов за период (обязательно)
+    Страницы.csv    — топ страниц за период (обязательно)
+    Устройства.csv  — разбивка по устройствам (опционально)
+    Страны.csv      — разбивка по странам (опционально)
+    Фильтры.csv     — мета: период и тип поиска (опционально)
 
-Контракт:
-    Читает   — config.sources.gsc (manual_export_dir, column_map, опц. raw_format)
-               и файлы gsc_YYYY-MM.csv (+ опц. gsc_YYYY-MM.meta.yaml).
-    Пишет    — data/raw/gsc/gsc_YYYY-MM.{csv,parquet} — ТОТ ЖЕ выходной контракт,
-               что у gsc_api.py (срез (query, page, device) x метрики), поэтому
-               transform.build_seo_queries_gsc работает без правок. Плюс
-               data/raw/gsc/validation_report.json и manifest.json
-               (canonical_tables: [seo_queries]).
-    Деградация — опционален; нет ручных выгрузок -> источник недоступен (принцип 4).
-    LLM      — не используется.
+Контракт выходного parquet seo_queries не изменился:
+    month, query, page, device, clicks, impressions, ctr, position
+    page="" и device="unknown" — ручная выгрузка не даёт пересечение query×page×device.
 
-Полнота НЕ верифицируется (в отличие от API нет контроля пагинации rowLimit/
-startRow) — в manifest всегда пишется completeness: "unverified",
-source_mode: "manual".
+Дополнительно пишутся gsc_daily_YYYY-MM.{csv,parquet},
+gsc_pages_YYYY-MM.{csv,parquet}, gsc_devices_YYYY-MM.{csv,parquet}
+(при наличии соответствующих файлов).
 
-Вход по месяцам:
-    gsc_YYYY-MM.csv — один файл на месяц. Колонки (алиасы в
-    config.sources.gsc.column_map): query, page, device, clicks, impressions,
-    ctr, position, month. Месяц берётся из имени файла (авторитетно).
-    gsc_YYYY-MM.meta.yaml (опц.) — поле total_clicks_ui (число сверху отчёта в
-    интерфейсе): нужно для оценки доли кликов, скрытой порогом анонимизации
-    Google. Расхождение суммы clicks с total_clicks_ui > 10% -> caveat.
-
-device:
-    Если в конкретном месяце нет колонки device (быстрый экспорт GSC её не
-    всегда даёт) — строки НЕ отбрасываем, пишем device: "unknown", а месяц
-    заносим в device_missing_months. Ниже по пайплайну S20 (CWV vs устройство)
-    обязан исключить такой месяц из посегментного разреза, а не притворяться,
-    что данные по устройствам есть.
+transform.build_seo_queries_gsc работает без правок — выходной контракт seo_queries
+не изменился, флаги source_mode и completeness в manifest те же.
 """
 
 from __future__ import annotations
@@ -48,29 +33,65 @@ from typing import Any, Callable
 
 from . import _common as C
 
-SCRIPT_VERSION = "0.1.0"
+SCRIPT_VERSION = "0.2.0"
 SOURCE = "gsc"
 CANONICAL_TABLES = ["seo_queries"]
 
-# Порядок колонок сырья фиксирован — на него опирается transform (тот же, что у
-# gsc_api.py). Переключение mode: api <-> manual не должно ломать transform.
 RAW_FIELDS = ["month", "query", "page", "device",
               "clicks", "impressions", "ctr", "position"]
 
-# Порог расхождения суммы clicks с total_clicks_ui из meta.yaml.
-CLICKS_UI_TOLERANCE = 0.10
+DAILY_FIELDS = ["date", "clicks", "impressions", "ctr", "position"]
+PAGES_FIELDS = ["page", "clicks", "impressions", "ctr", "position"]
+DEVICES_FIELDS = ["device", "clicks", "impressions", "ctr", "position"]
 
-# Имя файла помесячной выгрузки: gsc_YYYY-MM.csv (meta — gsc_YYYY-MM.meta.yaml).
-_MONTH_RE = re.compile(r"gsc_(\d{4}-\d{2})\.csv$", re.IGNORECASE)
+CLICKS_TOLERANCE = 0.10
+
+_MONTH_FOLDER_RE = re.compile(r"^\d{4}-\d{2}$")
+
+# Нормализованное имя стема → канонический ключ среза
+_FILE_MAP: dict[str, str] = {
+    "диаграмма": "diagram",
+    "запросы": "queries",
+    "страницы": "pages",
+    "устройства": "devices",
+    "страны": "countries",
+    "фильтры": "filters",
+}
+
+_REQUIRED_SLICES = {"diagram", "queries", "pages"}
+
+# Заголовки GSC-экспорта (RU-интерфейс).
+# «Kлики»: K — ASCII (U+004B), остальные символы кириллические.
+# Именно так выгружает GSC; не менять на Cyrillic К (U+041A).
+_CLICKS_HEADER = "Kлики"  # "Kлики": K=U+004B, лики=Cyrillic
+
+DEFAULT_COLUMN_MAP: dict[str, str] = {
+    "query":        "Популярные запросы",
+    "page":         "Популярные страницы",
+    "device":       "Устройство",
+    "country":      "Страна",
+    "date":         "Дата",
+    "clicks":       _CLICKS_HEADER,
+    "impressions":  "Показы",
+    "ctr":          "CTR",
+    "position":     "Позиция",
+    "filter_key":   "Фильтр",
+    "filter_value": "Значение",
+}
 
 
 def ping(config: dict[str, Any], env: dict[str, str]) -> bool:
-    """Лёгкая проверка: есть ли хотя бы один файл ручной выгрузки GSC."""
+    """True если есть хотя бы одна папка YYYY-MM с Диаграмма.csv и Запросы.csv."""
     gsc = (config.get("sources") or {}).get("gsc") or {}
     manual_dir = _manual_dir(gsc, _paths_root=None)
     if manual_dir is None or not manual_dir.exists():
         return False
-    return any(_MONTH_RE.search(p.name) for p in manual_dir.glob("gsc_*.csv"))
+    for folder in sorted(manual_dir.iterdir()):
+        if folder.is_dir() and _MONTH_FOLDER_RE.match(folder.name):
+            slices = _detect_slices(folder)
+            if "diagram" in slices and "queries" in slices:
+                return True
+    return False
 
 
 def extract(
@@ -86,64 +107,119 @@ def extract(
     log = log or (lambda _msg: None)
 
     gsc = (config.get("sources") or {}).get("gsc") or {}
-    column_map = gsc.get("column_map") or {}
+    column_map = _effective_column_map(gsc)
     fmt = C.resolve_raw_format(gsc)
 
     manual_dir = _manual_dir(gsc, _paths_root=getattr(paths, "root", None))
     if manual_dir is None or not manual_dir.exists():
-        raise C.SourceUnavailable(
-            SOURCE, f"нет каталога ручных выгрузок GSC: {manual_dir}"
-        )
-    month_files = _month_files(manual_dir)
-    if not month_files:
-        raise C.SourceUnavailable(
-            SOURCE, f"в {manual_dir} нет файлов gsc_YYYY-MM.csv"
-        )
+        raise C.SourceUnavailable(SOURCE, f"нет каталога ручных выгрузок GSC: {manual_dir}")
 
-    out_dir = C.reset_dir(C.source_dir(paths, SOURCE))
-    log(f"{SOURCE}[manual]: каталог {manual_dir}, файлов {len(month_files)}, формат {fmt}")
+    month_folders = _month_folders(manual_dir)
+    if not month_folders:
+        raise C.SourceUnavailable(SOURCE, f"в {manual_dir} нет папок YYYY-MM")
+
+    # Не сбрасываем директорию: manual_export_dir может совпадать с out_dir
+    # (напр. data/raw/gsc/ содержит и входные папки YYYY-MM/, и выходные flat-файлы).
+    out_dir = C.source_dir(paths, SOURCE)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log(f"{SOURCE}[manual]: каталог {manual_dir}, папок {len(month_folders)}, формат {fmt}")
 
     total_rows = 0
     accepted_rows = 0
     rejected_reasons: dict[str, int] = {}
-    device_missing_months: list[str] = []
-    clicks_ui_caveats: list[dict[str, Any]] = []
+    caveats: list[dict[str, Any]] = []
     months: list[str] = []
+    skipped_months: list[str] = []
+    available_slices_by_month: dict[str, list[str]] = {}
 
-    for month, csv_path in month_files:
+    for month, folder in month_folders:
+        slices = _detect_slices(folder)
+        available = [k for k in ["diagram", "queries", "pages", "devices", "countries", "filters"]
+                     if k in slices]
+        available_slices_by_month[month] = available
+
+        missing = _REQUIRED_SLICES - set(slices)
+        if missing:
+            caveats.append({
+                "month": month,
+                "type": "missing_required_files",
+                "missing": sorted(missing),
+                "caveat": f"пропущены обязательные срезы: {sorted(missing)}",
+            })
+            log(f"{SOURCE}[manual]: {month} — пропущены обязательные срезы {sorted(missing)}, пропускаем")
+            skipped_months.append(month)
+            continue
+
         months.append(month)
-        rows, has_device = _read_export(csv_path, column_map)
-        records, accepted, rejected = _normalize_month(rows, month, has_device, column_map)
-        total_rows += len(rows)
-        accepted_rows += accepted
-        for reason, n in rejected.items():
+
+        # Фильтры.csv (опционально) — только для инфо в лог
+        if "filters" in slices:
+            filters_info = _parse_filters(slices["filters"], column_map)
+            if filters_info.get("period"):
+                log(f"{SOURCE}[manual]: {month} — период из Фильтры.csv: {filters_info['period']}")
+
+        # Диаграмма.csv
+        diagram_rows = _read_slice_csv(slices["diagram"])
+        daily_records = _normalize_daily(diagram_rows, column_map)
+        if daily_records:
+            C.write_table(out_dir / f"gsc_daily_{month}", daily_records, DAILY_FIELDS, fmt)
+
+        # Запросы.csv → seo_queries
+        query_rows = _read_slice_csv(slices["queries"])
+        query_records, q_accepted, q_rejected = _normalize_queries(query_rows, month, column_map)
+        total_rows += len(query_rows)
+        accepted_rows += q_accepted
+        for reason, n in q_rejected.items():
             rejected_reasons[reason] = rejected_reasons.get(reason, 0) + n
-        if not has_device:
-            device_missing_months.append(month)
 
-        out = C.write_table(out_dir / f"gsc_{month}", records, RAW_FIELDS, fmt)
+        C.write_table(out_dir / f"gsc_{month}", query_records, RAW_FIELDS, fmt)
 
-        caveat = _clicks_ui_caveat(csv_path, month, records)
+        # Страницы.csv
+        pages_rows = _read_slice_csv(slices["pages"])
+        pages_records = _normalize_pages(pages_rows, column_map)
+        if pages_records:
+            C.write_table(out_dir / f"gsc_pages_{month}", pages_records, PAGES_FIELDS, fmt)
+
+        # Устройства.csv (опционально)
+        if "devices" in slices:
+            devices_rows = _read_slice_csv(slices["devices"])
+            devices_records = _normalize_devices(devices_rows, column_map)
+            if devices_records:
+                C.write_table(out_dir / f"gsc_devices_{month}", devices_records, DEVICES_FIELDS, fmt)
+
+        # Сверка кликов: Диаграмма vs Запросы
+        caveat = _clicks_caveat(month, daily_records, query_records)
         if caveat:
-            clicks_ui_caveats.append(caveat)
+            caveats.append(caveat)
 
-        log(f"{SOURCE}[manual]: {month} — принято {accepted}, отброшено "
-            f"{sum(rejected.values())}, device={'есть' if has_device else 'нет'} -> {out.name}")
+        log(f"{SOURCE}[manual]: {month} — запросы: принято {q_accepted}, "
+            f"отброшено {sum(q_rejected.values())}, срезы: {available}")
+
+    if not months:
+        raise C.SourceUnavailable(SOURCE, "нет успешно обработанных месяцев GSC")
+
+    # В этой схеме device всегда unknown — все месяцы в device_missing_months
+    device_missing_months = list(months)
 
     report = _write_validation_report(
-        out_dir, month_files, months, total_rows, accepted_rows,
-        rejected_reasons, device_missing_months, clicks_ui_caveats, column_map, fmt,
+        out_dir, month_folders, months, skipped_months, total_rows, accepted_rows,
+        rejected_reasons, device_missing_months, caveats, column_map, fmt,
+        available_slices_by_month,
     )
     manifest = _record_manifest(
-        paths, months, accepted_rows, fmt, device_missing_months, clicks_ui_caveats,
+        paths, months, accepted_rows, fmt, device_missing_months, caveats,
+        available_slices_by_month,
     )
+
     if device_missing_months:
-        log(f"{SOURCE}[manual]: без device в месяцах {device_missing_months} — "
-            "исключить из посегментного разреза S20")
-    for c in clicks_ui_caveats:
-        log(f"{SOURCE}[manual]: {c['month']} — расхождение с total_clicks_ui "
-            f"{c['deviation_pct']}% (порог {int(CLICKS_UI_TOLERANCE * 100)}%)")
-    log(f"{SOURCE}[manual]: готово — принято {accepted_rows} строк из {total_rows}")
+        log(f"{SOURCE}[manual]: device=unknown для всех месяцев {device_missing_months} — "
+            "исключить из посегментного разреза по устройству (S20)")
+
+    log(f"{SOURCE}[manual]: готово — принято {accepted_rows} строк из {total_rows}, "
+        f"месяцев {len(months)}")
+
+    clicks_mismatch_caveats = [c for c in caveats
+                               if c.get("type") == "clicks_diagram_vs_queries_mismatch"]
 
     return {
         "source": SOURCE,
@@ -153,7 +229,8 @@ def extract(
         "rejected_reasons": rejected_reasons,
         "months": months,
         "device_missing_months": device_missing_months,
-        "clicks_ui_caveats": clicks_ui_caveats,
+        "clicks_ui_caveats": clicks_mismatch_caveats,  # обратная совместимость
+        "caveats": caveats,
         "source_mode": "manual",
         "completeness": "unverified",
         "raw_format": fmt,
@@ -163,37 +240,52 @@ def extract(
     }
 
 
-# ── Раскладка входных файлов ────────────────────────────────────────────────
+# ── Раскладка входных папок ──────────────────────────────────────────────────
+
 def _manual_dir(gsc_cfg: dict[str, Any], _paths_root: Any) -> Path | None:
-    """Каталог ручных выгрузок: абсолютный — как есть; относительный — от корня."""
     raw_dir = gsc_cfg.get("manual_export_dir") or "inputs/manual_exports/gsc"
     p = Path(raw_dir)
     if p.is_absolute():
         return p
     if _paths_root is not None:
         return Path(_paths_root) / raw_dir
-    return p  # относительный без корня — используется только в ping
+    return p
 
 
-def _month_files(manual_dir: Path) -> list[tuple[str, Path]]:
-    """Список (месяц YYYY-MM, путь) по именам gsc_YYYY-MM.csv, отсортированный."""
+def _month_folders(manual_dir: Path) -> list[tuple[str, Path]]:
+    """Список (YYYY-MM, Path) папок-месяцев, отсортированный по имени."""
     found: list[tuple[str, Path]] = []
-    for path in manual_dir.glob("gsc_*.csv"):
-        m = _MONTH_RE.search(path.name)
-        if m:
-            found.append((m.group(1), path))
+    for item in manual_dir.iterdir():
+        if item.is_dir() and _MONTH_FOLDER_RE.match(item.name):
+            found.append((item.name, item))
     return sorted(found, key=lambda t: t[0])
 
 
-# ── Чтение и нормализация одного экспорта ───────────────────────────────────
-def _read_export(path: Path, column_map: dict[str, str]) -> tuple[list[dict[str, str]], bool]:
-    r"""Прочитать CSV-экспорт GSC. Возвращает (строки, есть_ли_колонка_device).
+def _detect_slices(folder: Path) -> dict[str, Path]:
+    """Найти CSV-файлы среза в папке месяца. Ключ — канонический (diagram/queries/…)."""
+    result: dict[str, Path] = {}
+    for csv_file in folder.glob("*.csv"):
+        normalized = csv_file.stem.strip().lower()
+        key = _FILE_MAP.get(normalized)
+        if key:
+            result[key] = csv_file
+    return result
 
-    GSC-экспорт обычно UTF-8 с запятой; поддерживаем cp1251 и ';'/'\t' на всякий.
-    """
-    data = Path(path).read_bytes()
+
+def _effective_column_map(gsc_cfg: dict[str, Any]) -> dict[str, str]:
+    """DEFAULT_COLUMN_MAP + переопределения из config.sources.gsc.column_map."""
+    result = dict(DEFAULT_COLUMN_MAP)
+    result.update(gsc_cfg.get("column_map") or {})
+    return result
+
+
+# ── Чтение CSV ────────────────────────────────────────────────────────────────
+
+def _read_slice_csv(path: Path) -> list[dict[str, str]]:
+    """Прочитать CSV-файл среза: UTF-8/cp1251, авто-разделитель, skipinitialspace."""
+    data = path.read_bytes()
     text: str | None = None
-    for enc in ("utf-8-sig", "cp1251"):
+    for enc in ("utf-8-sig", "utf-8", "cp1251"):
         try:
             text = data.decode(enc)
             break
@@ -203,11 +295,8 @@ def _read_export(path: Path, column_map: dict[str, str]) -> tuple[list[dict[str,
         text = data.decode("utf-8", errors="replace")
 
     delim = _sniff_delimiter(text)
-    reader = csv.DictReader(io.StringIO(text), delimiter=delim)
-    headers = list(reader.fieldnames or [])
-    device_header = column_map.get("device", "device")
-    has_device = device_header in headers or "device" in headers
-    return list(reader), has_device
+    reader = csv.DictReader(io.StringIO(text), delimiter=delim, skipinitialspace=True)
+    return list(reader)
 
 
 def _sniff_delimiter(text: str) -> str:
@@ -217,50 +306,114 @@ def _sniff_delimiter(text: str) -> str:
     return best if counts[best] > 0 else ","
 
 
-def _normalize_month(
-    rows: list[dict[str, str]], month: str, has_device: bool, column_map: dict[str, str],
-) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
-    """Нормализовать строки одного месяца. Возвращает (records, accepted, rejected).
+# ── Нормализация срезов ───────────────────────────────────────────────────────
 
-    Месяц берётся из имени файла (не из колонки month) — это авторитетный
-    источник. Пустой query -> строка отбраковывается (reason missing_query).
-    """
+def _normalize_queries(
+    rows: list[dict[str, str]], month: str, column_map: dict[str, str],
+) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
+    """Запросы.csv → seo_queries строки. page="" device="unknown"."""
     records: list[dict[str, Any]] = []
     rejected: dict[str, int] = {}
-
     for row in rows:
-        query = (_field(row, "query", column_map) or "").strip()
+        query = _field(row, "query", column_map).strip()
         if not query:
             rejected["missing_query"] = rejected.get("missing_query", 0) + 1
             continue
-
-        device = (_field(row, "device", column_map) or "").strip() if has_device else ""
         records.append({
             "month": month,
             "query": query,
-            "page": (_field(row, "page", column_map) or "").strip(),
-            "device": device or "unknown",
+            "page": "",
+            "device": "unknown",
             "clicks": _to_int(_field(row, "clicks", column_map)),
             "impressions": _to_int(_field(row, "impressions", column_map)),
             "ctr": _to_ctr(_field(row, "ctr", column_map)),
             "position": _to_float(_field(row, "position", column_map)),
         })
-
     return records, len(records), rejected
 
 
+def _normalize_daily(
+    rows: list[dict[str, str]], column_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Диаграмма.csv → временной ряд. Строки без даты отбраковываются."""
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        date_val = _field(row, "date", column_map).strip()
+        if not date_val:
+            continue
+        records.append({
+            "date": date_val,
+            "clicks": _to_int(_field(row, "clicks", column_map)),
+            "impressions": _to_int(_field(row, "impressions", column_map)),
+            "ctr": _to_ctr(_field(row, "ctr", column_map)),
+            "position": _to_float(_field(row, "position", column_map)),
+        })
+    return records
+
+
+def _normalize_pages(
+    rows: list[dict[str, str]], column_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Страницы.csv → агрегат по страницам."""
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        page = _field(row, "page", column_map).strip()
+        if not page:
+            continue
+        records.append({
+            "page": page,
+            "clicks": _to_int(_field(row, "clicks", column_map)),
+            "impressions": _to_int(_field(row, "impressions", column_map)),
+            "ctr": _to_ctr(_field(row, "ctr", column_map)),
+            "position": _to_float(_field(row, "position", column_map)),
+        })
+    return records
+
+
+def _normalize_devices(
+    rows: list[dict[str, str]], column_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Устройства.csv → агрегат по устройствам."""
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        device = _field(row, "device", column_map).strip()
+        if not device:
+            continue
+        records.append({
+            "device": device,
+            "clicks": _to_int(_field(row, "clicks", column_map)),
+            "impressions": _to_int(_field(row, "impressions", column_map)),
+            "ctr": _to_ctr(_field(row, "ctr", column_map)),
+            "position": _to_float(_field(row, "position", column_map)),
+        })
+    return records
+
+
+def _parse_filters(path: Path, column_map: dict[str, str]) -> dict[str, str]:
+    """Фильтры.csv → {period: "..."} (только строка с Дата)."""
+    try:
+        rows = _read_slice_csv(path)
+    except Exception:
+        return {}
+    for row in rows:
+        key = _field(row, "filter_key", column_map).strip().lower()
+        if key in ("дата", "date"):
+            return {"period": _field(row, "filter_value", column_map).strip()}
+    return {}
+
+
+# ── Вспомогательные функции поля/значения ────────────────────────────────────
+
 def _field(row: dict[str, Any], canonical: str, column_map: dict[str, str]) -> str:
-    """Значение каноничной колонки: по алиасу из column_map или по имени как есть."""
     header = column_map.get(canonical, canonical)
     value = row.get(header)
-    if value is None:  # алиас не совпал — пробуем каноничное имя напрямую
+    if value is None:
         value = row.get(canonical)
     return "" if value is None else str(value)
 
 
 def _to_int(value: str) -> int:
-    """Целое из строки экспорта (пробелы/запятые как разделители тысяч). Пусто -> 0."""
-    cleaned = (value or "").strip().replace(" ", "").replace(" ", "").replace(",", "")
+    cleaned = (value or "").strip().replace(" ", "").replace(" ", "").replace(",", "")
     if not cleaned:
         return 0
     try:
@@ -270,9 +423,8 @@ def _to_int(value: str) -> int:
 
 
 def _to_float(value: str) -> float | None:
-    """Дробное из строки; запятая -> точка. Пусто/мусор -> None."""
-    cleaned = (value or "").strip().replace(" ", "").replace(",", ".")
-    if not cleaned:
+    cleaned = (value or "").strip().replace(" ", "").replace(" ", "").replace(",", ".")
+    if not cleaned or cleaned.lower() == "nan":
         return None
     try:
         return float(cleaned)
@@ -281,9 +433,8 @@ def _to_float(value: str) -> float | None:
 
 
 def _to_ctr(value: str) -> float | None:
-    """CTR в долях. Экспорт GSC даёт проценты ('4.2%') — приводим к доле (0.042)."""
     raw = (value or "").strip()
-    if not raw:
+    if not raw or raw.lower() == "nan":
         return None
     pct = raw.endswith("%")
     num = _to_float(raw.rstrip("%"))
@@ -292,64 +443,63 @@ def _to_ctr(value: str) -> float | None:
     return num / 100 if pct else num
 
 
-# ── Сверка суммы clicks с total_clicks_ui из meta.yaml ──────────────────────
-def _clicks_ui_caveat(csv_path: Path, month: str, records: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Сравнить сумму clicks с total_clicks_ui из соседнего gsc_YYYY-MM.meta.yaml.
+# ── Сверка кликов ─────────────────────────────────────────────────────────────
 
-    Расхождение > CLICKS_UI_TOLERANCE -> caveat: существенная доля кликов
-    скрыта порогом анонимизации Google или экспорт неполный.
-    """
-    total_ui = _read_total_clicks_ui(csv_path)
-    if total_ui is None or total_ui <= 0:
+def _clicks_caveat(
+    month: str,
+    daily_records: list[dict[str, Any]],
+    query_records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Диаграмма vs Запросы: расхождение >10% → caveat clicks_diagram_vs_queries_mismatch."""
+    diagram_clicks = sum(int(r.get("clicks") or 0) for r in daily_records)
+    query_clicks = sum(int(r.get("clicks") or 0) for r in query_records)
+
+    if diagram_clicks <= 0:
+        return None  # нет базы для сравнения
+
+    deviation = abs(diagram_clicks - query_clicks) / diagram_clicks
+    if deviation <= CLICKS_TOLERANCE:
         return None
-    sum_clicks = sum(int(r.get("clicks") or 0) for r in records)
-    deviation = abs(sum_clicks - total_ui) / total_ui
-    if deviation <= CLICKS_UI_TOLERANCE:
-        return None
+
     return {
         "month": month,
-        "total_clicks_ui": total_ui,
-        "sum_clicks": sum_clicks,
+        "type": "clicks_diagram_vs_queries_mismatch",
+        "diagram_clicks": diagram_clicks,
+        "query_clicks": query_clicks,
         "deviation_pct": round(deviation * 100, 1),
-        "caveat": ("существенная доля кликов скрыта порогом анонимизации Google "
-                   "или экспорт неполный"),
+        "caveat": "расхождение суммы кликов между Диаграммой и Запросами",
     }
 
 
-def _read_total_clicks_ui(csv_path: Path) -> float | None:
-    """Прочитать total_clicks_ui из gsc_YYYY-MM.meta.yaml рядом с CSV (если есть)."""
-    meta_path = csv_path.with_name(csv_path.stem + ".meta.yaml")
-    if not meta_path.exists():
-        return None
-    import yaml
+# ── Отчёт и манифест ──────────────────────────────────────────────────────────
 
-    try:
-        meta = yaml.safe_load(meta_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return None
-    value = meta.get("total_clicks_ui")
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-# ── Отчёт валидации и манифест ──────────────────────────────────────────────
 def _write_validation_report(
-    out_dir, month_files, months, total_rows, accepted, rejected_reasons,
-    device_missing_months, clicks_ui_caveats, column_map, fmt,
+    out_dir: Path,
+    month_folders: list[tuple[str, Path]],
+    months: list[str],
+    skipped_months: list[str],
+    total_rows: int,
+    accepted: int,
+    rejected_reasons: dict[str, int],
+    device_missing_months: list[str],
+    caveats: list[dict[str, Any]],
+    column_map: dict[str, str],
+    fmt: str,
+    available_slices_by_month: dict[str, list[str]],
 ) -> dict[str, Any]:
-    report = {
+    report: dict[str, Any] = {
         "source_mode": "manual",
         "completeness": "unverified",
-        "input_files": [str(p) for _m, p in month_files],
+        "input_folders": [str(folder) for _m, folder in month_folders],
         "months": months,
+        "skipped_months": skipped_months,
         "total_rows": total_rows,
         "accepted": accepted,
         "rejected": sum(rejected_reasons.values()),
         "rejected_reasons": rejected_reasons,
         "device_missing_months": device_missing_months,
-        "clicks_ui_caveats": clicks_ui_caveats,
+        "available_slices_by_month": available_slices_by_month,
+        "caveats": caveats,
         "column_map": column_map,
         "raw_format": fmt,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -360,7 +510,15 @@ def _write_validation_report(
     return report
 
 
-def _record_manifest(paths, months, rows, fmt, device_missing_months, clicks_ui_caveats):
+def _record_manifest(
+    paths: Any,
+    months: list[str],
+    rows: int,
+    fmt: str,
+    device_missing_months: list[str],
+    caveats: list[dict[str, Any]],
+    available_slices_by_month: dict[str, list[str]],
+) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
     date_from = f"{months[0]}-01" if months else ""
@@ -369,15 +527,19 @@ def _record_manifest(paths, months, rows, fmt, device_missing_months, clicks_ui_
     notes: list[str] = []
     if device_missing_months:
         notes.append(
-            "нет разбивки по device в месяцах "
-            f"{', '.join(device_missing_months)} — исключить их из посегментного "
-            "разреза по устройству (S20)."
+            "device=unknown для всех месяцев ручной выгрузки "
+            f"{device_missing_months} — исключить из посегментного разреза S20."
         )
-    for c in clicks_ui_caveats:
-        notes.append(
-            f"{c['month']}: расхождение суммы clicks с total_clicks_ui "
-            f"{c['deviation_pct']}% — {c['caveat']}."
-        )
+    for c in caveats:
+        if c.get("type") == "clicks_diagram_vs_queries_mismatch":
+            notes.append(
+                f"{c['month']}: расхождение суммы кликов Диаграмма({c['diagram_clicks']}) "
+                f"vs Запросы({c['query_clicks']}) = {c['deviation_pct']}%."
+            )
+        elif c.get("type") == "missing_required_files":
+            notes.append(
+                f"{c['month']}: пропущены обязательные файлы {c['missing']}, месяц пропущен."
+            )
 
     return manifest_mod.update_source(
         Path(paths.raw), SOURCE,
@@ -390,6 +552,7 @@ def _record_manifest(paths, months, rows, fmt, device_missing_months, clicks_ui_
             "completeness": "unverified",
             "raw_format": fmt,
             "device_missing_months": device_missing_months,
+            "available_slices_by_month": available_slices_by_month,
             "notes": notes,
         },
     )

@@ -95,8 +95,13 @@ PLACEMENT_FIELDS = ["Placement", "AdNetworkType", "CampaignId", "Cost", "Clicks"
 # а не по текущему статусу; ARCHIVED обязателен, иначе расход остановленных
 # кампаний за прошлые месяцы потеряется.
 CAMPAIGN_STATES_ALL = ["ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"]
-CAMPAIGN_FIELD_NAMES = ["Id", "Name", "State", "Status",
-                        "StatisticsStartDate", "StatisticsEndDate"]
+CAMPAIGN_FIELD_NAMES = [
+    "Id", "Name", "ClientInfo", "StartDate", "EndDate", "Type",
+    "Status", "State", "StatusPayment", "StatusClarification",
+    "SourceId", "Currency", "DailyBudget", "Funds", "Statistics",
+    "RepresentedBy", "Notification", "BlockedIps", "ExcludedSites",
+    "TimeTargeting", "TimeZone",
+]
 
 # Директ отдаёт ошибки JSON-API как HTTP 200 с телом {"error": {...}} — статус
 # 200 сам по себе НЕ значит успех. Разбираем error_code, чтобы падать внятно и
@@ -570,7 +575,6 @@ def _fetch_strategies(session, headers) -> list[dict[str, Any]]:
         {
             "SelectionCriteria": {"States": CAMPAIGN_STATES_ALL},
             "FieldNames": CAMPAIGN_FIELD_NAMES,
-            "TextCampaignFieldNames": ["BiddingStrategy"],
         },
         result_key="Campaigns", context="campaigns.get",
     )
