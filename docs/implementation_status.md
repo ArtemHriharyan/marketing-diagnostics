@@ -21,7 +21,7 @@
 | **2C** | DONE    | — |
 | **2D** | DONE    | — |
 | **3A** | DONE    | build_canonical.py базовые преобразования. GSC manual path (task_id gsc-3A, task_id 3A-rewrite 2026-07-17): gsc_manual.py переписан под формат папок YYYY-MM/Запросы.csv/Диаграмма.csv/Страницы.csv/Устройства.csv. Выходной контракт seo_queries не изменился. column_map в config.yaml заполнен кириллическими заголовками GSC. tests/test_gsc_manual.py переписан: 9 тестов — 9 pass 2026-07-17. |
-| **3B** | DONE    | webmaster_manual: фактическая детекция page/device-колонок; manifest хранит has_page_column, has_device_column, page_device_absence_reason=method_limitation; tests/test_webmaster_manual.py (6 тестов) — 6 pass 2026-07-14 |
+| **3B** | DONE    | webmaster_manual: переписан под wide-формат (Query×Url×YYYY-MM_cols); агрегация по (query,page), CTR пересчёт, DEMAND=max; manifest: has_page_column=true, page_device_breakdown=true, has_demand_column; tests/test_webmaster_manual.py (12 тестов) — 12 pass 2026-07-17. BLOCKER: build_seo_queries_webmaster (build_canonical.py:942) хардкодит page=None — page из JSON теряется в transform. |
 | **3C** | DONE    | — |
 | **3D** | DONE    | Побочных изменений нет: 3A/3B затрагивают build_canonical.py, 3C — scripts/verify_metrika.py; wordstat.py и crm_import.py не изменены. Git-репо отсутствует (проверка кодом). 39 тестов GSC/Webmaster/CrUX/Wordstat/CRM — 39 pass 2026-07-14. |
 | **3.5A** | DONE  | Каркас кролера без HTTP: src/extract/site_crawl.py (build_url_priority_list, resolve_max_urls, extract); crawl_seed_urls + crawl.max_urls=30 в _template/config.yaml; inputs/manual_cwv.yaml и inputs/manual_form_tests.yaml (meta/patterns/conclusions); manifest caveat при усечении. 20 тестов test_site_crawl.py — 20 pass 2026-07-14. |

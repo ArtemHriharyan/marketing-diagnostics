@@ -671,18 +671,19 @@ def test_build_seo_queries_gsc_aggregates_devices_and_flags_brand():
         gsc_dir = _write(Path(td))
         df = bc.build_seo_queries_gsc(gsc_dir, {"brand_terms": ["погнали"]})
 
-    assert set(df["engine"]) == {"google"}
+    assert set(df["source"]) == {"gsc"}
     assert df["month"].iloc[0] == "2026-05"
     branded = df[df["query"] == "аренда погнали"].iloc[0]
-    assert branded["clicks"] == 8            # 5 + 3, device-срезы объединены
-    assert branded["impressions"] == 80      # 50 + 30
-    assert branded["position_avg"] == pytest.approx((3.0 * 50 + 5.0 * 30) / 80)
+    assert branded["total_clicks"] == 8            # 5 + 3, device-срезы объединены
+    assert branded["total_shows"] == 80            # 50 + 30
+    assert branded["avg_show_position"] == pytest.approx((3.0 * 50 + 5.0 * 30) / 80)
     assert bool(branded["is_brand"]) is True
     nonbrand = df[df["query"] == "прокат авто"].iloc[0]
     assert bool(nonbrand["is_brand"]) is False
 
 
 def test_build_seo_queries_webmaster_uses_window_end_month():
+    """Старый формат (без page, CTR, DEMAND): month из date_to, page=null, ctr=null."""
     import tempfile
     with tempfile.TemporaryDirectory() as td:
         wm_dir = Path(td) / "webmaster"
@@ -698,11 +699,13 @@ def test_build_seo_queries_webmaster_uses_window_end_month():
         entry = {"date_from": "2026-05-01", "date_to": "2026-06-30"}
         df = bc.build_seo_queries_webmaster(wm_dir, entry, {"brand_terms": ["погнали"]})
 
-    assert df.iloc[0]["engine"] == "yandex"
+    assert df.iloc[0]["source"] == "webmaster"
     assert df.iloc[0]["month"] == "2026-06"
-    assert df.iloc[0]["position_avg"] == pytest.approx(2.2)
+    assert df.iloc[0]["avg_show_position"] == pytest.approx(2.2)
     assert bool(df.iloc[0]["is_brand"]) is True
     assert df.iloc[0]["page"] is None
+    # Старый формат: CTR и DEMAND отсутствуют → null, не ошибка
+    assert df.iloc[0]["ctr"] is None or pd.isna(df.iloc[0]["ctr"])
 
 
 # ═════════════════ Новые поля visits: naive vs lastsign ══════════════════════
@@ -1027,4 +1030,171 @@ def test_build_seo_queries_gsc_month_without_device_not_dropped(tmp_path):
     df = bc.build_seo_queries_gsc(gsc_dir, {"brand_terms": []})
     assert len(df) == 2
     assert set(df["month"]) == {"2026-05"}
-    assert set(df["engine"]) == {"google"}
+    assert set(df["source"]) == {"gsc"}
+
+
+# ══════════════════ seo_queries: новые поля page / ctr / demand ═══════════════
+
+def test_build_seo_queries_webmaster_wide_format_page_ctr_demand():
+    """Новый формат (с page, CTR, DEMAND): поля заполнены, DEMAND=null при отсутствии."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        wm_dir = Path(td) / "webmaster"
+        wm_dir.mkdir()
+        popular = [
+            {
+                "query_text": "аренда авто",
+                "page": "/catalog/",
+                "indicators": {
+                    "TOTAL_SHOWS": 1234,
+                    "TOTAL_CLICKS": 56,
+                    "AVG_SHOW_POSITION": 9.8,
+                    "CTR": 0.045,
+                    "DEMAND": 1535,
+                },
+            },
+            {
+                "query_text": "прокат машины",
+                "page": "/promo/",
+                "indicators": {
+                    "TOTAL_SHOWS": 500,
+                    "TOTAL_CLICKS": 20,
+                    "AVG_SHOW_POSITION": 5.0,
+                    # Нет CTR и DEMAND — должны быть null
+                },
+            },
+        ]
+        (wm_dir / "search_queries_popular.json").write_text(
+            json.dumps(popular, ensure_ascii=False), encoding="utf-8"
+        )
+        entry = {"date_from": "2026-05-01", "date_to": "2026-06-30"}
+        df = bc.build_seo_queries_webmaster(wm_dir, entry, {"brand_terms": []})
+
+    assert "ctr" in df.columns and "demand" in df.columns
+
+    row1 = df[df["query"] == "аренда авто"].iloc[0]
+    assert row1["page"] == "/catalog/"
+    assert row1["source"] == "webmaster"
+    assert row1["ctr"] == pytest.approx(0.045)
+    assert row1["demand"] == 1535
+    assert row1["total_shows"] == 1234
+    assert row1["total_clicks"] == 56
+    assert row1["avg_show_position"] == pytest.approx(9.8)
+
+    # CTR/DEMAND отсутствуют → null, не ошибка
+    row2 = df[df["query"] == "прокат машины"].iloc[0]
+    assert row2["page"] == "/promo/"
+    assert row2["ctr"] is None or pd.isna(row2["ctr"])
+    assert row2["demand"] is None or pd.isna(row2["demand"])
+
+
+def test_build_seo_queries_webmaster_and_gsc_same_query_page_are_two_rows(tmp_path):
+    """Один запрос с одной страницей из webmaster и gsc — две строки, не дедуп."""
+    gsc_dir = tmp_path / "gsc"
+    gsc_dir.mkdir()
+    (gsc_dir / "gsc_2026-05.csv").write_text(
+        "month,query,page,device,clicks,impressions,ctr,position\n"
+        "2026-05-01,аренда авто,/catalog/,DESKTOP,5,50,0.1,3.0\n",
+        encoding="utf-8",
+    )
+
+    wm_dir = tmp_path / "webmaster"
+    wm_dir.mkdir()
+    popular = [{"query_text": "аренда авто", "page": "/catalog/",
+                "indicators": {"TOTAL_SHOWS": 1000, "TOTAL_CLICKS": 40,
+                               "AVG_SHOW_POSITION": 3.5}}]
+    (wm_dir / "search_queries_popular.json").write_text(
+        json.dumps(popular, ensure_ascii=False), encoding="utf-8"
+    )
+
+    gsc_df = bc.build_seo_queries_gsc(gsc_dir, {"brand_terms": []})
+    wm_df = bc.build_seo_queries_webmaster(wm_dir, {"date_to": "2026-06-30"}, {"brand_terms": []})
+
+    combined = pd.concat([gsc_df, wm_df], ignore_index=True)
+    # Один запрос/страница из двух источников = 2 строки, не одна
+    assert len(combined) == 2
+    assert set(combined["source"]) == {"gsc", "webmaster"}
+    # После дедупа по (query, page, source) — всё равно 2 строки
+    deduped = combined.drop_duplicates(subset=["query", "page", "source"], keep="first")
+    assert len(deduped) == 2
+
+
+def test_seo_queries_dedup_removes_duplicate_within_source():
+    """Дубль (query, page, source) внутри одного источника → одна строка после дедупа."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        wm_dir = Path(td) / "webmaster"
+        wm_dir.mkdir()
+        # Два идентичных (query, page) в одном JSON
+        popular = [
+            {"query_text": "аренда авто", "page": "/catalog/",
+             "indicators": {"TOTAL_SHOWS": 1000, "TOTAL_CLICKS": 40, "AVG_SHOW_POSITION": 3.5}},
+            {"query_text": "аренда авто", "page": "/catalog/",
+             "indicators": {"TOTAL_SHOWS": 999, "TOTAL_CLICKS": 39, "AVG_SHOW_POSITION": 3.4}},
+        ]
+        (wm_dir / "search_queries_popular.json").write_text(
+            json.dumps(popular, ensure_ascii=False), encoding="utf-8"
+        )
+        df_raw = bc.build_seo_queries_webmaster(
+            wm_dir, {"date_to": "2026-06-30"}, {"brand_terms": []}
+        )
+
+    # До дедупа — 2 строки из JSON
+    assert len(df_raw) == 2
+    # После дедупа по (query, page, source) — одна строка; первая победила
+    deduped = df_raw.drop_duplicates(subset=["query", "page", "source"], keep="first")
+    assert len(deduped) == 1
+    assert deduped.iloc[0]["total_shows"] == 1000  # первая строка
+
+
+def test_seo_queries_build_deduplicates_via_orchestrator(tmp_path):
+    """Сквозной тест: build() дедуплицирует дубли webmaster по (query, page, source)."""
+    import pyarrow.parquet as pq
+
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+
+    wm_dir = paths.raw / "webmaster"
+    wm_dir.mkdir()
+    popular = [
+        {"query_text": "аренда авто", "page": "/catalog/",
+         "indicators": {"TOTAL_SHOWS": 1000, "TOTAL_CLICKS": 40, "AVG_SHOW_POSITION": 3.5,
+                        "CTR": 0.04, "DEMAND": 500}},
+        {"query_text": "аренда авто", "page": "/catalog/",  # дубль
+         "indicators": {"TOTAL_SHOWS": 999, "TOTAL_CLICKS": 39, "AVG_SHOW_POSITION": 3.4}},
+        {"query_text": "прокат авто", "page": "/promo/",
+         "indicators": {"TOTAL_SHOWS": 200, "TOTAL_CLICKS": 10, "AVG_SHOW_POSITION": 7.0}},
+    ]
+    (wm_dir / "search_queries_popular.json").write_text(
+        json.dumps(popular, ensure_ascii=False), encoding="utf-8"
+    )
+
+    manifest_mod.update_source(
+        paths.raw, "webmaster", date_from="2026-05-01", date_to="2026-06-30",
+        rows=3, script_version="test", canonical_tables=["seo_queries"],
+    )
+
+    built = bc.build(paths, {"brand_terms": []}, {"utm_undefined_threshold": 0.25})
+    assert "seo_queries" in built
+
+    seo = pd.read_parquet(paths.canonical / "seo_queries.parquet")
+    # 3 JSON-строки, но дубль (аренда авто, /catalog/, webmaster) сжат в одну
+    assert len(seo) == 2
+    # Проверяем новые колонки в parquet
+    schema = pq.read_schema(paths.canonical / "seo_queries.parquet")
+    assert "ctr" in schema.names
+    assert "demand" in schema.names
+    assert "source" in schema.names
+    assert "total_shows" in schema.names
+    assert "total_clicks" in schema.names
+    assert "avg_show_position" in schema.names
+
+    row = seo[seo["query"] == "аренда авто"].iloc[0]
+    assert row["source"] == "webmaster"
+    assert row["page"] == "/catalog/"
+    assert row["ctr"] == pytest.approx(0.04)
+    assert row["demand"] == 500
+    # Строка без CTR/DEMAND → null в parquet
+    row2 = seo[seo["query"] == "прокат авто"].iloc[0]
+    assert pd.isna(row2["ctr"])
+    assert pd.isna(row2["demand"])

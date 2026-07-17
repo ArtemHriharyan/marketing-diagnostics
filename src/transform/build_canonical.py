@@ -891,13 +891,13 @@ def build_seo_queries_gsc(
     source_mode = (manifest_gsc_entry or {}).get("source_mode", "api")
     completeness = (manifest_gsc_entry or {}).get("completeness", "verified")
     return pd.DataFrame({
-        "engine": "google",
         "query": grouped["query"],
         "page": grouped["page"],
+        "source": "gsc",
         "month": grouped["month"],
-        "impressions": grouped["impressions"].astype(int),
-        "clicks": grouped["clicks"].astype(int),
-        "position_avg": grouped["position_avg"],
+        "total_shows": grouped["impressions"].astype(int),
+        "total_clicks": grouped["clicks"].astype(int),
+        "avg_show_position": grouped["position_avg"],
         "is_brand": grouped["query"].apply(lambda q: is_brand_query(q, brand_terms)),
         "source_mode": source_mode,
         "completeness": completeness,
@@ -911,9 +911,11 @@ def build_seo_queries_webmaster(
 ) -> pd.DataFrame:
     """data/raw/webmaster/search_queries_popular.json -> строки seo_queries.
 
-    Популярные запросы Вебмастера агрегированы за всё окно (без разбивки
-    по дням/месяцам и без page) — month фиксируется как месяц окончания
-    окна выгрузки (манифест источника webmaster.date_to), page отсутствует.
+    Популярные запросы Вебмастера агрегированы за всё окно. month фиксируется
+    как месяц окончания окна выгрузки (манифест webmaster.date_to).
+    Поле page берётся из JSON-объекта (новый контракт после 3B-patch);
+    при отсутствии поля — null (обратная совместимость со старым форматом).
+    ctr/demand — из indicators.CTR/DEMAND; null при отсутствии.
     """
     path = webmaster_dir / "search_queries_popular.json"
     if not path.exists():
@@ -936,17 +938,21 @@ def build_seo_queries_webmaster(
         position_avg = indicators.get("AVG_CLICK_POSITION")
         if position_avg is None:
             position_avg = indicators.get("AVG_SHOW_POSITION")
+        ctr_raw = indicators.get("CTR")
+        demand_raw = indicators.get("DEMAND")
         rows.append({
-            "engine": "yandex",
             "query": query,
-            "page": None,
+            "page": item.get("page"),   # null если поле отсутствует (старый формат)
+            "source": "webmaster",
             "month": month,
-            "impressions": int(indicators.get("TOTAL_SHOWS") or 0),
-            "clicks": int(indicators.get("TOTAL_CLICKS") or 0),
-            "position_avg": float(position_avg) if position_avg is not None else None,
+            "total_shows": int(indicators.get("TOTAL_SHOWS") or 0),
+            "total_clicks": int(indicators.get("TOTAL_CLICKS") or 0),
+            "avg_show_position": float(position_avg) if position_avg is not None else None,
             "is_brand": is_brand_query(query, brand_terms),
             "source_mode": source_mode,
             "completeness": completeness,
+            "ctr": float(ctr_raw) if ctr_raw is not None else None,
+            "demand": int(demand_raw) if demand_raw is not None else None,
         })
     return pd.DataFrame(rows)
 
@@ -1055,10 +1061,13 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "optimize_for": "string",
     },
     "seo_queries": {
-        "engine": "string", "query": "string", "page": "string", "month": "string",
-        "impressions": "int", "clicks": "int", "position_avg": "float", "is_brand": "bool",
+        "query": "string", "page": "string", "source": "string", "month": "string",
+        "total_shows": "int", "total_clicks": "int", "avg_show_position": "float",
+        "is_brand": "bool",
         "source_mode": "string",    # api | manual
         "completeness": "string",   # verified | unverified
+        "ctr": "float",             # из indicators.CTR (Вебмастер); null для GSC
+        "demand": "int",            # из indicators.DEMAND (Вебмастер); null для GSC
     },
     "site_pages": {
         "url": "string", "http_status": "int", "redirect_chain": "string",
@@ -1190,6 +1199,12 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
     seo_frames = [f for f in seo_frames if not f.empty]
     if seo_frames:
         seo_df = pd.concat(seo_frames, ignore_index=True)
+        # Дедуп по натуральному ключу (query, page, source): одна запись на пару
+        # (запрос, страница) внутри каждого источника. Webmaster+GSC с одинаковым
+        # (query, page) — разные строки (разный source), не конфликт.
+        seo_df = seo_df.drop_duplicates(
+            subset=["query", "page", "source"], keep="first"
+        ).reset_index(drop=True)
         write_canonical_table(seo_df, "seo_queries", canonical_dir / "seo_queries.parquet")
         built.append("seo_queries")
 

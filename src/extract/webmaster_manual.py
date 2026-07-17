@@ -1,44 +1,27 @@
 """Экстрактор: РУЧНАЯ выгрузка Яндекс.Вебмастера (без API).
 
-Активен, когда config.sources.webmaster.mode == "manual" (сейчас всегда —
-API-доступа к Вебмастеру у клиента нет). НЕ вызывает никакой API: читает,
-валидирует и нормализует CSV-экспорт «Популярные запросы», который аналитик
-кладёт в inputs/manual_exports/webmaster/.
+Активен, когда config.sources.webmaster.mode == "manual". Читает,
+валидирует и нормализует CSV-экспорт «Популярные запросы» в wide-формате,
+который аналитик кладёт в inputs/manual_exports/webmaster/.
 
 Контракт:
-    Читает   — config.sources.webmaster (manual_export_dir, column_map,
-               manual_no_page_breakdown_policy) и файлы webmaster_YYYY-MM.csv.
-    Пишет    — data/raw/webmaster/search_queries_popular.json — ТОТ ЖЕ выходной
-               контракт, что у webmaster_api.py (список запросов с indicators
-               TOTAL_SHOWS/TOTAL_CLICKS/AVG_SHOW_POSITION), поэтому
-               transform.build_seo_queries_webmaster работает без правок. Плюс
-               data/raw/webmaster/validation_report.json и manifest.json
-               (canonical_tables: [seo_queries]).
-    Деградация — опционален; нет ручных выгрузок -> источник недоступен (принцип 4).
+    Читает   — config.sources.webmaster (manual_export_dir, manual_export_file,
+               column_map) и единственный CSV-файл wide-формата.
+    Пишет    — data/raw/webmaster/search_queries_popular.json — список пар
+               (query_text, page) с indicators TOTAL_SHOWS/TOTAL_CLICKS/
+               AVG_SHOW_POSITION/CTR/DEMAND. Плюс validation_report.json и
+               manifest.json (canonical_tables: [seo_queries]).
+    Деградация — опционален; файл не найден -> SourceUnavailable (принцип 4).
     LLM      — не используется.
 
-Полнота НЕ верифицируется (нет контроля пагинации, как в API) -> в manifest
-всегда completeness: "unverified", source_mode: "manual".
+Формат входного файла (wide):
+    Одна строка = одна пара (Query × Url). Месяцы развёрнуты в колонки:
+    Query | Url | YYYY-MM_shows | YYYY-MM_position | YYYY-MM_demand |
+    YYYY-MM_ctr | YYYY-MM_clicks | ...
+    Один файл за весь период; имя задаётся manual_export_file
+    (дефолт — webmaster_export.csv).
 
-СТРУКТУРНОЕ ОГРАНИЧЕНИЕ (подтверждено, не предположение):
-    Отчёт «Популярные запросы» отдаёт данные ТОЛЬКО на уровне запроса
-    (query x показы/клики/позиция) БЕЗ разбивки по page/device. Это ограничение
-    самого метода, а не только ручного экспорта: API v4 Вебмастера
-    (search-queries/popular, см. webmaster_api.QUERY_INDICATORS) отдаёт ровно те
-    же четыре индикатора без измерений page/device. Поэтому ограничение помечено
-    как свойство метода в обоих режимах, а не как дефект ручной выгрузки.
-
-    Что делать с проверками, которым нужен разрез по page (S08–S10, S23, S24),
-    решает config.sources.webmaster.manual_no_page_breakdown_policy, а НЕ скрипт:
-        "degrade"   — эти проверки уходят в degradation (нет разбивки по page);
-        "aggregate" — считаются агрегатом по домену с понижением confidence_cap.
-    Дефолт в _template — "degrade".
-
-Вход по месяцам:
-    webmaster_YYYY-MM.csv — колонки (алиасы в config.sources.webmaster.column_map):
-    query, impressions, clicks, position, month. Экспорт помесячный; для
-    seo_queries значения агрегируются по запросу за всё окно (как это делает и
-    transform для стороны Вебмастера).
+Полнота НЕ верифицируется -> completeness: "unverified", source_mode: "manual".
 """
 
 from __future__ import annotations
@@ -53,25 +36,24 @@ from typing import Any, Callable
 
 from . import _common as C
 
-SCRIPT_VERSION = "0.1.0"
+SCRIPT_VERSION = "0.2.0"
 SOURCE = "webmaster"
 CANONICAL_TABLES = ["seo_queries"]
 
-# Допустимые значения политики разреза по page (см. докстринг).
-POLICIES = ("degrade", "aggregate")
-DEFAULT_POLICY = "degrade"
+# Колонка YYYY-MM_shows задаёт список месяцев в wide-файле.
+_MONTH_SHOWS_RE = re.compile(r"^(\d{4}-\d{2})_shows$")
 
-# Имя файла помесячной выгрузки: webmaster_YYYY-MM.csv.
-_MONTH_RE = re.compile(r"webmaster_(\d{4}-\d{2})\.csv$", re.IGNORECASE)
+# Дефолтные имена заголовков в реальном экспорте Вебмастера.
+_DEFAULT_COLUMN_MAP: dict[str, str] = {"query": "Query", "page": "Url"}
 
 
 def ping(config: dict[str, Any], env: dict[str, str]) -> bool:
-    """Лёгкая проверка: есть ли хотя бы один файл ручной выгрузки Вебмастера."""
+    """Лёгкая проверка: есть ли файл ручной выгрузки Вебмастера."""
     wm = (config.get("sources") or {}).get("webmaster") or {}
     manual_dir = _manual_dir(wm, _paths_root=None)
     if manual_dir is None or not manual_dir.exists():
         return False
-    return any(_MONTH_RE.search(p.name) for p in manual_dir.glob("webmaster_*.csv"))
+    return _export_path(wm, manual_dir).exists()
 
 
 def extract(
@@ -83,75 +65,51 @@ def extract(
     today: Any = None,
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Провалидировать и нормализовать ручные выгрузки Вебмастера в data/raw/webmaster/."""
+    """Провалидировать и нормализовать ручную выгрузку Вебмастера в data/raw/webmaster/."""
     log = log or (lambda _msg: None)
 
     wm = (config.get("sources") or {}).get("webmaster") or {}
-    column_map = wm.get("column_map") or {}
-    policy = _resolve_policy(wm.get("manual_no_page_breakdown_policy"))
+    column_map = _resolve_column_map(wm.get("column_map"))
 
     manual_dir = _manual_dir(wm, _paths_root=getattr(paths, "root", None))
     if manual_dir is None or not manual_dir.exists():
         raise C.SourceUnavailable(
             SOURCE, f"нет каталога ручных выгрузок Вебмастера: {manual_dir}"
         )
-    month_files = _month_files(manual_dir)
-    if not month_files:
+    export_path = _export_path(wm, manual_dir)
+    if not export_path.exists():
         raise C.SourceUnavailable(
-            SOURCE, f"в {manual_dir} нет файлов webmaster_YYYY-MM.csv"
+            SOURCE, f"файл выгрузки не найден: {export_path}"
         )
 
     out_dir = C.reset_dir(C.source_dir(paths, SOURCE))
-    log(f"{SOURCE}[manual]: каталог {manual_dir}, файлов {len(month_files)}, "
-        f"политика page-разреза '{policy}'")
+    log(f"{SOURCE}[manual]: файл {export_path}")
 
-    total_rows = 0
+    rows = _read_export(export_path)
+    total_rows = len(rows)
+
+    headers = list(rows[0].keys()) if rows else []
+    months = _detect_months(headers)
+    has_demand = any(f"{m}_demand" in headers for m in months)
+
+    log(f"{SOURCE}[manual]: строк {total_rows}, месяцев {len(months)}, demand={has_demand}")
+
     rejected_reasons: dict[str, int] = {}
     warnings: dict[str, int] = {}
-    months: list[str] = []
-    has_page_overall = False
-    has_device_overall = False
-    # Агрегат по запросу за всё окно: query -> [shows, clicks, pos*shows, pos_sum, n].
-    agg: dict[str, list[float]] = {}
+    agg: dict[tuple[str, str], list] = {}
 
-    for month, csv_path in month_files:
-        months.append(month)
-        rows = _read_export(csv_path)
-        total_rows += len(rows)
-        has_p, has_d = _detect_page_device_columns(rows, column_map)
-        if has_p:
-            has_page_overall = True
-        if has_d:
-            has_device_overall = True
-        _accumulate(rows, column_map, agg, rejected_reasons, warnings)
-        log(f"{SOURCE}[manual]: {month} — строк {len(rows)}")
+    _parse_and_accumulate(rows, months, column_map, has_demand, agg, rejected_reasons, warnings)
 
-    # page_device_breakdown определяется из фактически найденных колонок.
-    # Если ни page, ни device не обнаружены — ограничение метода (не только ручного
-    # экспорта): API v4 search-queries/popular тоже не отдаёт эти измерения.
-    page_device_breakdown = has_page_overall and has_device_overall
-    page_device_absence_reason: str | None = (
-        "method_limitation" if not page_device_breakdown else None
-    )
-
-    popular = _to_popular(agg)
+    popular = _to_popular(agg, has_demand)
     _dump(out_dir / "search_queries_popular.json", popular)
 
     report = _write_validation_report(
-        out_dir, month_files, months, total_rows, len(popular),
-        rejected_reasons, warnings, policy, column_map,
-        has_page_column=has_page_overall,
-        has_device_column=has_device_overall,
-        page_device_absence_reason=page_device_absence_reason,
+        out_dir, export_path, months, total_rows, len(popular),
+        rejected_reasons, warnings, column_map, has_demand,
     )
-    manifest = _record_manifest(
-        paths, months, len(popular), policy,
-        has_page_column=has_page_overall,
-        has_device_column=has_device_overall,
-        page_device_absence_reason=page_device_absence_reason,
-    )
-    log(f"{SOURCE}[manual]: готово — уникальных запросов {len(popular)} "
-        f"из {total_rows} строк (page/device-разреза нет — ограничение метода)")
+    manifest = _record_manifest(paths, months, len(popular), has_demand)
+
+    log(f"{SOURCE}[manual]: готово — уникальных пар query×page {len(popular)}")
 
     return {
         "source": SOURCE,
@@ -163,41 +121,25 @@ def extract(
         "months": months,
         "source_mode": "manual",
         "completeness": "unverified",
-        "has_page_column": has_page_overall,
-        "has_device_column": has_device_overall,
-        "page_device_breakdown": page_device_breakdown,
-        "page_device_absence_reason": page_device_absence_reason,
-        "manual_no_page_breakdown_policy": policy,
+        "has_page_column": True,
+        "has_device_column": False,
+        "page_device_breakdown": True,
+        "page_device_absence_reason": None,
+        "has_demand_column": has_demand,
         "canonical_tables": CANONICAL_TABLES,
         "manifest": manifest,
         "report": report,
     }
 
 
-# ── Политика разреза по page ────────────────────────────────────────────────
-def _resolve_policy(value: Any) -> str:
-    """Нормализовать manual_no_page_breakdown_policy; неизвестное -> дефолт."""
-    policy = str(value or DEFAULT_POLICY).strip().lower()
-    return policy if policy in POLICIES else DEFAULT_POLICY
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _resolve_column_map(column_map: Any) -> dict[str, str]:
+    result = dict(_DEFAULT_COLUMN_MAP)
+    result.update(column_map or {})
+    return result
 
 
-def _detect_page_device_columns(
-    rows: list[dict[str, str]], column_map: dict[str, str]
-) -> tuple[bool, bool]:
-    """Фактически проверить наличие колонок page/device в CSV — не предполагать заранее.
-
-    Смотрит на реальные ключи первой строки данных. column_map задаёт алиасы
-    (canonical -> csv_header), поэтому ищем именно mapped-заголовок.
-    """
-    if not rows:
-        return False, False
-    keys = rows[0].keys()
-    page_col = column_map.get("page", "page")
-    device_col = column_map.get("device", "device")
-    return page_col in keys, device_col in keys
-
-
-# ── Раскладка входных файлов ────────────────────────────────────────────────
 def _manual_dir(wm_cfg: dict[str, Any], _paths_root: Any) -> Path | None:
     raw_dir = wm_cfg.get("manual_export_dir") or "inputs/manual_exports/webmaster"
     p = Path(raw_dir)
@@ -208,16 +150,128 @@ def _manual_dir(wm_cfg: dict[str, Any], _paths_root: Any) -> Path | None:
     return p
 
 
-def _month_files(manual_dir: Path) -> list[tuple[str, Path]]:
-    found: list[tuple[str, Path]] = []
-    for path in manual_dir.glob("webmaster_*.csv"):
-        m = _MONTH_RE.search(path.name)
+def _export_path(wm_cfg: dict[str, Any], manual_dir: Path) -> Path:
+    filename = wm_cfg.get("manual_export_file") or "webmaster_export.csv"
+    return manual_dir / filename
+
+
+def _detect_months(headers: list[str]) -> list[str]:
+    months = []
+    for h in headers:
+        m = _MONTH_SHOWS_RE.match(h)
         if m:
-            found.append((m.group(1), path))
-    return sorted(found, key=lambda t: t[0])
+            months.append(m.group(1))
+    return sorted(months)
 
 
-# ── Чтение и агрегация ──────────────────────────────────────────────────────
+# ── Парсинг и агрегация ──────────────────────────────────────────────────────
+
+def _parse_and_accumulate(
+    rows: list[dict[str, str]],
+    months: list[str],
+    column_map: dict[str, str],
+    has_demand: bool,
+    agg: dict,
+    rejected_reasons: dict,
+    warnings: dict,
+) -> None:
+    """Развернуть wide-строки в long и накопить агрегат по (query, page)."""
+    for row in rows:
+        query = (_field(row, "query", column_map) or "").strip()
+        if not query:
+            rejected_reasons["missing_query"] = rejected_reasons.get("missing_query", 0) + 1
+            continue
+        page = (_field(row, "page", column_map) or "").strip()
+
+        for month in months:
+            shows = _to_int(row.get(f"{month}_shows", ""))
+            if shows == 0:
+                continue  # пропускаем месяц с нулевыми показами
+
+            clicks = _to_int(row.get(f"{month}_clicks", ""))
+            position = _to_float(row.get(f"{month}_position", ""))
+            demand = _to_float(row.get(f"{month}_demand", "")) if has_demand else None
+
+            if position is None:
+                warnings["missing_position"] = warnings.get("missing_position", 0) + 1
+
+            key = (query, page)
+            if key not in agg:
+                # [shows, clicks, pos_weighted, pos_sum, pos_count, demand_max]
+                agg[key] = [0.0, 0.0, 0.0, 0.0, 0.0, None]
+            slot = agg[key]
+            slot[0] += shows
+            slot[1] += clicks
+            if position is not None:
+                slot[2] += position * shows
+                slot[3] += position
+                slot[4] += 1
+            if demand is not None:
+                slot[5] = demand if slot[5] is None else max(slot[5], demand)
+
+
+def _to_popular(
+    agg: dict[tuple[str, str], list],
+    has_demand: bool,
+) -> list[dict[str, Any]]:
+    """Свести агрегат (query×page) к выходному контракту search_queries_popular.json."""
+    popular: list[dict[str, Any]] = []
+    for (query, page), (shows, clicks, pos_w, pos_sum, pos_n, demand_max) in agg.items():
+        if shows > 0:
+            avg_position = pos_w / shows
+        elif pos_n > 0:
+            avg_position = pos_sum / pos_n
+        else:
+            avg_position = None
+
+        ctr: float | None = (clicks / shows) if shows > 0 else None
+        demand: int | None = int(round(demand_max)) if has_demand and demand_max is not None else None
+
+        popular.append({
+            "query_text": query,
+            "page": page,
+            "indicators": {
+                "TOTAL_SHOWS": int(shows),
+                "TOTAL_CLICKS": int(clicks),
+                "AVG_SHOW_POSITION": round(avg_position, 4) if avg_position is not None else None,
+                "CTR": round(ctr, 6) if ctr is not None else None,
+                "DEMAND": demand,
+            },
+        })
+    popular.sort(key=lambda q: q["indicators"]["TOTAL_SHOWS"], reverse=True)
+    return popular
+
+
+def _field(row: dict[str, Any], canonical: str, column_map: dict[str, str]) -> str:
+    header = column_map.get(canonical, canonical)
+    value = row.get(header)
+    if value is None:
+        value = row.get(canonical)
+    return "" if value is None else str(value)
+
+
+def _to_int(value: str) -> int:
+    cleaned = (value or "").strip().replace(" ", "").replace(" ", "").replace(",", "")
+    if not cleaned:
+        return 0
+    try:
+        return int(float(cleaned))
+    except ValueError:
+        return 0
+
+
+def _to_float(value: str) -> float | None:
+    cleaned = (value or "").strip().replace(" ", "").replace(",", ".")
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+# ── Чтение CSV ───────────────────────────────────────────────────────────────
+
 def _read_export(path: Path) -> list[dict[str, str]]:
     data = Path(path).read_bytes()
     text: str | None = None
@@ -242,126 +296,34 @@ def _sniff_delimiter(text: str) -> str:
     return best if counts[best] > 0 else ","
 
 
-def _accumulate(rows, column_map, agg, rejected_reasons, warnings) -> None:
-    """Накопить показы/клики/позицию по запросу за все месяцы окна."""
-    for row in rows:
-        query = (_field(row, "query", column_map) or "").strip()
-        if not query:
-            rejected_reasons["missing_query"] = rejected_reasons.get("missing_query", 0) + 1
-            continue
-        shows = _to_int(_field(row, "impressions", column_map))
-        clicks = _to_int(_field(row, "clicks", column_map))
-        position = _to_float(_field(row, "position", column_map))
-        if position is None:
-            warnings["missing_position"] = warnings.get("missing_position", 0) + 1
-
-        slot = agg.setdefault(query, [0.0, 0.0, 0.0, 0.0, 0.0])
-        slot[0] += shows
-        slot[1] += clicks
-        if position is not None:
-            slot[2] += position * shows   # для взвешивания по показам
-            slot[3] += position           # запас, если показов нет
-            slot[4] += 1
-
-
-def _to_popular(agg: dict[str, list[float]]) -> list[dict[str, Any]]:
-    """Свести агрегат к структуре, совместимой с webmaster_api / transform.
-
-    AVG_SHOW_POSITION — средневзвешенная по показам позиция (если показов нет —
-    простое среднее). Сортировка по TOTAL_SHOWS убыв. (как «популярные запросы»).
-    """
-    popular: list[dict[str, Any]] = []
-    for query, (shows, clicks, pos_weighted, pos_sum, n) in agg.items():
-        if shows > 0:
-            avg_position = pos_weighted / shows
-        elif n > 0:
-            avg_position = pos_sum / n
-        else:
-            avg_position = None
-        popular.append({
-            "query_text": query,
-            "indicators": {
-                "TOTAL_SHOWS": int(shows),
-                "TOTAL_CLICKS": int(clicks),
-                "AVG_SHOW_POSITION": (round(avg_position, 4)
-                                      if avg_position is not None else None),
-            },
-        })
-    popular.sort(key=lambda q: q["indicators"]["TOTAL_SHOWS"], reverse=True)
-    return popular
-
-
-def _field(row: dict[str, Any], canonical: str, column_map: dict[str, str]) -> str:
-    header = column_map.get(canonical, canonical)
-    value = row.get(header)
-    if value is None:
-        value = row.get(canonical)
-    return "" if value is None else str(value)
-
-
-def _to_int(value: str) -> int:
-    cleaned = (value or "").strip().replace(" ", "").replace(" ", "").replace(",", "")
-    if not cleaned:
-        return 0
-    try:
-        return int(float(cleaned))
-    except ValueError:
-        return 0
-
-
-def _to_float(value: str) -> float | None:
-    cleaned = (value or "").strip().replace(" ", "").replace(",", ".")
-    if not cleaned:
-        return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
 # ── Отчёт валидации, манифест, дамп ─────────────────────────────────────────
-def _limitation_note() -> str:
-    return (
-        "отчёт «Популярные запросы» не даёт разбивку по page/device — подтверждено "
-        "как ограничение метода: и ручной экспорт, и API v4 (search-queries/popular) "
-        "отдают только query-уровень (TOTAL_SHOWS/TOTAL_CLICKS/AVG_*_POSITION)."
-    )
-
-
-def _policy_note(policy: str) -> str:
-    if policy == "aggregate":
-        return ("политика 'aggregate': S08–S10, S23, S24 считаются агрегатом по "
-                "домену с понижением confidence_cap.")
-    return ("политика 'degrade': S08–S10, S23, S24 (нужен разрез по page) уходят "
-            "в degradation.")
-
 
 def _write_validation_report(
-    out_dir, month_files, months, total_rows, accepted, rejected_reasons,
-    warnings, policy, column_map,
-    *,
-    has_page_column: bool,
-    has_device_column: bool,
-    page_device_absence_reason: str | None,
+    out_dir: Path,
+    export_path: Path,
+    months: list[str],
+    total_rows: int,
+    accepted: int,
+    rejected_reasons: dict,
+    warnings: dict,
+    column_map: dict,
+    has_demand: bool,
 ) -> dict[str, Any]:
-    page_device_breakdown = has_page_column and has_device_column
     report = {
         "source_mode": "manual",
         "completeness": "unverified",
-        "input_files": [str(p) for _m, p in month_files],
+        "input_file": str(export_path),
         "months": months,
         "total_rows": total_rows,
         "accepted": accepted,
         "rejected": sum(rejected_reasons.values()),
         "rejected_reasons": rejected_reasons,
         "warnings": warnings,
-        "has_page_column": has_page_column,
-        "has_device_column": has_device_column,
-        "page_device_breakdown": page_device_breakdown,
-        "page_device_absence_reason": page_device_absence_reason,
-        "structural_limitation": _limitation_note(),
-        "manual_no_page_breakdown_policy": policy,
-        "policy_effect": _policy_note(policy),
+        "has_page_column": True,
+        "has_device_column": False,
+        "page_device_breakdown": True,
+        "page_device_absence_reason": None,
+        "has_demand_column": has_demand,
         "column_map": column_map,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -371,18 +333,11 @@ def _write_validation_report(
     return report
 
 
-def _record_manifest(
-    paths, months, rows, policy,
-    *,
-    has_page_column: bool,
-    has_device_column: bool,
-    page_device_absence_reason: str | None,
-):
+def _record_manifest(paths, months: list[str], rows: int, has_demand: bool):
     from ..pipeline import manifest as manifest_mod
 
     date_from = f"{months[0]}-01" if months else ""
     date_to = f"{months[-1]}-01" if months else ""
-    notes = [_limitation_note(), _policy_note(policy)]
 
     return manifest_mod.update_source(
         Path(paths.raw), SOURCE,
@@ -392,12 +347,12 @@ def _record_manifest(
         extra={
             "source_mode": "manual",
             "completeness": "unverified",
-            "has_page_column": has_page_column,
-            "has_device_column": has_device_column,
-            "page_device_breakdown": has_page_column and has_device_column,
-            "page_device_absence_reason": page_device_absence_reason,
-            "manual_no_page_breakdown_policy": policy,
-            "notes": notes,
+            "has_page_column": True,
+            "has_device_column": False,
+            "page_device_breakdown": True,
+            "page_device_absence_reason": None,
+            "has_demand_column": has_demand,
+            "months": months,
         },
     )
 
