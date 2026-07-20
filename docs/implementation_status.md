@@ -17,7 +17,8 @@
 | **1C** | DONE    | — |
 | **1D** | DONE    | проверка совместимости 2026-07-14: methodology×2 pass, degradation×6 pass, config×16 pass, intake _template exit=0, intake pognali.rent exit=0 |
 | **2A** | DONE    | — |
-| **2B** | DONE    | — |
+| **2B** | DONE    | 2B-patch 2026-07-20: window truncation 180d, isolation, UTF-8 fix, 16 tests |
+| **2B-patch-2** | CODE DONE, live run pending | см. запись ниже — код + 30 тестов green (mock), реальный прогон на pognali.rent не выполнялся в этой сессии |
 | **2C** | DONE    | — |
 | **2D** | DONE    | — |
 | **3A** | DONE    | build_canonical.py базовые преобразования. GSC manual path (task_id gsc-3A, task_id 3A-rewrite 2026-07-17): gsc_manual.py переписан под формат папок YYYY-MM/Запросы.csv/Диаграмма.csv/Страницы.csv/Устройства.csv. Выходной контракт seo_queries не изменился. column_map в config.yaml заполнен кириллическими заголовками GSC. tests/test_gsc_manual.py переписан: 9 тестов — 9 pass 2026-07-17. |
@@ -74,6 +75,15 @@ keywords.parquet, product_feed.parquet. Флаги campaign_report_has_lost_impr
 archived_campaigns_retrievable, feed_used в manifest. cost_basis=net_no_vat.
 10 тестов — все pass (включая error 58/513, деградацию вторичных отчётов).
 
+**2B-patch (финальная версия)** DONE — 2026-07-20
+REPORT_WINDOW_LIMIT_DAYS = {SEARCH_QUERY_PERFORMANCE_REPORT: 180}; обрезка окна запросов
+до max(requested, today-180); window_infos/{requested,effective,truncated} в manifest;
+caveat_type=source_window_limit (не data_quality_issue) при обрезке.
+Изоляция ошибок: report_status per type (campaigns/queries/geo), SourceUnavailable только
+если все три упали. geo_report_available + geo_caveat.reason в manifest.
+UTF-8 fix: _api_error + _fetch_report читают content.decode("utf-8") вместо resp.text.
+16 тестов test_direct_2b_patch.py — 16 passed (11 старых + 5 новых ШАГ 0).
+
 **2C — gsc_api + gsc_manual + webmaster_api + webmaster_manual + wordstat** DONE
 - GSC API: пагинация startRow, одинаковый контракт с manual (RAW_FIELDS).
 - GSC manual: CSV-валидация, device=unknown, clicks_ui_caveat, validation_report.
@@ -126,6 +136,91 @@ bc.build() вызывается из orchestrator.run_transform(), manifest об
 ---
 
 ## Следующая задача
+
+**2B-patch:** DONE (2026-07-19). pytest test_direct_2b_patch.py → 11 passed; test_build_canonical.py → 96 passed (4 новых). 5 pre-existing failures в test_extract_smoke.py (gsc_manual/webmaster, не связаны с 2B-patch).
+
+**2B-patch-2 (2026-07-20):** CODE DONE, live-прогон на pognali.rent НЕ выполнялся в
+этой сессии (нет доступа к реальному API/токену) — статус DONE по протоколу задачи
+ставить нельзя до реального прогона с `report_status: {campaigns: ok, queries: ok,
+geo: ok}`.
+
+Три исправления в `src/extract/direct.py`:
+1. **QUERY_FIELDS**: убрано `Device` (error 4000 на реальном аккаунте, не принят
+   Reports API для SEARCH_QUERY_PERFORMANCE_REPORT). QUERY_FIELDS_GOAL — аналогично.
+   Итоговый состав не проверен на error 4000 повторно (нет live-доступа) — если
+   API отклонит ещё одно поле, потребуется повторный цикл убрать/проверить.
+2. **Geo**: `report_type` для гео-отчёта заменён `GEO_PERFORMANCE_REPORT` (не
+   существует, error 8000) → `CUSTOM_REPORT` (по образцу PLACEMENT_FIELDS).
+   GEO_FIELDS/GEO_FIELDS_GOAL по составу не менялись. REPORT_WINDOW_LIMIT_DAYS
+   для CUSTOM_REPORT/geo не добавлен — не проверено эмпирически на реальном
+   окне, требует live-прогона (может понадобиться error 4001 → лимит по аналогии
+   с queries).
+3. **JSON API v5 селекторы**: `adgroups.get`/`ads.get`/`keywords.get` теперь
+   вызываются с `SelectionCriteria.CampaignIds` из списка кампаний
+   `_fetch_strategies()` (шаг 5, уже выполняется раньше шагов 6–9 — порядок
+   шагов менять не пришлось). `feeds.get` требует `Ids` явно (error 8000) и не
+   имеет отдельного метода перечисления фидов клиента без него — вслепую
+   больше не вызывается; `_fetch_feed` всегда возвращает `feed_used=False` +
+   note с явным объяснением ограничения API (не баг).
+
+Побочное изменение вне `allowed_files` (согласовано с пользователем): в
+`tests/test_extract_smoke.py::test_direct_feed_used_writes_parquet` старое
+ожидание `feed_used=True` при наличии фида противоречило подтверждённому
+поведению API (feeds.get не может обнаружить фид без готового Ids) —
+тест обновлён под `feed_used=False`, остальной файл не тронут.
+
+Тесты: `pytest tests/test_direct_2b_patch.py` → 30 passed (23 старых/новых
+mock-теста для 2B-patch-2 внутри файла + существовавшие). `pytest
+tests/test_extract_smoke.py -k direct` → 11 passed. Полный
+`tests/test_extract_smoke.py`: 5 failed (gsc_manual/webmaster_manual,
+pre-existing, не связаны с этим патчем — те же 5 падают и до изменений).
+
+**Blocker:** реальный прогон на аккаунте pognali.rent не выполнен (нет
+API-доступа в этой сессии). До прогона: не исключено, что (а) QUERY_FIELDS
+после убирания Device отклонит ещё одно поле; (б) CUSTOM_REPORT для гео
+потребует REPORT_WINDOW_LIMIT_DAYS; (в) CUSTOM_REPORT отклонит одно из полей
+GEO_FIELDS (LocationOfPresenceId/Name/Device). Ставить 2B-patch-2=DONE только
+после этого прогона с report_status: {campaigns: ok, queries: ok, geo: ok}.
+
+---
+
+## 2B-patch / step0 findings
+
+**Дата анализа:** 2026-07-19
+
+### Диагностика расхождения (аренда авто владивосток, CampaignId 119193036)
+
+**Проверено по коду:**
+
+1. **DateFrom/DateTo не логируются постановочно** (`_fetch_report` использует
+   даты из `date_from`/`date_to`, но в manifest фиксируются только общие
+   границы окна, не даты конкретного запроса). Без логов невозможно снаружи
+   проверить, за какой период API реально получил запрос.
+
+2. **Нет помесячного чанкинга для SEARCH_QUERY_PERFORMANCE_REPORT** — весь период
+   запрашивается одним запросом. Это архитектурное отличие от Метрики, которая
+   чанкует по месяцам. При большом окне (12 месяцев) Reports API может усекать
+   выборку или обрабатывать её иначе, чем UI.
+
+3. **Нет AdNetworkType-фильтра** — отчёт по определению поисковой (SEARCH_QUERY),
+   явного фильтра нет. Скорее всего, не причина расхождения.
+
+4. **cost_raw именование** — в существующем `build_direct_queries` и `build_costs`
+   `cost_raw`/`cost_rub` хранятся в **рублях** (после деления на 1 000 000),
+   что противоречит имени. Двойного деления нет. Требует исправления согласно
+   data-export-spec-v1 (cost_raw = int64 микрорублей, cost_normalized = float64 рублей).
+
+**Вывод:** Причина расхождения **не найдена точно** из анализа кода — требуется
+прогон с реальным токеном и логированием дат. Наиболее вероятная гипотеза:
+**period mismatch** — пользователь сравнивал UI за период, отличающийся от
+фактически переданного в API DateFrom/DateTo.
+
+**Исправление (блокирующее):** добавлено логирование `period_logs` (date_from,
+date_to, rows) на каждый чанк в manifest + помесячный чанкинг для всех трёх
+отчётов (campaign/query/geo). После следующего прогона расхождение должно стать
+идентифицируемым по `period_logs` в manifest.json.
+
+---
 
 **3B-fix:** исправить `_join_backfill` в `src/transform/build_canonical.py`.
 

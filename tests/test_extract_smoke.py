@@ -546,20 +546,20 @@ def test_direct_archived_campaigns_retrievable_flag_true(paths):
 
 
 def test_direct_feed_used_writes_parquet(paths):
-    """Есть товарный фид -> product_feed.parquet + manifest.feed_used=true (A25)."""
-    feeds = [{"Id": 77, "Name": "Каталог", "BusinessType": "RETAIL",
-              "UrlFeedParameters": {"Url": "https://pognali.rent/feed.yml"},
-              "UpdateStatus": {"LastUpdate": "2026-06-27T03:00:00Z"}}]
+    """feeds.get требует Ids явно (2B-patch-2, error 8000 на реальном аккаунте) —
+    список фидов клиента нельзя получить без него, поэтому фид всегда
+    graceful-empty: manifest.feed_used=false, product_feed.parquet не пишется.
+    """
     box = {}
-    session = FakeSession(_direct_routes(box, feeds=feeds))
+    session = FakeSession(_direct_routes(box))
     box["session"] = session
 
     result = direct.extract(CONFIG_DIRECT, ENV, paths, session=session, sleeper=NO_SLEEP)
 
-    assert result["feed_used"] is True
-    assert (paths.raw / "direct" / "product_feed.parquet").exists()
+    assert result["feed_used"] is False
+    assert not (paths.raw / "direct" / "product_feed.parquet").exists()
     entry = manifest_mod.load_manifest(paths.raw)["sources"]["direct"]
-    assert entry["feed_used"] is True
+    assert entry["feed_used"] is False
 
 
 def test_direct_keyword_match_type_classification():

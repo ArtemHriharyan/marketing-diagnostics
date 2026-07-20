@@ -320,16 +320,31 @@ def _write_metrika_logs_fixture(raw_dir: Path) -> None:
 def _write_direct_fixture(raw_dir: Path) -> None:
     out_dir = raw_dir / "direct"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Legacy flat file — используется build_costs (CAMPAIGN_PERFORMANCE_REPORT).
     (out_dir / "campaign_performance.tsv").write_text(
         "CampaignId\tCampaignName\tCost\tClicks\tImpressions\tDate\n"
         "1\tПоиск\t5000000\t10\t200\t2026-06-01\n",
         encoding="utf-8",
     )
+
+    # Новый формат: помесячные чанки для build_direct_queries.
+    queries_dir = out_dir / "queries"
+    queries_dir.mkdir(parents=True, exist_ok=True)
+    (queries_dir / "2026-06.tsv").write_text(
+        "Date\tCampaignId\tCampaignName\tAdGroupId\tQuery\tMatchType\tDevice\t"
+        "Cost\tClicks\tImpressions\tConversions\n"
+        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t2000000\t3\t50\t1\n",
+        encoding="utf-8",
+    )
+
+    # Legacy файл (для smoke-тестов экстрактора, не используется transform).
     (out_dir / "search_query_performance.tsv").write_text(
         "Query\tCampaignId\tAdGroupId\tCost\tClicks\tConversions\n"
         "купить машину\t1\t11\t2000000\t3\t1\n",
         encoding="utf-8",
     )
+
     strategies = [{"Id": 1, "Name": "Поиск", "TextCampaign": {
         "BiddingStrategy": {"Search": {"BiddingStrategyType": "AVERAGE_CPA"}}}}]
     (out_dir / "campaign_strategies.json").write_text(
@@ -391,7 +406,11 @@ def test_build_writes_only_tables_with_raw_source(tmp_path):
     dq = pd.read_parquet(paths.canonical / "direct_queries.parquet")
     assert dq.iloc[0]["query"] == "купить машину"
     assert dq.iloc[0]["campaign_name"] == "Поиск"
-    assert dq.iloc[0]["date_month"] == "2026-06"
+    assert str(dq.iloc[0]["date"]) == "2026-06-01"
+    assert dq.iloc[0]["cost_raw"] == 2000000
+    assert dq.iloc[0]["cost_normalized"] == pytest.approx(2.0)
+    assert dq.iloc[0]["conversions_all"] == 1
+    assert dq.iloc[0]["match_type"] == "broad"
 
     cs = pd.read_parquet(paths.canonical / "campaign_strategies.parquet")
     assert cs.iloc[0]["optimize_for"] == "conversions"

@@ -733,6 +733,16 @@ def _read_tsv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(fh, delimiter="\t"))
 
 
+def _read_tsv_dir(path: Path) -> list[dict[str, str]]:
+    """Прочитать все *.tsv непосредственно в path (не рекурсивно), объединить строки."""
+    rows: list[dict[str, str]] = []
+    if not path.exists():
+        return rows
+    for tsv_path in sorted(path.glob("*.tsv")):
+        rows.extend(_read_tsv(tsv_path))
+    return rows
+
+
 def build_costs(
     direct_dir: Path | None,
     manifest_direct_entry: dict[str, Any] | None,
@@ -780,43 +790,269 @@ def build_costs(
     return pd.DataFrame(rows)
 
 
+_MICROS_PER_RUB = 1_000_000
+
+
+def _parse_cost(raw: Any) -> tuple[int, float]:
+    """Cost-поле из TSV Директа -> (cost_raw_micros: int, cost_normalized_rub: float).
+
+    Единственное место деления микрорублей — все билдеры используют только его.
+    """
+    micros = int(float(raw)) if raw not in (None, "", "nan") else 0
+    return micros, round(micros / _MICROS_PER_RUB, 6)
+
+
+def _parse_int_field(raw: Any, default: int = 0) -> int:
+    try:
+        return int(float(raw)) if raw not in (None, "", "nan") else default
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_date_field(raw: Any) -> date | None:
+    try:
+        return datetime.strptime((raw or "").strip(), "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
 def build_direct_queries(
     direct_dir: Path, manifest_direct_entry: dict[str, Any] | None,
+    macro_goals: list[dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
-    """search_query_performance.tsv -> direct_queries.
+    """SEARCH_QUERY_PERFORMANCE_REPORT -> direct_queries.
 
-    Отчёт агрегирован за всё окно выгрузки (без разбивки по дням) — Директ
-    не запрашивает Date для SEARCH_QUERY_PERFORMANCE_REPORT. date_month
-    фиксируется как месяц окончания окна выгрузки (манифест источника
-    direct.date_to), это метка окна, а не помесячная разбивка.
+    Читает из direct/queries/ (новый помесячный формат), если папка есть;
+    иначе откатывается на legacy search_query_performance.tsv.
+    cost_raw хранится как int64 микрорублей; cost_normalized = float64 рублей.
     """
-    query_rows = _read_tsv(direct_dir / "search_query_performance.tsv")
-    if not query_rows:
+    queries_dir = direct_dir / "queries"
+    if queries_dir.exists() and list(queries_dir.glob("*.tsv")):
+        raw_rows = _read_tsv_dir(queries_dir)
+    else:
+        raw_rows = _read_tsv(direct_dir / "search_query_performance.tsv")
+
+    if not raw_rows:
         return pd.DataFrame()
 
-    campaign_rows = _read_tsv(direct_dir / "campaign_performance.tsv")
-    name_by_id = {
-        (r.get("CampaignId") or "").strip(): (r.get("CampaignName") or "").strip()
-        for r in campaign_rows if r.get("CampaignId")
-    }
+    rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        cost_raw, cost_normalized = _parse_cost(row.get("Cost"))
+        rows.append({
+            "date": _parse_date_field(row.get("Date")),
+            "campaign_id": _to_optional_str(row.get("CampaignId")),
+            "campaign_name": _to_optional_str(row.get("CampaignName")),
+            "ad_group_id": _to_optional_str(row.get("AdGroupId")),
+            "query": row.get("Query") or "",
+            "match_type": _to_optional_str(row.get("MatchType")),
+            "device": _to_optional_str(row.get("Device")),
+            "cost_raw": cost_raw,
+            "cost_normalized": cost_normalized,
+            "clicks": _parse_int_field(row.get("Clicks")),
+            "impressions": _parse_int_field(row.get("Impressions")),
+            "conversions_all": _parse_int_field(row.get("Conversions")),
+        })
 
-    micros_per_rub = float((manifest_direct_entry or {}).get("cost_micros_per_rub") or 1_000_000)
-    date_to = (manifest_direct_entry or {}).get("date_to") or ""
-    date_month = date_to[:7] if len(date_to) >= 7 else ""
+    df = pd.DataFrame(rows)
+
+    if macro_goals:
+        goal_ids = [str(g["id"]) for g in macro_goals]
+        key_cols = ["date", "campaign_id", "campaign_name", "ad_group_id",
+                    "query", "match_type", "device"]
+        df = _join_goal_convs(df, queries_dir / "goals", goal_ids, key_cols)
+
+    return df
+
+
+def build_direct_campaigns(
+    direct_dir: Path, manifest_direct_entry: dict[str, Any] | None,
+    macro_goals: list[dict[str, Any]] | None = None,
+) -> pd.DataFrame:
+    """CAMPAIGN_PERFORMANCE_REPORT -> direct_campaigns.
+
+    Читает из direct/campaigns/ (новый помесячный формат).
+    """
+    campaign_dir = direct_dir / "campaigns"
+    raw_rows = _read_tsv_dir(campaign_dir)
+    if not raw_rows:
+        return pd.DataFrame()
 
     rows: list[dict[str, Any]] = []
-    for row in query_rows:
-        campaign_id = (row.get("CampaignId") or "").strip()
-        cost_raw = _to_optional_float(row.get("Cost")) or 0.0
+    for row in raw_rows:
+        cost_raw, cost_normalized = _parse_cost(row.get("Cost"))
         rows.append({
-            "query": row.get("Query") or "",
-            "campaign_id": campaign_id or None,
-            "campaign_name": name_by_id.get(campaign_id) or None,
-            "cost_rub": round(cost_raw / micros_per_rub, 6),
-            "clicks": int(float(row["Clicks"])) if row.get("Clicks") not in (None, "") else 0,
-            "date_month": date_month,
+            "date": _parse_date_field(row.get("Date")),
+            "campaign_id": _to_optional_str(row.get("CampaignId")),
+            "campaign_name": _to_optional_str(row.get("CampaignName")),
+            "device": _to_optional_str(row.get("Device")),
+            "cost_raw": cost_raw,
+            "cost_normalized": cost_normalized,
+            "clicks": _parse_int_field(row.get("Clicks")),
+            "impressions": _parse_int_field(row.get("Impressions")),
+            "conversions_all": _parse_int_field(row.get("Conversions")),
         })
+
+    df = pd.DataFrame(rows)
+
+    if macro_goals:
+        goal_ids = [str(g["id"]) for g in macro_goals]
+        key_cols = ["date", "campaign_id", "campaign_name", "device"]
+        df = _join_goal_convs(df, campaign_dir / "goals", goal_ids, key_cols)
+
+    return df
+
+
+def build_direct_geo(
+    direct_dir: Path, manifest_direct_entry: dict[str, Any] | None,
+    macro_goals: list[dict[str, Any]] | None = None,
+) -> pd.DataFrame:
+    """GEO_PERFORMANCE_REPORT -> direct_geo.
+
+    Читает из direct/geo/ (новый помесячный формат).
+    """
+    geo_dir = direct_dir / "geo"
+    raw_rows = _read_tsv_dir(geo_dir)
+    if not raw_rows:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        cost_raw, cost_normalized = _parse_cost(row.get("Cost"))
+        rows.append({
+            "date": _parse_date_field(row.get("Date")),
+            "campaign_id": _to_optional_str(row.get("CampaignId")),
+            "campaign_name": _to_optional_str(row.get("CampaignName")),
+            "location_of_presence_id": _to_optional_str(row.get("LocationOfPresenceId")),
+            "location_of_presence_name": _to_optional_str(row.get("LocationOfPresenceName")),
+            "device": _to_optional_str(row.get("Device")),
+            "cost_raw": cost_raw,
+            "cost_normalized": cost_normalized,
+            "clicks": _parse_int_field(row.get("Clicks")),
+            "impressions": _parse_int_field(row.get("Impressions")),
+            "conversions_all": _parse_int_field(row.get("Conversions")),
+        })
+
+    df = pd.DataFrame(rows)
+
+    if macro_goals:
+        goal_ids = [str(g["id"]) for g in macro_goals]
+        key_cols = ["date", "campaign_id", "campaign_name",
+                    "location_of_presence_id", "location_of_presence_name", "device"]
+        df = _join_goal_convs(df, geo_dir / "goals", goal_ids, key_cols)
+
+    return df
+
+
+def _build_goal_frame(goal_dir: Path, conv_col_name: str = "conversions") -> pd.DataFrame:
+    """Прочитать TSV-файлы из goal_dir и вернуть DF с каноническими именами колонок."""
+    raw_rows = _read_tsv_dir(goal_dir)
+    if not raw_rows:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        parsed: dict[str, Any] = {}
+        if "Date" in row:
+            parsed["date"] = _parse_date_field(row.get("Date"))
+        if "CampaignId" in row:
+            parsed["campaign_id"] = _to_optional_str(row.get("CampaignId"))
+        if "CampaignName" in row:
+            parsed["campaign_name"] = _to_optional_str(row.get("CampaignName"))
+        if "AdGroupId" in row:
+            parsed["ad_group_id"] = _to_optional_str(row.get("AdGroupId"))
+        if "Query" in row:
+            parsed["query"] = row.get("Query") or ""
+        if "MatchType" in row:
+            parsed["match_type"] = _to_optional_str(row.get("MatchType"))
+        if "Device" in row:
+            parsed["device"] = _to_optional_str(row.get("Device"))
+        if "LocationOfPresenceId" in row:
+            parsed["location_of_presence_id"] = _to_optional_str(row.get("LocationOfPresenceId"))
+        if "LocationOfPresenceName" in row:
+            parsed["location_of_presence_name"] = _to_optional_str(row.get("LocationOfPresenceName"))
+        parsed[conv_col_name] = _parse_int_field(row.get("Conversions"))
+        rows.append(parsed)
     return pd.DataFrame(rows)
+
+
+def _join_goal_convs(
+    base_df: pd.DataFrame,
+    goals_base_dir: Path,
+    goal_ids: list[str],
+    key_cols: list[str],
+) -> pd.DataFrame:
+    """LEFT JOIN goal-отчётов на base_df по key_cols.
+
+    Отсутствующая строка в goal-отчёте -> 0 (не null).
+    Если ключ в base_df не уникален — raise (умножение строк расхода недопустимо).
+    Проверяет сумму cost_normalized до и после джойна.
+    """
+    key_subset = [c for c in key_cols if c in base_df.columns]
+    if not base_df.empty and base_df.duplicated(subset=key_subset).any():
+        dup_sample = base_df[base_df.duplicated(subset=key_subset, keep=False)].head(3)
+        raise ValueError(
+            f"Ключ direct-отчёта не уникален; джойн с целями умножит строки расхода. "
+            f"Первые дубликаты: {dup_sample[key_subset].to_dict('records')}"
+        )
+
+    cost_before = float(base_df["cost_normalized"].sum()) if "cost_normalized" in base_df.columns else 0.0
+    result = base_df.copy()
+
+    for goal_id in goal_ids:
+        col = f"goal_conv_{goal_id}"
+        goal_dir = goals_base_dir / f"goal_{goal_id}"
+        goal_df = _build_goal_frame(goal_dir, conv_col_name=col)
+
+        if goal_df.empty:
+            result[col] = 0
+            continue
+
+        merge_key = [c for c in key_subset if c in goal_df.columns]
+        if not merge_key:
+            result[col] = 0
+            continue
+
+        # При дублях в goal-отчёте по ключу — агрегируем (sum).
+        if goal_df.duplicated(subset=merge_key).any():
+            goal_df = goal_df.groupby(merge_key, dropna=False)[col].sum().reset_index()
+
+        result = result.merge(
+            goal_df[merge_key + [col]],
+            on=merge_key, how="left",
+        )
+        result[col] = result[col].fillna(0).astype("Int64")
+
+    # Инвариант: сумма cost_normalized не должна измениться.
+    if "cost_normalized" in result.columns:
+        cost_after = float(result["cost_normalized"].sum())
+        if abs(cost_before - cost_after) > 0.01:
+            raise ValueError(
+                f"cost_normalized изменился после джойна с целями: "
+                f"{cost_before:.4f} → {cost_after:.4f}. "
+                "Возможно, ключ в goal-отчёте не уникален."
+            )
+
+    return result
+
+
+def _write_direct_table(
+    df: pd.DataFrame, base_table_name: str, out_path: Path,
+    goal_ids: list[str] | None = None,
+) -> None:
+    """Записать direct-таблицу с динамическими goal_conv_<id> колонками."""
+    schema = dict(SCHEMAS[base_table_name])
+    for gid in (goal_ids or []):
+        schema[f"goal_conv_{gid}"] = "int"
+
+    fields_arrow = [pa.field(col, _ARROW_TYPES[t]) for col, t in schema.items()]
+    arrow_schema = pa.schema(fields_arrow)
+    arrays = [
+        pa.array(_column_values(df, col, t), type=_ARROW_TYPES[t])
+        for col, t in schema.items()
+    ]
+    table = pa.Table.from_arrays(arrays, schema=arrow_schema)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, out_path)
 
 
 def build_campaign_strategies(direct_dir: Path) -> pd.DataFrame:
@@ -1053,8 +1289,27 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "clicks": "int", "impressions": "int",
     },
     "direct_queries": {
-        "query": "string", "campaign_id": "string", "campaign_name": "string",
-        "cost_rub": "float", "clicks": "int", "date_month": "string",
+        "date": "date",
+        "campaign_id": "string", "campaign_name": "string",
+        "ad_group_id": "string", "query": "string",
+        "match_type": "string", "device": "string",
+        "cost_raw": "int", "cost_normalized": "float",
+        "clicks": "int", "impressions": "int", "conversions_all": "int",
+        # goal_conv_<id> колонки добавляются динамически через _write_direct_table
+    },
+    "direct_campaigns": {
+        "date": "date",
+        "campaign_id": "string", "campaign_name": "string", "device": "string",
+        "cost_raw": "int", "cost_normalized": "float",
+        "clicks": "int", "impressions": "int", "conversions_all": "int",
+    },
+    "direct_geo": {
+        "date": "date",
+        "campaign_id": "string", "campaign_name": "string",
+        "location_of_presence_id": "string", "location_of_presence_name": "string",
+        "device": "string",
+        "cost_raw": "int", "cost_normalized": "float",
+        "clicks": "int", "impressions": "int", "conversions_all": "int",
     },
     "campaign_strategies": {
         "campaign_id": "string", "campaign_name": "string", "strategy_type": "string",
@@ -1177,10 +1432,27 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
         built.append("costs")
 
     if direct_dir is not None:
-        dq_df = build_direct_queries(direct_dir, direct_entry)
+        direct_cfg = (config.get("sources") or {}).get("direct") or {}
+        macro_goals = direct_cfg.get("macro_goals") or []
+        goal_ids = [str(g["id"]) for g in macro_goals] if macro_goals else []
+
+        dq_df = build_direct_queries(direct_dir, direct_entry, macro_goals=macro_goals)
         if not dq_df.empty:
-            write_canonical_table(dq_df, "direct_queries", canonical_dir / "direct_queries.parquet")
+            _write_direct_table(dq_df, "direct_queries",
+                                canonical_dir / "direct_queries.parquet", goal_ids)
             built.append("direct_queries")
+
+        dc_df = build_direct_campaigns(direct_dir, direct_entry, macro_goals=macro_goals)
+        if not dc_df.empty:
+            _write_direct_table(dc_df, "direct_campaigns",
+                                canonical_dir / "direct_campaigns.parquet", goal_ids)
+            built.append("direct_campaigns")
+
+        dg_df = build_direct_geo(direct_dir, direct_entry, macro_goals=macro_goals)
+        if not dg_df.empty:
+            _write_direct_table(dg_df, "direct_geo",
+                                canonical_dir / "direct_geo.parquet", goal_ids)
+            built.append("direct_geo")
 
         cs_df = build_campaign_strategies(direct_dir)
         if not cs_df.empty:

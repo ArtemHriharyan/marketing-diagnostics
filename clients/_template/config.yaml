@@ -8,7 +8,11 @@ client:
 
 sources:              # что ЗАЯВЛЕНО; intake проверит фактическую доступность
   metrika:   {enabled: true,  counter_id: null}
-  direct:    {enabled: false, client_login: null}
+  direct:
+    enabled: false
+    client_login: null
+    attribution_type: ""  # обязательно явно при использовании целей: LSC | LC | FC | LYDC
+    macro_goals: []       # [{id: 12345678, name: "Отправка формы брони"}]
   webmaster:
     enabled: false
     host_id: null
