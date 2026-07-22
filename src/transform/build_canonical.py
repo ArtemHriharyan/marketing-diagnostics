@@ -79,7 +79,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..extract import _common as extract_common
-from ..extract.metrika_logs import VISIT_FIELDS
+from ..extract.metrika_logs import LOOKBACK_SUBDIR, VISIT_FIELDS
 from ..pipeline import manifest as manifest_mod
 
 CANONICAL_MANIFEST_NAME = "manifest.json"
@@ -621,6 +621,26 @@ def _read_metrika_logs_rows(raw_dir: Path) -> list[dict[str, str]]:
     return rows
 
 
+def _read_metrika_lookback_rows(raw_dir: Path) -> list[dict[str, str]]:
+    """Визиты lookback-окна (см. LOOKBACK_SUBDIR, src.extract.metrika_logs).
+
+    Нужны ТОЛЬКО для восстановления цепочки clientID в carry-forward
+    (resolve_traffic_source, T02/T03, задача 4X-lookback-canonical-flag) — сами
+    по себе в основные агрегаты/визиты отчёта не попадают (см. build_visits).
+    Поля переиспользуют состав основного окна (_fetch_lookback), поэтому
+    парсятся тем же _parse_visit_row, что и базовые визиты.
+    """
+    rows: list[dict[str, str]] = []
+    lookback_dir = Path(raw_dir) / LOOKBACK_SUBDIR
+    if not lookback_dir.exists():
+        return rows
+    for path in sorted(lookback_dir.glob("visits_lookback_*.csv.gz")):
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
+            reader = csv.DictReader(fh, delimiter="\t")
+            rows.extend(reader)
+    return rows
+
+
 def _parse_backfill_int(raw: str | None) -> int | None:
     """Числовое поле backfill (ширина/высота экрана) -> int | None (nullable)."""
     value = (raw or "").strip()
@@ -832,6 +852,23 @@ def build_visits(
     (2A-patch): region_field фиксирует фактическое имя поля региона визита,
     которое реально запрашивал extract (ym:s:regionArea, если API его принял,
     либо откат ym:s:regionCity, если отклонил — см. _resolve_region_field).
+
+    Помимо основного окна читает raw_dir/<LOOKBACK_SUBDIR>/ (задача
+    4X-lookback-canonical-flag): визиты за N дней ДО основного окна, нужные
+    ТОЛЬКО для восстановления цепочки clientID в carry-forward
+    (resolve_traffic_source, T02/T03). Каждая строка результата помечена
+    явным булевым полем is_lookback_only (True — визит из lookback-окна).
+    UTM-порог и склейка с backfill считаются ТОЛЬКО по основному окну — до
+    того, как lookback-строки подмешиваются в df, — поэтому их наличие не
+    меняет ни source_final/is_ad визитов основного окна, ни статистику
+    backfill. resolve_traffic_source видит обе группы вместе (лукбэк-визит
+    может стать восстановленным «реальным источником» для визита основного
+    окна), а traffic_source_resolve-статистика считается только по строкам
+    основного окна (is_lookback_only=False) — лукбэк не входит в знаменатель.
+    is_lookback_only остаётся в возвращаемом DataFrame для явности, но не
+    входит в SCHEMAS["visits"]: фактическую фильтрацию лукбэк-строк перед
+    записью visits.parquet выполняет build() — они никогда не попадают в
+    parquet, отдаваемый в compute.
     """
     region_field = _resolve_region_field(manifest_metrika_entry)
     raw_rows = _read_metrika_logs_rows(raw_dir)
@@ -852,16 +889,40 @@ def build_visits(
     df["is_ad"] = df["source_final"] == "ad"
 
     df, backfill_stats = _join_backfill(df, raw_dir, region_field)
+    df["is_lookback_only"] = False
+
+    lookback_raw_rows = _read_metrika_lookback_rows(raw_dir)
+    lookback_parsed = [
+        r for r in (_parse_visit_row(row, goals_cfg, region_field) for row in lookback_raw_rows)
+        if r is not None
+    ]
+    if lookback_parsed:
+        lookback_df = dedupe_visits(pd.DataFrame(lookback_parsed))
+        lookback_df["is_lookback_only"] = True
+        # source_final/is_ad не используются для лукбэк-строк (фильтруются перед
+        # parquet), но заполняются здесь же (а не оставляются NaN), чтобы concat
+        # не апкастил is_ad всего столбца до object — dtype визитов основного
+        # окна не должен зависеть от присутствия лукбэк-данных.
+        lookback_df["source_final"] = lookback_df["source_group"]
+        lookback_df["is_ad"] = lookback_df["source_final"] == "ad"
+        combined = pd.concat([df, lookback_df], ignore_index=True)
+    else:
+        combined = df
 
     lookback_days = int(
         ((defaults or {}).get("transform") or {}).get("traffic_resolve_lookback_days", 30)
     )
     date_from, _date_to = extract_common.resolve_window(config, defaults)
     lookback_cutoff = date_from - timedelta(days=lookback_days)
-    df = resolve_traffic_source(df, lookback_cutoff=lookback_cutoff)
-    stats = {**backfill_stats, "traffic_source_resolve": compute_traffic_resolve_stats(df)}
+    combined = resolve_traffic_source(combined, lookback_cutoff=lookback_cutoff)
 
-    return df, utm_uncertain, stats
+    main_mask = combined["is_lookback_only"] == False  # noqa: E712
+    stats = {
+        **backfill_stats,
+        "traffic_source_resolve": compute_traffic_resolve_stats(combined[main_mask]),
+    }
+
+    return combined, utm_uncertain, stats
 
 
 # ═══════════════════════════ Чтение сырья: costs / direct ═══════════════════
@@ -1672,7 +1733,16 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
             raw_dir / "metrika_logs", config, defaults, sources.get("metrika_logs")
         )
         if not visits_df.empty:
-            write_canonical_table(visits_df, "visits", canonical_dir / "visits.parquet")
+            # lookback-визиты (is_lookback_only=True) нужны build_visits только
+            # для carry-forward источника (T02/T03) — в parquet, отдаваемый
+            # compute, не попадают (см. докстринг build_visits).
+            report_visits_df = visits_df[
+                visits_df["is_lookback_only"] == False  # noqa: E712
+            ].reset_index(drop=True)
+        else:
+            report_visits_df = visits_df
+        if not report_visits_df.empty:
+            write_canonical_table(report_visits_df, "visits", canonical_dir / "visits.parquet")
             built.append("visits")
             flags["utm_uncertain"] = utm_uncertain
             # Обязательный caveat T02/T03: доля internal/undefined визитов, которых

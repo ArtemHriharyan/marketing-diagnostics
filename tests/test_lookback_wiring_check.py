@@ -2,16 +2,19 @@
 
 Две независимые вещи проверяются здесь, без предположений:
 
-1. Видит ли resolve_traffic_source (через build_visits) строки из
-   metrika_logs/lookback/, или только основной глоб verhнего уровня
-   src_dir. Ответ фиксируется тестом, а не текстом — если поведение когда-
-   нибудь изменится (после отдельной задачи над build_canonical.py), тест
-   упадёт и потребует явного пересмотра этой записи.
+1. Видит ли build_visits() строки из metrika_logs/lookback/. С задачи
+   4X-lookback-canonical-flag ответ — да: лукбэк-визиты попадают в
+   возвращаемый df, но каждая такая строка явно помечена
+   is_lookback_only=True и не входит в основные агрегаты (source_final/
+   is_ad для неё не используются, traffic_source_resolve-статистика её не
+   учитывает). Ответ фиксируется тестом, а не текстом — если поведение
+   снова изменится, тест упадёт и потребует явного пересмотра этой записи.
 
 2. force_lookback_backfill (src/extract/metrika_logs.py) — принудительная
    дозаливка LOOKBACK_SUBDIR для уже извлечённого окна, не дожидаясь
    естественного триггера _should_backfill/_already_extracted, и без
-   изменения уже существующих canonical-данных.
+   изменения уже существующих canonical-данных ОСНОВНОГО окна (новые
+   is_lookback_only=True строки — ожидаемое дополнение, не регрессия).
 
 Использует ту же схему моков HTTP, что и tests/test_metrika_logs_patch.py /
 tests/test_metrika_logs_lookback.py — реальная сеть не трогается.
@@ -135,19 +138,51 @@ def _lookback_only_routes(box, *, request_id=950, part_text=None):
     ]
 
 
-# ── (1) resolve_traffic_source / build_visits видимость lookback/ ─────────
-def test_build_visits_does_not_see_lookback_subdir_rows(paths):
-    """Явный факт, не предположение: визиты metrika_logs/lookback/ НЕ попадают
-    в df, который build_visits передаёт в resolve_traffic_source.
+# ── (1) build_visits видимость lookback/ (4X-lookback-canonical-flag) ─────
+def test_build_visits_sees_lookback_rows_flagged(paths):
+    """Лукбэк-визиты metrika_logs/lookback/ попадают в df build_visits(), но
+    явно помечены is_lookback_only=True и не смешиваются с основным окном.
 
-    Это архитектурный пробел build_canonical.py (не исправляется в этой
-    задаче — см. её описание и docs/implementation_status.md, задача
-    4X-metrika-lookback, пункт (а)). Если это когда-нибудь изменится, тест
-    ниже упадёт и потребует пересмотра записи в manifest/докстрингах.
+    Раньше (4X-lookback-wiring-check) лукбэк был архитектурно невидим —
+    _read_metrika_logs_rows глобит только visits_*.csv.gz верхнего уровня.
+    Задача 4X-lookback-canonical-flag сделала его видимым явно, через
+    отдельное чтение raw_dir/lookback/ и колонку-флаг (см. build_visits в
+    build_canonical.py). Проверяем оба факта: лукбэк-строка есть в df, и она
+    отличима от строки основного окна.
+
+    Мок различает основной и лукбэк-чанк по порядку HTTP-вызовов (первое
+    скачивание part/0/download — основное окно с visit_id="v1", второе —
+    лукбэк-чанк с visit_id="vlb"): в _full_routes оба чанка используют один
+    request_id и одну и ту же статичную часть текста, поэтому здесь нужен
+    отдельный набор роутов с колбэком, различающим вызовы по счётчику.
     """
     box = {}
-    session = FakeSession(_full_routes(box))
+    request_id = 900
+    lookback_text = (
+        "ym:s:visitID\tym:s:clientID\tym:s:dateTime\tym:s:lastsignTrafficSource\n"
+        "vlb\tc1\t2026-05-15 09:00:00\tad\n"
+    )
+
+    def poll_responder(n):
+        status = "created" if n == 0 else "processed"
+        parts = [] if n == 0 else [{"part_number": 0}]
+        return FakeResponse(json_data={"log_request": {
+            "request_id": request_id, "status": status, "parts": parts}})
+
+    def download_responder(n):
+        text = MAIN_PART_TEXT if n == 0 else lookback_text
+        return FakeResponse(text=text)
+
+    routes = [
+        _evaluate_route(lambda: box["session"]),
+        (lambda m, u: m == "POST" and u.endswith("/logrequests"),
+         FakeResponse(json_data={"log_request": {"request_id": request_id, "status": "created"}})),
+        (lambda m, u: m == "GET" and u.endswith(f"/logrequest/{request_id}"), poll_responder),
+        (_contains("/part/0/download"), download_responder),
+    ]
+    session = FakeSession(routes)
     box["session"] = session
+
     metrika_logs.extract(
         CONFIG_METRIKA, ENV, paths, session=session, sleeper=NO_SLEEP,
         defaults={"transform": {"traffic_resolve_lookback_days": 30}},
@@ -159,11 +194,11 @@ def test_build_visits_does_not_see_lookback_subdir_rows(paths):
 
     df, _utm, _stats = bc.build_visits(src_dir, {"goals": {}}, {"utm_undefined_threshold": 0.25})
 
-    # Только основной визит (v1). Лог-визит lookback (vlb/другой clientID/дата
-    # мая) сюда не попал бы, даже если бы там был другой visit_id — глоб
-    # _read_metrika_logs_rows не спускается в подкаталоги.
-    assert set(df["visit_id"]) == {"v1"}
-    assert len(df) == 1
+    assert len(df) == 2
+    main_rows = df[~df["is_lookback_only"]]
+    lookback_rows = df[df["is_lookback_only"]]
+    assert set(main_rows["visit_id"]) == {"v1"}
+    assert set(lookback_rows["visit_id"]) == {"vlb"}
 
 
 def test_read_metrika_logs_rows_globs_top_level_only_by_construction(paths):
@@ -288,9 +323,11 @@ def test_force_lookback_backfill_without_prior_extraction_falls_back_to_full_run
 
 
 def test_force_lookback_backfill_does_not_change_existing_canonical_output(paths):
-    """Принудительный lookback не меняет canonical-визиты (build_visits) —
-    т.к. lookback/ ей не видна (см. первый блок тестов), результат до/после
-    идентичен по составу и содержимому строк."""
+    """Принудительный lookback добавляет is_lookback_only=True строки (теперь
+    видимые build_visits, см. первый блок тестов), но не меняет состав и
+    содержимое строк ОСНОВНОГО окна — единственных, что реально идут в
+    canonical visits.parquet и метрики (build() фильтрует lookback перед
+    записью, см. докстринг build_visits в build_canonical.py)."""
     box = {}
     session = FakeSession(_full_routes(box))
     box["session"] = session
@@ -299,6 +336,7 @@ def test_force_lookback_backfill_does_not_change_existing_canonical_output(paths
 
     src_dir = paths.raw / "metrika_logs"
     df_before, _, _ = bc.build_visits(src_dir, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+    assert not df_before["is_lookback_only"].any()  # sanity: лукбэка ещё нет вовсе
 
     box2 = {}
     session2 = FakeSession(_lookback_only_routes(box2))
@@ -309,6 +347,12 @@ def test_force_lookback_backfill_does_not_change_existing_canonical_output(paths
 
     df_after, _, _ = bc.build_visits(src_dir, {"goals": {}}, {"utm_undefined_threshold": 0.25})
 
+    # Новая лукбэк-строка реально появилась и явно помечена — иначе тест
+    # ниже (сравнение только не-лукбэк подмножества) был бы бессмысленным.
+    lookback_after = df_after[df_after["is_lookback_only"]]
+    assert set(lookback_after["visit_id"]) == {"vlb"}
+
+    main_after = df_after[~df_after["is_lookback_only"]].reset_index(drop=True)
     pd.testing.assert_frame_equal(
-        df_before.reset_index(drop=True), df_after.reset_index(drop=True),
+        df_before.reset_index(drop=True), main_after,
     )

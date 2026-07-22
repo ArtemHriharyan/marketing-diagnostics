@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.extract.metrika_logs import VISIT_FIELDS, VISIT_FIELDS_BASE  # noqa: E402
+from src.extract.metrika_logs import LOOKBACK_SUBDIR, VISIT_FIELDS, VISIT_FIELDS_BASE  # noqa: E402
 from src.pipeline import manifest as manifest_mod  # noqa: E402
 from src.transform import build_canonical as bc  # noqa: E402
 
@@ -836,6 +836,154 @@ def test_build_visits_parquet_dtypes_and_original_columns(tmp_path):
 
     canonical_manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
     assert canonical_manifest["flags"]["metrika_backfill"]["is_robot_available"] is False
+
+
+# ═════════════════════ build_visits: lookback (4X-lookback-canonical-flag) ═
+def _write_lookback_visits(
+    metrika_dir: Path, visits: list[dict],
+    fname: str = "visits_lookback_2026-05-01_2026-05-31_part000.csv.gz",
+) -> None:
+    """Лукбэк-слой lookback/visits_lookback_*.csv.gz — тот же формат, что и база."""
+    lookback_dir = metrika_dir / LOOKBACK_SUBDIR
+    lookback_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["\t".join(VISIT_FIELDS_BASE)]
+    for v in visits:
+        cells = {f: "" for f in VISIT_FIELDS_BASE}
+        cells["ym:s:visitID"] = v["id"]
+        cells["ym:s:clientID"] = v.get("cid", "c")
+        cells["ym:s:dateTime"] = v["dt"]
+        cells["ym:s:lastsignTrafficSource"] = v.get("src", "direct")
+        cells["ym:s:deviceCategory"] = v.get("dev", "2")
+        cells["ym:s:startURL"] = v.get("url", "https://site.ru/")
+        cells["ym:s:goalsID"] = v.get("goals", "")
+        cells["ym:s:isNewUser"] = v.get("new", "0")
+        cells["ym:s:pageViews"] = v.get("pv", "1")
+        cells["ym:s:visitDuration"] = v.get("dur", "10")
+        lines.append("\t".join(cells[f] for f in VISIT_FIELDS_BASE))
+    with gzip.open(lookback_dir / fname, "wt", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+_LOOKBACK_CONFIG = {
+    "goals": {},
+    "data_window": {"date_from": "2026-06-01", "date_to": "2026-06-30"},
+}
+_LOOKBACK_DEFAULTS = {
+    "utm_undefined_threshold": 0.25,
+    "transform": {"traffic_resolve_lookback_days": 30},
+}
+
+
+def test_build_visits_lookback_rows_tagged_and_used_for_carry_forward(tmp_path):
+    """Лукбэк-визит того же clientID ДО основного окна восстанавливает источник
+    визита с ambiguous (internal) lastsign в основном окне — то, что раньше
+    было архитектурно невозможно (см. заменённый test_lookback_wiring_check.py:
+    test_build_visits_does_not_see_lookback_subdir_rows)."""
+    metrika = tmp_path / "data" / "raw" / "metrika_logs"
+    _write_base_visits(metrika, [
+        {"id": "v1", "cid": "c1", "dt": "2026-06-05 10:00:00", "src": "internal"},
+    ])
+    # В пределах lookback_cutoff (2026-06-01 - 30д = 2026-05-02) -> учитывается.
+    _write_lookback_visits(metrika, [
+        {"id": "vlb", "cid": "c1", "dt": "2026-05-20 09:00:00", "src": "ad"},
+    ])
+
+    df, _utm, stats = bc.build_visits(metrika, _LOOKBACK_CONFIG, _LOOKBACK_DEFAULTS)
+
+    assert set(df["visit_id"]) == {"v1", "vlb"}
+    by_id = df.set_index("visit_id")
+    assert by_id.loc["vlb", "is_lookback_only"] == True  # noqa: E712
+    assert by_id.loc["v1", "is_lookback_only"] == False  # noqa: E712
+
+    # Цепочка carry-forward дотянулась через границу окна до лукбэк-визита.
+    assert by_id.loc["v1", "source_group_resolved"] == "ad"
+    assert by_id.loc["v1", "traffic_source_resolved"] == True  # noqa: E712
+
+    # Лукбэк не входит в знаменатель traffic_source_resolve (только осн. окно).
+    assert stats["traffic_source_resolve"]["internal_or_undefined_total"] == 1
+    assert stats["traffic_source_resolve"]["unresolved_count"] == 0
+
+
+def test_build_visits_without_lookback_dir_stays_unresolved(tmp_path):
+    """Без lookback/ тот же ambiguous-визит остаётся unresolved (контраст к тесту выше)."""
+    metrika = tmp_path / "data" / "raw" / "metrika_logs"
+    _write_base_visits(metrika, [
+        {"id": "v1", "cid": "c1", "dt": "2026-06-05 10:00:00", "src": "internal"},
+    ])
+
+    df, _utm, stats = bc.build_visits(metrika, _LOOKBACK_CONFIG, _LOOKBACK_DEFAULTS)
+
+    assert set(df["visit_id"]) == {"v1"}
+    row = df.set_index("visit_id").loc["v1"]
+    assert row["is_lookback_only"] == False  # noqa: E712
+    assert row["traffic_source_resolved"] == False  # noqa: E712
+    assert stats["traffic_source_resolve"]["unresolved_count"] == 1
+
+
+def test_build_visits_lookback_before_cutoff_does_not_resolve(tmp_path):
+    """Лукбэк-визит РАНЬШЕ lookback_cutoff не используется как реальный источник."""
+    metrika = tmp_path / "data" / "raw" / "metrika_logs"
+    _write_base_visits(metrika, [
+        {"id": "v1", "cid": "c1", "dt": "2026-06-05 10:00:00", "src": "internal"},
+    ])
+    # cutoff = 2026-05-02; визит раньше границы -> не учитывается.
+    _write_lookback_visits(metrika, [
+        {"id": "vlb", "cid": "c1", "dt": "2026-04-15 09:00:00", "src": "ad"},
+    ])
+
+    df, _utm, _stats = bc.build_visits(metrika, _LOOKBACK_CONFIG, _LOOKBACK_DEFAULTS)
+
+    row = df.set_index("visit_id").loc["v1"]
+    assert row["traffic_source_resolved"] == False  # noqa: E712
+
+
+def test_build_excludes_lookback_rows_from_visits_parquet(tmp_path):
+    """Итоговый visits.parquet (build()) исключает is_lookback_only=true строки —
+    компьют-слой их никогда не видит."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    metrika = paths.raw / "metrika_logs"
+    _write_base_visits(metrika, [
+        {"id": "v1", "cid": "c1", "dt": "2026-06-05 10:00:00", "src": "internal"},
+    ])
+    _write_lookback_visits(metrika, [
+        {"id": "vlb", "cid": "c1", "dt": "2026-05-20 09:00:00", "src": "ad"},
+    ])
+    manifest_mod.update_source(
+        paths.raw, "metrika_logs", date_from="2026-06-01", date_to="2026-06-30",
+        rows=1, script_version="test", canonical_tables=["visits"],
+    )
+
+    built = bc.build(paths, _LOOKBACK_CONFIG, _LOOKBACK_DEFAULTS)
+    assert "visits" in built
+
+    visits = pd.read_parquet(paths.canonical / "visits.parquet")
+    assert set(visits["visit_id"]) == {"v1"}
+    assert "is_lookback_only" not in visits.columns
+    assert visits.iloc[0]["source_group_resolved"] == "ad"
+
+
+def test_build_visits_main_rows_unchanged_with_or_without_lookback(tmp_path):
+    """Наличие lookback-данных не меняет уже разрешённые визиты основного окна
+    (сравнение построчно на одной фикстуре, где нет ambiguous-визитов —
+    единственный сценарий, где carry-forward вообще мог бы что-то изменить)."""
+    def _make(with_lookback: bool) -> pd.DataFrame:
+        metrika = tmp_path / ("with_lb" if with_lookback else "without_lb") / "metrika_logs"
+        _write_base_visits(metrika, [
+            {"id": "v1", "cid": "c1", "dt": "2026-06-05 10:00:00", "src": "search_engine"},
+            {"id": "v2", "cid": "c2", "dt": "2026-06-06 10:00:00", "src": "ad"},
+        ])
+        if with_lookback:
+            _write_lookback_visits(metrika, [
+                {"id": "vlb", "cid": "c1", "dt": "2026-05-20 09:00:00", "src": "direct"},
+            ])
+        df, _utm, _stats = bc.build_visits(metrika, _LOOKBACK_CONFIG, _LOOKBACK_DEFAULTS)
+        return df[df["is_lookback_only"] == False].reset_index(drop=True)  # noqa: E712
+
+    df_without = _make(False)
+    df_with = _make(True)
+
+    pd.testing.assert_frame_equal(df_without, df_with)
 
 
 def test_build_costs_only_from_manual_fixtures_without_direct(tmp_path):

@@ -393,7 +393,11 @@ def run_extract(paths: ClientPaths, log: StageLogger) -> None:
                 extracted.append(mod_name)
             except extract_common.SourceUnavailable as exc:
                 # AuthError — частный случай; сообщение уже человекочитаемое.
-                log(f"extract[{mod_name}]: ИСТОЧНИК НЕДОСТУПЕН — {exc} (код {exc.exit_code})")
+                log(
+                    f"extract[{mod_name}]: ИСТОЧНИК НЕДОСТУПЕН — {exc} "
+                    f"(внутренний код оркестратора {exc.exit_code}, "
+                    f"не код ошибки из текста выше)"
+                )
                 unavailable.append(mod_name)
             except NotImplementedError:
                 log(f"extract[{mod_name}]: экстрактор ещё не реализован — пропуск")
@@ -410,7 +414,11 @@ def run_extract(paths: ClientPaths, log: StageLogger) -> None:
             log(f"extract[{_sc}]: готово — {_sc_rows} строк -> data/raw/{_sc_result.get('source', _sc)}/")
             extracted.append(_sc)
         except extract_common.SourceUnavailable as exc:
-            log(f"extract[{_sc}]: ИСТОЧНИК НЕДОСТУПЕН — {exc} (код {exc.exit_code})")
+            log(
+                f"extract[{_sc}]: ИСТОЧНИК НЕДОСТУПЕН — {exc} "
+                f"(внутренний код оркестратора {exc.exit_code}, "
+                f"не код ошибки из текста выше)"
+            )
             unavailable.append(_sc)
         except NotImplementedError:
             log(f"extract[{_sc}]: экстрактор ещё не реализован — пропуск")

@@ -272,7 +272,9 @@ def http_request(
                 sleeper(backoff_delay(attempt))
                 continue
             raise SourceUnavailable(
-                source, f"сеть недоступна после {max_attempts} попыток: {type(exc).__name__}"
+                source,
+                f"сеть недоступна после {max_attempts} попыток: "
+                f"{type(exc).__name__}: {exc}",
             ) from exc
 
         status = getattr(response, "status_code", None)
