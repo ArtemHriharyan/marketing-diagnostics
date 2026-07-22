@@ -4,6 +4,12 @@
 Задача 3.5B — детерминированный HTTP-обход и запись pages.parquet.
 Задача 3.5C — JS-diff (raw vs rendered), внутренние ссылки, BFS,
                link_graph.parquet.
+Задача 3.5-patch — robots.txt (RFC 9309) + unified seo_queries.parquet;
+               восстановлено из git stash после reset-инцидента 2026-07-22
+               (см. docs/implementation_status.md, запись 3.5-patch/3.5-merge-recovered).
+Задача 3.5-hang-fix — двухслойная защита от зависаний HTTP-запроса:
+               (connect, read) таймаут + жёсткий предел общей длительности
+               запроса, скипание бинарных Content-Type без скачивания тела.
 
 Контракт:
     Читает   — config.crawl_seed_urls, config.crawl.max_urls, config.crawl.base_url,
@@ -85,14 +91,22 @@ PAGES_SCHEMA: list[str] = [
 # Колонки выходной таблицы link_graph (3.5C).
 LINK_GRAPH_SCHEMA: list[str] = ["from_url", "to_url", "depth_from_home"]
 
-# Колонка страницы в канонических таблицах GSC/Webmaster.
-_PAGE_COL_GSC = "page"
-_PAGE_COL_WM = "page"
+# После 4D GSC/Webmaster объединены в одну таблицу seo_queries.parquet;
+# источник различается колонкой source ("gsc" | "webmaster").
+_SEO_QUERIES_FILE = "seo_queries.parquet"
+_PAGE_COL_SEO = "page"
+_SOURCE_COL_SEO = "source"
+_CLICKS_COL_SEO = "total_clicks"
+_SOURCE_GSC = "gsc"
+_SOURCE_WM = "webmaster"
+
 # Колонка страницы в Директ-расходах.
+# ПРИМЕЧАНИЕ: costs.parquet (build_costs) сейчас campaign-level — колонки
+# entry_page там нет и не будет без отдельной пер-страничной выгрузки Директа.
+# Поиск ниже корректно деградирует в [] (page_col not in df.columns), это не
+# баг site_crawl — см. docs/implementation_status.md, задача 3.5-patch.
 _PAGE_COL_COST = "entry_page"
-# Колонка расхода/кликов для сортировки.
 _COST_COL = "cost"
-_CLICKS_COL = "clicks"
 
 
 # ── HTML-парсеры (stdlib) ─────────────────────────────────────────────────────
@@ -292,6 +306,112 @@ def fetch_sitemap(
         return set()
 
 
+# ── robots.txt ────────────────────────────────────────────────────────────────
+
+def _parse_robots_txt(text: str) -> list[dict[str, Any]]:
+    """Разобрать robots.txt на группы {agents: [...], rules: [(kind, path), ...]}.
+
+    kind — "disallow" | "allow" (в нижнем регистре, как в файле).
+    Группа — блок последовательных User-agent строк + следующие за ними
+    Allow/Disallow до следующего User-agent (RFC 9309).
+    """
+    groups: list[dict[str, Any]] = []
+    current_agents: list[str] = []
+    current_rules: list[tuple[str, str]] = []
+    rule_seen = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().lower()
+        value = value.strip()
+
+        if key == "user-agent":
+            if rule_seen:
+                groups.append({"agents": current_agents, "rules": current_rules})
+                current_agents = []
+                current_rules = []
+                rule_seen = False
+            current_agents.append(value.lower())
+        elif key in ("disallow", "allow"):
+            current_rules.append((key, value))
+            rule_seen = True
+
+    if current_agents or current_rules:
+        groups.append({"agents": current_agents, "rules": current_rules})
+    return groups
+
+
+def _select_robots_rules(
+    groups: list[dict[str, Any]], user_agent: str = "*"
+) -> list[tuple[str, str]]:
+    """Выбрать правила для user_agent; иначе — группа '*'; иначе — пусто."""
+    ua = user_agent.lower()
+    for g in groups:
+        if ua in g["agents"]:
+            return g["rules"]
+    for g in groups:
+        if "*" in g["agents"]:
+            return g["rules"]
+    return []
+
+
+def _is_path_disallowed(path: str, rules: list[tuple[str, str]]) -> bool:
+    """Проверить путь по правилам Disallow/Allow (побеждает самое длинное совпадение)."""
+    best_len = -1
+    best_disallow = False
+    for kind, pattern in rules:
+        if pattern == "":
+            # Disallow: (пусто) означает «разрешено всё» — не блокирует.
+            continue
+        if path.startswith(pattern) and len(pattern) > best_len:
+            best_len = len(pattern)
+            best_disallow = kind == "disallow"
+    return best_disallow
+
+
+def fetch_robots_txt(
+    base_url: str,
+    session: Any,
+    timeout: int = CRAWL_TIMEOUT_SEC,
+) -> list[tuple[str, str]]:
+    """Скачать /robots.txt и вернуть правила Disallow/Allow для user-agent "*".
+
+    При отсутствии файла, ошибке сети или ином статусе — пустой список
+    (краулинг не блокируется, деградация мягкая, как у sitemap).
+    """
+    robots_url = base_url.rstrip("/") + "/robots.txt"
+    try:
+        resp = session.get(robots_url, timeout=timeout, allow_redirects=True)
+        if getattr(resp, "status_code", None) != 200:
+            return []
+        text = getattr(resp, "text", "") or ""
+        groups = _parse_robots_txt(text)
+        return _select_robots_rules(groups, "*")
+    except Exception:
+        return []
+
+
+def _get_header(headers: Any, name: str) -> str | None:
+    """Регистронезависимый доступ к HTTP-заголовку (requests уже нечувствителен
+    к регистру, но мок-объекты в тестах используют обычный dict)."""
+    if not headers:
+        return None
+    try:
+        val = headers.get(name)
+        if val:
+            return val
+    except AttributeError:
+        return None
+    name_lower = name.lower()
+    for k, v in headers.items():
+        if k.lower() == name_lower:
+            return v
+    return None
+
+
 # ── Headless-рендеринг (опционально) ─────────────────────────────────────────
 
 def _render_headless(url: str, timeout: int = CRAWL_TIMEOUT_SEC) -> str | None:
@@ -370,6 +490,107 @@ def _to_absolute(url: str, base_url: str) -> str:
     return base + url
 
 
+def _combine_robots_directive(
+    meta_robots: str | None,
+    x_robots_tag: str | None,
+    robots_txt_disallowed: bool,
+) -> str | None:
+    """Свести meta robots + X-Robots-Tag + robots.txt в одно строковое поле.
+
+    Единственный источник (обычно meta) даёт исходную строку без изменений
+    (совместимость со старым контрактом). При нескольких источниках —
+    объединение через "; ".
+    """
+    parts: list[str] = []
+    if meta_robots:
+        parts.append(meta_robots)
+    if x_robots_tag:
+        parts.append(f"x-robots-tag: {x_robots_tag}")
+    if robots_txt_disallowed:
+        parts.append("robots.txt: disallow")
+    return "; ".join(parts) if parts else None
+
+
+def _is_skippable_content_type(content_type: str | None) -> bool:
+    """True, если Content-Type — бинарное содержимое (картинка/видео/PDF и т.п.),
+    тело которого краулеру не нужно и не должно скачиваться целиком."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if not ct:
+        return False
+    return any(ct.startswith(prefix) for prefix in _SKIP_CONTENT_TYPE_PREFIXES)
+
+
+def _guarded_get(
+    session: Any,
+    url: str,
+    *,
+    timeout: int = CRAWL_TIMEOUT_SEC,
+    hard_timeout: int = CRAWL_HARD_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    """Единый HTTP GET для crawl_pages/crawl_bfs с двухслойной защитой от зависаний.
+
+    Слой 1 — (connect, read) кортеж в session.get(): ограничивает бездействие
+    сокета между чтениями, но НЕ общую длительность запроса (requests/urllib3
+    сбрасывают таймер на каждом полученном чанке — медленно "текущий" ответ
+    может идти сколько угодно долго и никогда не поднять ReadTimeout).
+    Слой 2 — жёсткий верхний предел на всю длительность запроса (включая
+    материализацию .text), не зависящий от активности чтения: весь вызов
+    выполняется в отдельном потоке, ожидание результата ограничено
+    hard_timeout секундами — вызывающий код гарантированно получает
+    управление обратно, даже если фоновый поток так и не завершится.
+
+    Content-Type, попадающий в _SKIP_CONTENT_TYPE_PREFIXES (картинки, PDF,
+    видео и т.п.), не скачивается — resp.text не читается, соединение
+    закрывается сразу после заголовков.
+
+    Возвращает dict:
+        status   — "ok" | "skipped_non_html" | "hard_timeout_exceeded" | "error"
+        response — объект ответа (для ok/skipped_non_html), иначе None
+        text     — тело ответа (только для "ok"), иначе None
+        error    — имя исключения/причина (для error/hard_timeout_exceeded), иначе None
+    """
+
+    def _do_request() -> dict[str, Any]:
+        resp = session.get(
+            url,
+            timeout=(CRAWL_CONNECT_TIMEOUT_SEC, timeout),
+            allow_redirects=True,
+            stream=True,
+        )
+        content_type = _get_header(getattr(resp, "headers", None), "Content-Type")
+        if _is_skippable_content_type(content_type):
+            close = getattr(resp, "close", None)
+            if callable(close):
+                close()
+            return {"status": "skipped_non_html", "response": resp, "text": None, "error": None}
+        text = getattr(resp, "text", "") or ""
+        return {"status": "ok", "response": resp, "text": text, "error": None}
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(_do_request)
+        try:
+            return future.result(timeout=hard_timeout)
+        except concurrent.futures.TimeoutError:
+            return {
+                "status": "hard_timeout_exceeded",
+                "response": None,
+                "text": None,
+                "error": "hard_timeout_exceeded",
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "response": None,
+                "text": None,
+                "error": type(exc).__name__,
+            }
+    finally:
+        # wait=False: если фоновый поток всё ещё блокирован на сокете (сработал
+        # hard_timeout), не ждём его завершения — он будет собран GC отдельно.
+        executor.shutdown(wait=False)
+
+
 def crawl_pages(
     urls: list[str],
     base_url: str,
@@ -378,20 +599,30 @@ def crawl_pages(
     session: Any,
     log: Any = None,
     timeout: int = CRAWL_TIMEOUT_SEC,
+    hard_timeout: int = CRAWL_HARD_TIMEOUT_SEC,
     headless: bool = False,
+    robots_rules: list[tuple[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Обойти список URL и собрать свойства страниц.
 
     Возвращает список dict по схеме PAGES_SCHEMA.
-    Ошибки соединения не роняют пайплайн: http_status=0, мета-поля=None.
+    Ошибки соединения, жёсткий таймаут (hard_timeout) и бинарный Content-Type
+    не роняют пайплайн и не прерывают обход остальной очереди: http_status=0
+    (ошибка/таймаут) или страница пропускается без парсинга тела (Content-Type).
     headless=True включает JS-рендеринг через playwright (требует playwright install).
+    robots_rules — правила Disallow/Allow для user-agent "*" из fetch_robots_txt;
+    robots_directive сводит meta robots + X-Robots-Tag заголовок + robots.txt.
     """
     log = log or (lambda _: None)
     pages: list[dict[str, Any]] = []
+    robots_rules = robots_rules or []
 
     for url in urls:
         abs_url = _to_absolute(url, base_url)
         crawled_at = datetime.now(timezone.utc).isoformat()
+
+        path = urlparse(abs_url).path or "/"
+        robots_txt_disallowed = _is_path_disallowed(path, robots_rules)
 
         record: dict[str, Any] = {
             "url": url,
@@ -399,7 +630,7 @@ def crawl_pages(
             "redirect_chain": "[]",
             "final_url": abs_url,
             "canonical_url": None,
-            "robots_directive": None,
+            "robots_directive": _combine_robots_directive(None, None, robots_txt_disallowed),
             "in_sitemap": False,
             "title": None,
             "description": None,
@@ -408,8 +639,14 @@ def crawl_pages(
             "js_content_diff": None,
         }
 
-        try:
-            resp = session.get(abs_url, timeout=timeout, allow_redirects=True)
+        result = _guarded_get(session, abs_url, timeout=timeout, hard_timeout=hard_timeout)
+
+        if result["status"] in ("hard_timeout_exceeded", "error"):
+            reason = result["error"] or result["status"]
+            log(f"{SOURCE}: ошибка при обходе {url}: {reason}")
+            record["http_status"] = 0
+        else:
+            resp = result["response"]
             status = getattr(resp, "status_code", None)
             record["http_status"] = status
 
@@ -425,11 +662,15 @@ def crawl_pages(
             norm = (final_url or "").rstrip("/") or "/"
             record["in_sitemap"] = norm in sitemap_urls
 
-            # Парсинг HTML: для 2xx ответов.
-            if status is not None and 200 <= status < 300:
-                text = getattr(resp, "text", "") or ""
+            x_robots_tag = _get_header(getattr(resp, "headers", None), "X-Robots-Tag")
+
+            # Парсинг HTML: для 2xx ответов с не-бинарным Content-Type.
+            meta_robots: str | None = None
+            if result["status"] == "ok" and status is not None and 200 <= status < 300:
+                text = result["text"] or ""
                 if text:
                     meta = _parse_page_meta(text)
+                    meta_robots = meta.pop("robots_directive", None)
                     record.update(meta)
 
                     if headless:
@@ -438,10 +679,12 @@ def crawl_pages(
                         record["js_content_diff"] = (
                             json.dumps(diff, ensure_ascii=False) if diff is not None else None
                         )
+            elif result["status"] == "skipped_non_html":
+                log(f"{SOURCE}: {url} пропущен без скачивания тела (skipped_non_html)")
 
-        except Exception as exc:
-            log(f"{SOURCE}: ошибка при обходе {url}: {type(exc).__name__}")
-            record["http_status"] = 0
+            record["robots_directive"] = _combine_robots_directive(
+                meta_robots, x_robots_tag, robots_txt_disallowed
+            )
 
         log(f"{SOURCE}: {url} → {record['http_status']}")
         pages.append(record)
@@ -470,6 +713,7 @@ def crawl_bfs(
     max_depth: int = MAX_BFS_DEPTH,
     log: Any = None,
     timeout: int = CRAWL_TIMEOUT_SEC,
+    hard_timeout: int = CRAWL_HARD_TIMEOUT_SEC,
 ) -> list[dict[str, Any]]:
     """BFS по внутренним ссылкам от главной страницы до max_depth включительно.
 
@@ -479,6 +723,9 @@ def crawl_bfs(
       - страницы на глубине max_depth не обходятся (их дочерние рёбра не записываются)
 
     Циклы устраняются через множество visited (нормализованный URL без trailing slash).
+    Ошибка/жёсткий таймаут на одной странице пропускает её без прерывания
+    обхода остальной очереди (см. _guarded_get). Бинарный Content-Type
+    (картинка и т.п.) не парсится на ссылки, но ребро до него уже записано.
 
     Возвращает список dict {from_url, to_url, depth_from_home}.
     """
@@ -499,15 +746,23 @@ def crawl_bfs(
         if depth >= max_depth:
             continue
 
-        try:
-            resp = session.get(current_url, timeout=timeout, allow_redirects=True)
-            status = getattr(resp, "status_code", 0)
-            if not (200 <= status < 300):
-                continue
-            html = getattr(resp, "text", "") or ""
-        except Exception as exc:
-            log(f"{SOURCE}: BFS ошибка {current_url}: {type(exc).__name__}")
+        result = _guarded_get(session, current_url, timeout=timeout, hard_timeout=hard_timeout)
+
+        if result["status"] in ("hard_timeout_exceeded", "error"):
+            reason = result["error"] or result["status"]
+            log(f"{SOURCE}: BFS ошибка {current_url}: {reason}")
             continue
+
+        resp = result["response"]
+        status = getattr(resp, "status_code", 0)
+        if not (200 <= status < 300):
+            continue
+
+        if result["status"] == "skipped_non_html":
+            log(f"{SOURCE}: BFS {current_url} пропущен без скачивания тела (skipped_non_html)")
+            continue
+
+        html = result["text"] or ""
 
         links = _extract_links(html, current_url, base_url)
         for link in links["internal"]:
@@ -628,15 +883,11 @@ def build_url_priority_list(
             _add(url, "top_spend")
 
         # 4а. Органика GSC.
-        for url in _pages_from_canonical(
-            canonical_dir, "seo_queries_gsc.parquet", _PAGE_COL_GSC, _CLICKS_COL, top_n_each_source
-        ):
+        for url in _pages_from_seo_queries(canonical_dir, _SOURCE_GSC, top_n_each_source):
             _add(url, "top_organic_gsc")
 
         # 4б. Органика Webmaster (запасной вариант, если GSC нет).
-        for url in _pages_from_canonical(
-            canonical_dir, "seo_queries_webmaster.parquet", _PAGE_COL_WM, _CLICKS_COL, top_n_each_source
-        ):
+        for url in _pages_from_seo_queries(canonical_dir, _SOURCE_WM, top_n_each_source):
             _add(url, "top_organic_webmaster")
 
         # 5. Страницы с ключевыми словами из wordstat_seeds.
@@ -706,6 +957,7 @@ def extract(
 
     pages: list[dict[str, Any]] = []
     bfs_edges: list[dict[str, Any]] = []
+    headless_stats: dict[str, Any] | None = None
     base_url = _resolve_base_url(config)
     headless = bool((config.get("crawl") or {}).get("headless", False))
 
@@ -718,6 +970,9 @@ def extract(
             sitemap_urls = fetch_sitemap(base_url, session)
             log(f"{SOURCE}: sitemap содержит {len(sitemap_urls)} URL")
 
+            robots_rules = fetch_robots_txt(base_url, session)
+            log(f"{SOURCE}: robots.txt содержит {len(robots_rules)} правил (user-agent *)")
+
             pages = crawl_pages(
                 result["urls"],
                 base_url,
@@ -725,10 +980,28 @@ def extract(
                 session=session,
                 log=log,
                 headless=headless,
+                robots_rules=robots_rules,
             )
             if pages:
                 write_pages_parquet(pages, out_dir)
                 log(f"{SOURCE}: pages.parquet записан, {len(pages)} страниц")
+
+            if headless and pages:
+                attempted = sum(
+                    1 for p in pages
+                    if p.get("http_status") is not None and 200 <= p["http_status"] < 300
+                )
+                populated = sum(1 for p in pages if p.get("js_content_diff"))
+                headless_stats = {"attempted": attempted, "diff_populated": populated}
+                if attempted > 0 and populated == 0:
+                    log(
+                        f"{SOURCE}: headless включён, но js_content_diff пуст на всех "
+                        f"{attempted} проверенных страницах — либо сайт SSR (пустой diff "
+                        "корректен), либо playwright/chromium недоступен в этой среде "
+                        "(pip install playwright && playwright install chromium). "
+                        "Различить эти случаи без ручного подтверждения нельзя — "
+                        "см. docs/implementation_status.md, задача 3.5-patch."
+                    )
 
             # BFS от главной страницы (3.5C).
             bfs_edges = crawl_bfs(base_url, session, log=log)
@@ -741,7 +1014,10 @@ def extract(
     else:
         log(f"{SOURCE}: base_url не задан — HTTP-обход пропущен")
 
-    manifest = _record_manifest(paths, result, crawled=len(pages), bfs_edges=len(bfs_edges))
+    manifest = _record_manifest(
+        paths, result, crawled=len(pages), bfs_edges=len(bfs_edges),
+        headless=headless, headless_stats=headless_stats,
+    )
     log(f"{SOURCE}: url_queue.json записан, {len(result['urls'])} URL")
 
     return {
@@ -786,34 +1062,68 @@ def _pages_from_canonical(
         return []
 
 
+def _pages_from_seo_queries(
+    canonical_dir: Path,
+    source_value: str,
+    top_n: int,
+) -> list[str]:
+    """Топ-N уникальных URL по total_clicks для source='gsc'|'webmaster'
+    из объединённой таблицы seo_queries.parquet (после 4D GSC и Webmaster
+    больше не пишутся отдельными файлами)."""
+    path = canonical_dir / _SEO_QUERIES_FILE
+    if not path.exists():
+        return []
+    try:
+        import pandas as pd
+        df = pd.read_parquet(
+            path, columns=[_PAGE_COL_SEO, _SOURCE_COL_SEO, _CLICKS_COL_SEO]
+        )
+        if _PAGE_COL_SEO not in df.columns or _SOURCE_COL_SEO not in df.columns:
+            return []
+        df = df[df[_SOURCE_COL_SEO] == source_value]
+        if df.empty:
+            return []
+        if _CLICKS_COL_SEO in df.columns:
+            ranked = df.groupby(_PAGE_COL_SEO)[_CLICKS_COL_SEO].sum()
+            ranked = ranked.sort_values(ascending=False)
+            pages = ranked.index.tolist()
+        else:
+            pages = df[_PAGE_COL_SEO].dropna().astype(str).unique().tolist()
+        result_pages = []
+        for p in pages[:top_n]:
+            p = str(p).strip()
+            if p:
+                result_pages.append(p.rstrip("/") or "/")
+        return result_pages
+    except Exception:
+        return []
+
+
 def _pages_matching_keywords(
     canonical_dir: Path,
     seeds: list[str],
     top_n: int,
 ) -> list[str]:
-    """Страницы GSC/Webmaster, URL которых содержит слово из seeds."""
+    """Страницы GSC/Webmaster (seo_queries.parquet), URL которых содержит
+    слово из seeds."""
+    path = canonical_dir / _SEO_QUERIES_FILE
+    if not path.exists():
+        return []
     matched: list[str] = []
-    for table_file, page_col in [
-        ("seo_queries_gsc.parquet", _PAGE_COL_GSC),
-        ("seo_queries_webmaster.parquet", _PAGE_COL_WM),
-    ]:
-        path = canonical_dir / table_file
-        if not path.exists():
-            continue
-        try:
-            import pandas as pd
-            df = pd.read_parquet(path, columns=[page_col])
-            pages = df[page_col].dropna().astype(str).unique()
-            for page in pages:
-                page_lower = page.lower()
-                if any(seed in page_lower for seed in seeds):
-                    url = page.strip().rstrip("/")
-                    if url not in matched:
-                        matched.append(url)
-        except Exception:
-            continue
-        if len(matched) >= top_n:
-            break
+    try:
+        import pandas as pd
+        df = pd.read_parquet(path, columns=[_PAGE_COL_SEO])
+        pages = df[_PAGE_COL_SEO].dropna().astype(str).unique()
+        for page in pages:
+            page_lower = page.lower()
+            if any(seed in page_lower for seed in seeds):
+                url = page.strip().rstrip("/")
+                if url not in matched:
+                    matched.append(url)
+            if len(matched) >= top_n:
+                break
+    except Exception:
+        return matched[:top_n]
     return matched[:top_n]
 
 
@@ -822,6 +1132,8 @@ def _record_manifest(
     result: dict[str, Any],
     crawled: int = 0,
     bfs_edges: int = 0,
+    headless: bool = False,
+    headless_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
@@ -832,9 +1144,13 @@ def _record_manifest(
         "truncated": result["truncated"],
         "pages_crawled": crawled,
         "bfs_edges": bfs_edges,
+        "headless_enabled": headless,
     }
     if result["caveat"]:
         extra["caveat"] = result["caveat"]
+    if headless_stats is not None:
+        extra["headless_pages_attempted"] = headless_stats["attempted"]
+        extra["headless_diff_populated"] = headless_stats["diff_populated"]
 
     return manifest_mod.update_source(
         Path(paths.raw), SOURCE,

@@ -320,6 +320,89 @@ def test_bfs_404_page_skipped():
     assert any(e["to_url"] == f"{BASE}/a" for e in edges)
 
 
+# ── crawl_bfs: жёсткий таймаут (3.5-hang-fix) ───────────────────────────────────
+# Эмулирует сервер, медленно вытекающий телом мелкими чанками дольше read-таймаута,
+# но без полного бездействия сокета (см. docs/implementation_status.md, 3.5-hang-diag).
+
+class _SlowBfsResp:
+    def __init__(self, delay: float, url: str) -> None:
+        self.status_code = 200
+        self.url = url
+        self.history: list = []
+        self._delay = delay
+
+    @property
+    def text(self) -> str:
+        import time
+        time.sleep(self._delay)
+        return "<html><body></body></html>"
+
+
+class _SlowBfsSession:
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+
+    def get(self, url: str, **kwargs) -> _SlowBfsResp:
+        return _SlowBfsResp(self._delay, url)
+
+
+def test_bfs_hard_timeout_returns_instead_of_hanging():
+    import time
+
+    session = _SlowBfsSession(delay=2.0)
+    start = time.monotonic()
+    edges = crawl_bfs(BASE, session, hard_timeout=0.2)
+    elapsed = time.monotonic() - start
+
+    assert edges == []
+    assert elapsed < 1.5
+
+
+def test_bfs_continues_after_hard_timeout_on_child_url():
+    """Ребёнок home уходит в hard_timeout — обход остальной очереди не прерывается."""
+
+    class _MixedSession:
+        def get(self, url: str, **kwargs):
+            if url == f"{BASE}/":
+                return _MockResp(200, _make_page(f"{BASE}/a", f"{BASE}/b"), url)
+            if url == f"{BASE}/a":
+                return _SlowBfsResp(2.0, url)
+            if url == f"{BASE}/b":
+                return _MockResp(200, _make_page(), url)
+            return _MockResp(404, "", url)
+
+    edges = crawl_bfs(BASE, _MixedSession(), hard_timeout=0.2)
+    to_urls = {e["to_url"] for e in edges}
+    assert f"{BASE}/a" in to_urls  # ребро до /a записано, хотя сама /a не отдаёт тело
+    assert f"{BASE}/b" in to_urls  # обход продолжился после hard_timeout на /a
+
+
+# ── crawl_bfs: Content-Type skip (3.5-hang-fix) ─────────────────────────────────
+
+def test_bfs_skips_image_content_type_without_crashing():
+    class _ImgResp:
+        def __init__(self, url: str) -> None:
+            self.status_code = 200
+            self.url = url
+            self.history: list = []
+            self.headers = {"content-type": "image/png"}
+            self.text = "binary-garbage"
+
+    class _Session:
+        def get(self, url: str, **kwargs):
+            if url == f"{BASE}/":
+                return _MockResp(200, _make_page(f"{BASE}/photo.png"), url)
+            if url == f"{BASE}/photo.png":
+                return _ImgResp(url)
+            return _MockResp(404, "", url)
+
+    edges = crawl_bfs(BASE, _Session(), max_depth=2)
+    to_urls = {e["to_url"] for e in edges}
+    from_urls = [e["from_url"] for e in edges]
+    assert f"{BASE}/photo.png" in to_urls        # ребро до картинки записано
+    assert f"{BASE}/photo.png" not in from_urls  # но её "ссылки" не обходятся
+
+
 # ── write_link_graph_parquet ──────────────────────────────────────────────────
 
 def test_write_link_graph_parquet_schema(tmp_path):

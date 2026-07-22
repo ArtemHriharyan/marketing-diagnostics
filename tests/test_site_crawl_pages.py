@@ -470,6 +470,103 @@ def test_crawl_url_field_preserves_original(mini_site_session, sitemap_urls):
     assert pages[0]["url"] == "/rooms"
 
 
+# ── crawl_pages: жёсткий таймаут (3.5-hang-fix) ────────────────────────────────
+# Эмулирует сервер, медленно вытекающий телом мелкими чанками дольше read-таймаута,
+# но без полного бездействия сокета — классический requests-гочер, из-за которого
+# scalar timeout= не срабатывает (см. docs/implementation_status.md, 3.5-hang-diag).
+
+class _SlowMockResponse:
+    """Мок ответа, чьё .text выполняется дольше hard_timeout."""
+
+    def __init__(self, delay: float, url: str = "") -> None:
+        self.status_code = 200
+        self.url = url
+        self.history: list = []
+        self.headers = {"content-type": "text/html; charset=utf-8"}
+        self._delay = delay
+
+    @property
+    def text(self) -> str:
+        import time
+        time.sleep(self._delay)
+        return "<html><body>too slow</body></html>"
+
+    def close(self) -> None:
+        pass
+
+
+class _SlowMockSession:
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+
+    def get(self, url: str, **kwargs) -> _SlowMockResponse:
+        return _SlowMockResponse(self._delay, url=url)
+
+
+def test_crawl_pages_hard_timeout_returns_instead_of_hanging(sitemap_urls):
+    """Тело течёт дольше hard_timeout — crawl_pages не зависает, возвращает
+    управление в пределах hard_timeout, а не delay сервера."""
+    import time
+
+    session = _SlowMockSession(delay=2.0)
+    start = time.monotonic()
+    pages = crawl_pages(["/"], BASE, sitemap_urls, session=session, hard_timeout=0.2)
+    elapsed = time.monotonic() - start
+
+    assert pages[0]["http_status"] == 0
+    assert elapsed < 1.5
+
+
+def test_crawl_pages_continues_after_hard_timeout_on_one_url(mini_site_session, sitemap_urls):
+    """Один URL уходит в hard_timeout — обход остальной очереди не прерывается."""
+
+    class _MixedSession:
+        def __init__(self, slow_url: str, fallback: Any) -> None:
+            self._slow_url = slow_url
+            self._fallback = fallback
+
+        def get(self, url: str, **kwargs):
+            if url == self._slow_url:
+                return _SlowMockResponse(2.0, url=url)
+            return self._fallback.get(url, **kwargs)
+
+    session = _MixedSession(f"{BASE}/", mini_site_session)
+    pages = crawl_pages(
+        ["/", "/rooms"], BASE, sitemap_urls, session=session, hard_timeout=0.2,
+    )
+    assert pages[0]["http_status"] == 0
+    assert pages[1]["http_status"] == 200
+
+
+# ── crawl_pages: Content-Type skip (3.5-hang-fix) ──────────────────────────────
+
+def test_crawl_pages_skips_image_content_type_without_parsing_body(sitemap_urls):
+    """Content-Type image/* — тело не парсится как HTML: http_status сохраняется,
+    но title/h1 остаются None (мета не извлекается из бинарного содержимого)."""
+    session = MockSession({
+        f"{BASE}/photo.jpg": MockResponse(
+            200, "not-real-html-binary-garbage", url=f"{BASE}/photo.jpg",
+            content_type="image/jpeg",
+        ),
+    })
+    pages = crawl_pages(["/photo.jpg"], BASE, sitemap_urls, session=session)
+    p = pages[0]
+    assert p["http_status"] == 200
+    assert p["title"] is None
+    assert p["h1"] is None
+
+
+def test_crawl_pages_skips_pdf_content_type(sitemap_urls):
+    session = MockSession({
+        f"{BASE}/doc.pdf": MockResponse(
+            200, "%PDF-1.4 binary", url=f"{BASE}/doc.pdf", content_type="application/pdf",
+        ),
+    })
+    pages = crawl_pages(["/doc.pdf"], BASE, sitemap_urls, session=session)
+    assert pages[0]["http_status"] == 200
+    assert pages[0]["title"] is None
+
+
 # ── write_pages_parquet ───────────────────────────────────────────────────────
 
 def test_write_pages_parquet_schema(tmp_path, mini_site_session, sitemap_urls):
