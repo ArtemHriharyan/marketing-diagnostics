@@ -3,15 +3,26 @@
 Формат входных данных: папки YYYY-MM в manual_export_dir.
 Каждая папка содержит отдельные CSV-файлы по срезам:
     Диаграмма.csv   — временной ряд по дням (обязательно)
-    Запросы.csv     — топ запросов за период (обязательно)
-    Страницы.csv    — топ страниц за период (обязательно)
+    Запросы.csv     — запросы за период (обязательно)
+    Страницы.csv    — топ страниц за период (обязательно, кроме комбинированного
+                       формата ниже — там page уже приходит из Запросы.csv)
     Устройства.csv  — разбивка по устройствам (опционально)
     Страны.csv      — разбивка по странам (опционально)
     Фильтры.csv     — мета: период и тип поиска (опционально)
 
-Контракт выходного parquet seo_queries не изменился:
-    month, query, page, device, clicks, impressions, ctr, position
-    page="" и device="unknown" — ручная выгрузка не даёт пересечение query×page×device.
+Contract 3A — комбинированный формат Запросы.csv (несколько измерений сразу):
+    Если в GSC перед экспортом одновременно включены измерения Query + Page +
+    Device (см. docs/gsc_export_instructions.md), Запросы.csv содержит колонки
+    обоих дополнительных измерений в каждой строке — page и device берутся из
+    строки, а не подставляются заглушкой. Это ровно контракт seo_queries:
+    month, query, page, device, clicks, impressions, ctr, position — без
+    выродившихся page="" / device="unknown".
+
+    Если Запросы.csv содержит только query (старый раздельный экспорт — по
+    одному измерению за раз), парсер НЕ падает: page="" и device="unknown" как
+    раньше, но месяц помечается caveat'ом incomplete_dimensions (и попадает в
+    incomplete_dimensions_months / device_missing_months) — явный сигнал, что
+    contract 3A для этого месяца выполнен не полностью.
 
 Дополнительно пишутся gsc_daily_YYYY-MM.{csv,parquet},
 gsc_pages_YYYY-MM.{csv,parquet}, gsc_devices_YYYY-MM.{csv,parquet}
@@ -33,7 +44,7 @@ from typing import Any, Callable
 
 from . import _common as C
 
-SCRIPT_VERSION = "0.2.0"
+SCRIPT_VERSION = "0.3.0"
 SOURCE = "gsc"
 CANONICAL_TABLES = ["seo_queries"]
 
@@ -131,6 +142,7 @@ def extract(
     months: list[str] = []
     skipped_months: list[str] = []
     available_slices_by_month: dict[str, list[str]] = {}
+    combined_by_month: dict[str, bool] = {}
 
     for month, folder in month_folders:
         slices = _detect_slices(folder)
@@ -138,7 +150,20 @@ def extract(
                      if k in slices]
         available_slices_by_month[month] = available
 
-        missing = _REQUIRED_SLICES - set(slices)
+        # Запросы.csv читается один раз здесь: заголовок нужен уже для проверки
+        # обязательных срезов (комбинированный формат contract 3A ослабляет
+        # требование Страницы.csv — page уже приходит из Запросы.csv).
+        combined = False
+        query_header: list[str] = []
+        query_rows: list[dict[str, str]] = []
+        if "queries" in slices:
+            query_header, query_rows = _read_slice_csv_with_header(slices["queries"])
+            combined = _is_combined_header(query_header, column_map)
+
+        required = set(_REQUIRED_SLICES)
+        if combined:
+            required -= {"pages"}
+        missing = required - set(slices)
         if missing:
             caveats.append({
                 "month": month,
@@ -151,6 +176,17 @@ def extract(
             continue
 
         months.append(month)
+        combined_by_month[month] = combined
+        if not combined:
+            caveats.append({
+                "month": month,
+                "type": "incomplete_dimensions",
+                "caveat": (
+                    "Запросы.csv не содержит колонок Page и Device одновременно — "
+                    "раздельный экспорт по одному измерению вместо комбинированного "
+                    "(contract 3A); page/device для этого месяца недостоверны."
+                ),
+            })
 
         # Фильтры.csv (опционально) — только для инфо в лог
         if "filters" in slices:
@@ -164,9 +200,10 @@ def extract(
         if daily_records:
             C.write_table(out_dir / f"gsc_daily_{month}", daily_records, DAILY_FIELDS, fmt)
 
-        # Запросы.csv → seo_queries
-        query_rows = _read_slice_csv(slices["queries"])
-        query_records, q_accepted, q_rejected = _normalize_queries(query_rows, month, column_map)
+        # Запросы.csv → seo_queries (query_rows уже прочитаны выше)
+        query_records, q_accepted, q_rejected = _normalize_queries(
+            query_rows, month, column_map, combined=combined,
+        )
         total_rows += len(query_rows)
         accepted_rows += q_accepted
         for reason, n in q_rejected.items():
@@ -174,11 +211,12 @@ def extract(
 
         C.write_table(out_dir / f"gsc_{month}", query_records, RAW_FIELDS, fmt)
 
-        # Страницы.csv
-        pages_rows = _read_slice_csv(slices["pages"])
-        pages_records = _normalize_pages(pages_rows, column_map)
-        if pages_records:
-            C.write_table(out_dir / f"gsc_pages_{month}", pages_records, PAGES_FIELDS, fmt)
+        # Страницы.csv (опционально при комбинированном Запросы.csv)
+        if "pages" in slices:
+            pages_rows = _read_slice_csv(slices["pages"])
+            pages_records = _normalize_pages(pages_rows, column_map)
+            if pages_records:
+                C.write_table(out_dir / f"gsc_pages_{month}", pages_records, PAGES_FIELDS, fmt)
 
         # Устройства.csv (опционально)
         if "devices" in slices:
@@ -193,27 +231,30 @@ def extract(
             caveats.append(caveat)
 
         log(f"{SOURCE}[manual]: {month} — запросы: принято {q_accepted}, "
-            f"отброшено {sum(q_rejected.values())}, срезы: {available}")
+            f"отброшено {sum(q_rejected.values())}, срезы: {available}, "
+            f"combined={combined}")
 
     if not months:
         raise C.SourceUnavailable(SOURCE, "нет успешно обработанных месяцев GSC")
 
-    # В этой схеме device всегда unknown — все месяцы в device_missing_months
-    device_missing_months = list(months)
+    # device_missing_months (и, для этой схемы, page тоже) — только для месяцев
+    # legacy-формата: комбинированный Запросы.csv даёт реальные page/device.
+    incomplete_dimensions_months = [m for m in months if not combined_by_month.get(m, False)]
+    device_missing_months = list(incomplete_dimensions_months)
 
     report = _write_validation_report(
         out_dir, month_folders, months, skipped_months, total_rows, accepted_rows,
         rejected_reasons, device_missing_months, caveats, column_map, fmt,
-        available_slices_by_month,
+        available_slices_by_month, incomplete_dimensions_months,
     )
     manifest = _record_manifest(
         paths, months, accepted_rows, fmt, device_missing_months, caveats,
-        available_slices_by_month,
+        available_slices_by_month, incomplete_dimensions_months,
     )
 
     if device_missing_months:
-        log(f"{SOURCE}[manual]: device=unknown для всех месяцев {device_missing_months} — "
-            "исключить из посегментного разреза по устройству (S20)")
+        log(f"{SOURCE}[manual]: incomplete_dimensions=true для месяцев {device_missing_months} — "
+            "page/device недостоверны, исключить из посегментного разреза (S20)")
 
     log(f"{SOURCE}[manual]: готово — принято {accepted_rows} строк из {total_rows}, "
         f"месяцев {len(months)}")
@@ -229,6 +270,9 @@ def extract(
         "rejected_reasons": rejected_reasons,
         "months": months,
         "device_missing_months": device_missing_months,
+        "incomplete_dimensions_months": incomplete_dimensions_months,
+        "incomplete_dimensions": bool(incomplete_dimensions_months),
+        "combined_dimensions_by_month": combined_by_month,
         "clicks_ui_caveats": clicks_mismatch_caveats,  # обратная совместимость
         "caveats": caveats,
         "source_mode": "manual",
@@ -283,6 +327,16 @@ def _effective_column_map(gsc_cfg: dict[str, Any]) -> dict[str, str]:
 
 def _read_slice_csv(path: Path) -> list[dict[str, str]]:
     """Прочитать CSV-файл среза: UTF-8/cp1251, авто-разделитель, skipinitialspace."""
+    return _read_slice_csv_with_header(path)[1]
+
+
+def _read_slice_csv_with_header(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    """Как _read_slice_csv, но дополнительно отдаёт заголовок.
+
+    Нужен для детекции комбинированного формата Запросы.csv (contract 3A):
+    наличие колонок Page/Device в заголовке отличает комбинированный экспорт
+    от старого раздельного (только query).
+    """
     data = path.read_bytes()
     text: str | None = None
     for enc in ("utf-8-sig", "utf-8", "cp1251"):
@@ -296,7 +350,15 @@ def _read_slice_csv(path: Path) -> list[dict[str, str]]:
 
     delim = _sniff_delimiter(text)
     reader = csv.DictReader(io.StringIO(text), delimiter=delim, skipinitialspace=True)
-    return list(reader)
+    rows = list(reader)
+    return list(reader.fieldnames or []), rows
+
+
+def _is_combined_header(header: list[str], column_map: dict[str, str]) -> bool:
+    """True если Запросы.csv содержит колонки Page и Device одновременно (contract 3A)."""
+    page_header = column_map.get("page", "page")
+    device_header = column_map.get("device", "device")
+    return page_header in header and device_header in header
 
 
 def _sniff_delimiter(text: str) -> str:
@@ -309,9 +371,16 @@ def _sniff_delimiter(text: str) -> str:
 # ── Нормализация срезов ───────────────────────────────────────────────────────
 
 def _normalize_queries(
-    rows: list[dict[str, str]], month: str, column_map: dict[str, str],
+    rows: list[dict[str, str]], month: str, column_map: dict[str, str], *, combined: bool,
 ) -> tuple[list[dict[str, Any]], int, dict[str, int]]:
-    """Запросы.csv → seo_queries строки. page="" device="unknown"."""
+    """Запросы.csv → seo_queries строки.
+
+    combined=True  — Запросы.csv содержит Page и Device одновременно (contract
+                      3A, комбинированный экспорт) — берём их из строки.
+    combined=False — legacy: только query; page="" device="unknown" как раньше
+                      (месяц помечается caveat'ом incomplete_dimensions на
+                      уровне extract()).
+    """
     records: list[dict[str, Any]] = []
     rejected: dict[str, int] = {}
     for row in rows:
@@ -319,11 +388,17 @@ def _normalize_queries(
         if not query:
             rejected["missing_query"] = rejected.get("missing_query", 0) + 1
             continue
+        if combined:
+            page = _field(row, "page", column_map).strip()
+            device = _field(row, "device", column_map).strip() or "unknown"
+        else:
+            page = ""
+            device = "unknown"
         records.append({
             "month": month,
             "query": query,
-            "page": "",
-            "device": "unknown",
+            "page": page,
+            "device": device,
             "clicks": _to_int(_field(row, "clicks", column_map)),
             "impressions": _to_int(_field(row, "impressions", column_map)),
             "ctr": _to_ctr(_field(row, "ctr", column_map)),
@@ -486,6 +561,7 @@ def _write_validation_report(
     column_map: dict[str, str],
     fmt: str,
     available_slices_by_month: dict[str, list[str]],
+    incomplete_dimensions_months: list[str],
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "source_mode": "manual",
@@ -498,6 +574,8 @@ def _write_validation_report(
         "rejected": sum(rejected_reasons.values()),
         "rejected_reasons": rejected_reasons,
         "device_missing_months": device_missing_months,
+        "incomplete_dimensions_months": incomplete_dimensions_months,
+        "incomplete_dimensions": bool(incomplete_dimensions_months),
         "available_slices_by_month": available_slices_by_month,
         "caveats": caveats,
         "column_map": column_map,
@@ -518,6 +596,7 @@ def _record_manifest(
     device_missing_months: list[str],
     caveats: list[dict[str, Any]],
     available_slices_by_month: dict[str, list[str]],
+    incomplete_dimensions_months: list[str],
 ) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
@@ -525,10 +604,12 @@ def _record_manifest(
     date_to = f"{months[-1]}-01" if months else ""
 
     notes: list[str] = []
-    if device_missing_months:
+    if incomplete_dimensions_months:
         notes.append(
-            "device=unknown для всех месяцев ручной выгрузки "
-            f"{device_missing_months} — исключить из посегментного разреза S20."
+            "incomplete_dimensions=true для месяцев "
+            f"{incomplete_dimensions_months} — Запросы.csv не содержит Page/Device "
+            "одновременно (раздельный экспорт вместо комбинированного, contract 3A "
+            "не выполнен полностью); исключить из посегментного разреза S20."
         )
     for c in caveats:
         if c.get("type") == "clicks_diagram_vs_queries_mismatch":
@@ -552,6 +633,8 @@ def _record_manifest(
             "completeness": "unverified",
             "raw_format": fmt,
             "device_missing_months": device_missing_months,
+            "incomplete_dimensions_months": incomplete_dimensions_months,
+            "incomplete_dimensions": bool(incomplete_dimensions_months),
             "available_slices_by_month": available_slices_by_month,
             "notes": notes,
         },

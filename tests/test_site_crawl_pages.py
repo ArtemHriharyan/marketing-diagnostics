@@ -14,11 +14,15 @@ import pytest
 
 from src.extract.site_crawl import (
     PAGES_SCHEMA,
+    _is_path_disallowed,
     _parse_page_meta,
+    _parse_robots_txt,
     _parse_sitemap_xml,
     _resolve_base_url,
+    _select_robots_rules,
     _to_absolute,
     crawl_pages,
+    fetch_robots_txt,
     fetch_sitemap,
     write_pages_parquet,
 )
@@ -36,12 +40,13 @@ class MockResponse:
         url: str = "",
         history: list | None = None,
         content_type: str = "text/html; charset=utf-8",
+        headers: dict | None = None,
     ) -> None:
         self.status_code = status_code
         self.text = text
         self.url = url
         self.history = history or []
-        self.headers = {"content-type": content_type}
+        self.headers = {"content-type": content_type, **(headers or {})}
 
 
 class MockSession:
@@ -98,6 +103,10 @@ _SITEMAP_XML = """<?xml version="1.0" encoding="UTF-8"?>
   <url><loc>https://example.com/rooms</loc></url>
 </urlset>"""
 
+_ROBOTS_TXT_MINI = """User-agent: *
+Disallow: /private/
+"""
+
 BASE = "https://example.com"
 
 
@@ -116,11 +125,18 @@ def mini_site_session() -> MockSession:
     return MockSession({
         f"{BASE}/sitemap.xml": MockResponse(200, _SITEMAP_XML, url=f"{BASE}/sitemap.xml",
                                              content_type="application/xml"),
+        f"{BASE}/robots.txt": MockResponse(200, _ROBOTS_TXT_MINI, url=f"{BASE}/robots.txt",
+                                            content_type="text/plain"),
         f"{BASE}/": response_200,
         f"{BASE}/rooms": MockResponse(200, _HTML_MINIMAL, url=f"{BASE}/rooms"),
         f"{BASE}/redirect": redirect_final,
         f"{BASE}/noindex": MockResponse(200, _HTML_NOINDEX, url=f"{BASE}/noindex"),
         f"{BASE}/dup": MockResponse(200, _HTML_NON_SELF_CANONICAL, url=f"{BASE}/dup"),
+        f"{BASE}/private/page": MockResponse(200, _HTML_MINIMAL, url=f"{BASE}/private/page"),
+        f"{BASE}/x-robots": MockResponse(
+            200, _HTML_MINIMAL, url=f"{BASE}/x-robots",
+            headers={"X-Robots-Tag": "noindex"},
+        ),
         # /missing не добавлен → MockSession вернёт 404
     })
 
@@ -214,6 +230,85 @@ def test_fetch_sitemap_network_error_returns_empty():
     assert fetch_sitemap(BASE, ErrSession()) == set()
 
 
+# ── robots.txt ────────────────────────────────────────────────────────────────
+
+_ROBOTS_TXT = """User-agent: *
+Disallow: /admin/
+Disallow: /cart
+Allow: /cart/share
+
+User-agent: Yandex
+Disallow: /yandex-only/
+
+Sitemap: https://example.com/sitemap.xml
+"""
+
+
+def test_parse_robots_txt_groups_by_user_agent():
+    groups = _parse_robots_txt(_ROBOTS_TXT)
+    agents = [g["agents"] for g in groups]
+    assert ["*"] in agents
+    assert ["yandex"] in agents
+
+
+def test_parse_robots_txt_ignores_comments_and_sitemap():
+    groups = _parse_robots_txt(_ROBOTS_TXT)
+    star_rules = _select_robots_rules(groups, "*")
+    assert ("disallow", "/admin/") in star_rules
+    assert not any(k == "sitemap" for k, _ in star_rules)
+
+
+def test_select_robots_rules_falls_back_to_star():
+    groups = _parse_robots_txt(_ROBOTS_TXT)
+    rules = _select_robots_rules(groups, "googlebot")
+    assert ("disallow", "/admin/") in rules
+
+
+def test_select_robots_rules_specific_agent():
+    groups = _parse_robots_txt(_ROBOTS_TXT)
+    rules = _select_robots_rules(groups, "yandex")
+    assert rules == [("disallow", "/yandex-only/")]
+
+
+def test_is_path_disallowed_matches_prefix():
+    rules = [("disallow", "/admin/")]
+    assert _is_path_disallowed("/admin/users", rules) is True
+
+
+def test_is_path_disallowed_allows_unmatched_path():
+    rules = [("disallow", "/admin/")]
+    assert _is_path_disallowed("/catalog/", rules) is False
+
+
+def test_is_path_disallowed_allow_overrides_more_specific_disallow():
+    rules = [("disallow", "/cart"), ("allow", "/cart/share")]
+    assert _is_path_disallowed("/cart/share", rules) is False
+    assert _is_path_disallowed("/cart", rules) is True
+
+
+def test_is_path_disallowed_empty_disallow_means_allow_all():
+    rules = [("disallow", "")]
+    assert _is_path_disallowed("/anything", rules) is False
+
+
+def test_fetch_robots_txt_parses_star_rules(mini_site_session):
+    rules = fetch_robots_txt(BASE, mini_site_session)
+    assert ("disallow", "/private/") in rules
+
+
+def test_fetch_robots_txt_404_returns_empty():
+    session = MockSession({})
+    assert fetch_robots_txt(BASE, session) == []
+
+
+def test_fetch_robots_txt_network_error_returns_empty():
+    class ErrSession:
+        def get(self, url, **kwargs):
+            raise ConnectionError("network down")
+
+    assert fetch_robots_txt(BASE, ErrSession()) == []
+
+
 # ── _to_absolute ──────────────────────────────────────────────────────────────
 
 def test_to_absolute_relative_path():
@@ -289,6 +384,56 @@ def test_crawl_canonical_non_self(mini_site_session, sitemap_urls):
 def test_crawl_robots_noindex(mini_site_session, sitemap_urls):
     pages = _crawl(["/noindex"], mini_site_session, sitemap_urls)
     assert pages[0]["robots_directive"] == "noindex, nofollow"
+
+
+def test_crawl_robots_directive_none_when_no_signal(mini_site_session, sitemap_urls):
+    pages = _crawl(["/rooms"], mini_site_session, sitemap_urls)
+    assert pages[0]["robots_directive"] is None
+
+
+def test_crawl_x_robots_tag_header_sets_directive(mini_site_session, sitemap_urls):
+    pages = crawl_pages(["/x-robots"], BASE, sitemap_urls, session=mini_site_session)
+    assert pages[0]["robots_directive"] == "x-robots-tag: noindex"
+
+
+def test_crawl_robots_txt_disallow_sets_directive(mini_site_session, sitemap_urls):
+    rules = fetch_robots_txt(BASE, mini_site_session)
+    pages = crawl_pages(
+        ["/private/page"], BASE, sitemap_urls,
+        session=mini_site_session, robots_rules=rules,
+    )
+    assert pages[0]["robots_directive"] == "robots.txt: disallow"
+
+
+def test_crawl_robots_txt_allowed_path_not_flagged(mini_site_session, sitemap_urls):
+    rules = fetch_robots_txt(BASE, mini_site_session)
+    pages = crawl_pages(
+        ["/rooms"], BASE, sitemap_urls,
+        session=mini_site_session, robots_rules=rules,
+    )
+    assert pages[0]["robots_directive"] is None
+
+
+def test_crawl_combines_meta_and_robots_txt(mini_site_session, sitemap_urls):
+    rules = [("disallow", "/noindex")]
+    pages = crawl_pages(
+        ["/noindex"], BASE, sitemap_urls,
+        session=mini_site_session, robots_rules=rules,
+    )
+    assert pages[0]["robots_directive"] == "noindex, nofollow; robots.txt: disallow"
+
+
+def test_crawl_robots_txt_disallow_recorded_even_on_network_error(sitemap_urls):
+    """robots.txt блокирует по пути — это не требует успешного HTTP-запроса к странице."""
+    class ErrSession:
+        def get(self, url, **kwargs):
+            raise ConnectionError("timeout")
+
+    pages = crawl_pages(
+        ["/private/page"], BASE, sitemap_urls,
+        session=ErrSession(), robots_rules=[("disallow", "/private/")],
+    )
+    assert pages[0]["robots_directive"] == "robots.txt: disallow"
 
 
 def test_crawl_in_sitemap_true(mini_site_session, sitemap_urls):

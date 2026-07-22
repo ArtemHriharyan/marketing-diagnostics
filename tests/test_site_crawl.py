@@ -124,32 +124,22 @@ def test_max_urls_argument_overrides_config():
 
 @pytest.fixture()
 def canonical_dir(tmp_path):
-    """Создать минимальные parquet-таблицы в tmp_path."""
+    """Создать минимальные parquet-таблицы в tmp_path (схема после 4D:
+    GSC и Webmaster объединены в seo_queries.parquet, различаются колонкой
+    source; costs.parquet — campaign-level, без entry_page)."""
     try:
         import pandas as pd
     except ImportError:
         pytest.skip("pandas недоступен")
 
-    costs = pd.DataFrame({
-        "entry_page": ["/rooms", "/promo", "/contacts"],
-        "cost": [5000.0, 3000.0, 1000.0],
-    })
-    costs.to_parquet(tmp_path / "costs.parquet", index=False)
-
-    gsc = pd.DataFrame({
+    seo = pd.DataFrame({
         "page": ["/rooms", "/faq", "/booking"],
-        "clicks": [200, 150, 100],
+        "source": ["gsc", "gsc", "gsc"],
+        "total_clicks": [200, 150, 100],
     })
-    gsc.to_parquet(tmp_path / "seo_queries_gsc.parquet", index=False)
+    seo.to_parquet(tmp_path / "seo_queries.parquet", index=False)
 
     return tmp_path
-
-
-def test_top_spend_pages_added(canonical_dir):
-    config = {}
-    result = build_url_priority_list(config, canonical_dir)
-    assert "/rooms" in result["urls"]
-    assert "/promo" in result["urls"]
 
 
 def test_top_organic_gsc_pages_added(canonical_dir):
@@ -157,6 +147,33 @@ def test_top_organic_gsc_pages_added(canonical_dir):
     result = build_url_priority_list(config, canonical_dir)
     assert "/faq" in result["urls"]
     assert "/booking" in result["urls"]
+
+
+def test_top_organic_gsc_ranked_by_total_clicks(canonical_dir):
+    config = {}
+    result = build_url_priority_list(config, canonical_dir)
+    assert result["urls"][:3] == ["/rooms", "/faq", "/booking"]
+
+
+def test_costs_without_entry_page_column_degrades_to_empty(tmp_path):
+    """costs.parquet реальной формы (campaign-level, без entry_page) не должен
+    ронять сборку очереди — top_spend просто не даёт кандидатов."""
+    try:
+        import pandas as pd
+    except ImportError:
+        pytest.skip("pandas недоступен")
+
+    costs = pd.DataFrame({
+        "date": ["2026-01-01"],
+        "source_tag": ["direct"],
+        "cost_raw": [100.0],
+    })
+    costs.to_parquet(tmp_path / "costs.parquet", index=False)
+
+    config = {"crawl_seed_urls": ["/"]}
+    result = build_url_priority_list(config, tmp_path)
+    assert result["urls"] == ["/"]
+    assert result["url_sources"]["/"] == "explicit_seed"
 
 
 def test_explicit_seeds_stay_first_when_canonical_present(canonical_dir):
@@ -173,12 +190,12 @@ def test_keyword_match_pages_added(tmp_path):
         pytest.skip("pandas недоступен")
 
     # top_n_each_source=20 по умолчанию: страницы 0–19 захватываются как top_organic_webmaster.
-    # Страница 20 (/arenda-avto) имеет clicks=1 (ранг 21) — ниже порога и попадает
+    # Страница 20 (/arenda-avto) имеет total_clicks=1 (ранг 21) — ниже порога и попадает
     # в список только через keyword_match.
-    rows = [{"page": f"/page-{i}", "clicks": 100 - i} for i in range(20)]
-    rows.append({"page": "/arenda-avto", "clicks": 1})
+    rows = [{"page": f"/page-{i}", "source": "webmaster", "total_clicks": 100 - i} for i in range(20)]
+    rows.append({"page": "/arenda-avto", "source": "webmaster", "total_clicks": 1})
     wm = pd.DataFrame(rows)
-    wm.to_parquet(tmp_path / "seo_queries_webmaster.parquet", index=False)
+    wm.to_parquet(tmp_path / "seo_queries.parquet", index=False)
 
     config = {"wordstat_seeds": ["arenda"]}
     result = build_url_priority_list(config, tmp_path)

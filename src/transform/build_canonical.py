@@ -104,6 +104,10 @@ _VALID_SOURCE_GROUPS = {
     "messenger", "other",
 }
 
+# ym:s:lastsignTrafficSource, при которых источник считается техническим
+# артефактом разрыва сессии, а не самостоятельным каналом (T02/T03 carry-forward).
+_TRAFFIC_RESOLVE_AMBIGUOUS = {"internal", "undefined"}
+
 # Значения utm_source, которые считаются "не заданными".
 _UTM_UNDEFINED_TOKENS = {"", "не определено", "(not set)", "not set", "undefined", "none"}
 
@@ -280,6 +284,89 @@ def apply_utm_threshold(
     ambiguous_mask = is_ad & utm_missing
     source_final.loc[ambiguous_mask] = "undefined" if utm_uncertain else "ad"
     return source_final, utm_uncertain, frac_undefined
+
+
+# ── T02/T03: carry-forward источника трафика для internal/undefined ────────
+def resolve_traffic_source(
+    df: pd.DataFrame, lookback_cutoff: date | None = None,
+) -> pd.DataFrame:
+    """Восстановить lastsign-источник для визитов с internal/undefined (T02/T03).
+
+    Читает ``client_id``, ``dt``, ``date``, ``last_sign_traffic_source_raw``.
+    Визиты сортируются по (client_id, dt) по возрастанию; визит с сырым
+    источником из ``_TRAFFIC_RESOLVE_AMBIGUOUS`` получает значение ближайшего
+    ПРЕДЫДУЩЕГО визита того же clientID с реальным источником (только вперёд
+    по времени — назад не смотрим). ``lookback_cutoff`` — нижняя граница даты
+    визита, который допустимо использовать как реальный источник (граница
+    lookback-окна, config/defaults.yaml: transform.traffic_resolve_lookback_days);
+    визиты старше границы остаются в df, но цепочку не продолжают.
+
+    Добавляет колонки:
+        source_group_resolved   — source_group после восстановления (для визита
+                                   с реальным источником не меняется);
+        traffic_source_resolved — bool, False, если для clientID не нашлось ни
+                                   одного реального источника в пределах истории
+                                   (это ожидаемое поведение, не ошибка).
+
+    Исходные lastsign/naive поля не трогает — новые колонки отдельно от них.
+    """
+    if df.empty:
+        out = df.copy()
+        out["source_group_resolved"] = pd.Series(dtype="object")
+        out["traffic_source_resolved"] = pd.Series(dtype="bool")
+        return out
+
+    ordered = df.sort_values(["client_id", "dt"], kind="stable")
+    resolved_raw: list[str | None] = []
+    resolved_flag: list[bool] = []
+    last_real: dict[Any, str | None] = {}
+
+    for _, row in ordered.iterrows():
+        client_id = row["client_id"]
+        raw = row.get("last_sign_traffic_source_raw")
+        norm = (raw or "").strip().lower()
+        visit_date = row["date"]
+
+        if norm not in _TRAFFIC_RESOLVE_AMBIGUOUS:
+            if lookback_cutoff is None or visit_date >= lookback_cutoff:
+                last_real[client_id] = raw
+            resolved_raw.append(raw)
+            resolved_flag.append(True)
+            continue
+
+        prior = last_real.get(client_id)
+        if prior is not None:
+            resolved_raw.append(prior)
+            resolved_flag.append(True)
+        else:
+            resolved_raw.append(raw)
+            resolved_flag.append(False)
+
+    ordered = ordered.assign(_resolved_raw=resolved_raw, traffic_source_resolved=resolved_flag)
+    ordered["source_group_resolved"] = ordered["_resolved_raw"].apply(classify_traffic_source)
+    ordered = ordered.drop(columns=["_resolved_raw"])
+    return ordered.loc[df.index].reset_index(drop=True)
+
+
+def compute_traffic_resolve_stats(df: pd.DataFrame) -> dict[str, Any]:
+    """Доля визитов с traffic_source_resolved=False среди internal/undefined.
+
+    Обязательный caveat манифеста (T02/T03) — считается только над визитами,
+    у которых сырой lastsign-источник был internal/undefined; визиты с уже
+    реальным источником в знаменатель не входят.
+    """
+    if df.empty or "last_sign_traffic_source_raw" not in df.columns:
+        return {"internal_or_undefined_total": 0, "unresolved_count": 0, "unresolved_frac": 0.0}
+    norm = df["last_sign_traffic_source_raw"].fillna("").astype(str).str.strip().str.lower()
+    ambiguous_mask = norm.isin(_TRAFFIC_RESOLVE_AMBIGUOUS)
+    total = int(ambiguous_mask.sum())
+    unresolved = int((ambiguous_mask & ~df["traffic_source_resolved"]).sum())
+    frac = (unresolved / total) if total else 0.0
+    return {
+        "internal_or_undefined_total": total,
+        "unresolved_count": unresolved,
+        "unresolved_frac": frac,
+    }
 
 
 # ═════════════════════════════ Правила: costs ═══════════════════════════════
@@ -500,6 +587,28 @@ _BACKFILL_COLUMNS = [
 ]
 
 
+# Историческое имя поля региона визита — используется, если manifest ещё не
+# содержит region_field (выгрузка до 2A-patch, старый extract писал только
+# ym:s:regionCity без записи имени поля в manifest).
+_REGION_FIELD_LEGACY_DEFAULT = "ym:s:regionCity"
+
+
+def _resolve_region_field(manifest_metrika_entry: dict[str, Any] | None) -> str:
+    """Фактическое имя поля региона визита в сыром CSV (2A-patch).
+
+    extract/metrika_logs.py решает во время выгрузки, какое имя РЕАЛЬНО ушло
+    в API (ym:s:regionArea, если API его принял; откат на ym:s:regionCity,
+    если API отклонил regionArea — см. manifest.region_field_verified) и
+    записывает выбранное имя в manifest.region_field. Transform не гадает и
+    не хардкодит имя — читает то же имя, что реально запрашивал extract;
+    иначе колонка молча уходит в None, даже если данные в CSV есть под другим
+    заголовком. Manifest без этого поля (выгрузка до 2A-patch) -> откат на
+    исторически известное ym:s:regionCity, не пустая колонка.
+    """
+    entry = manifest_metrika_entry or {}
+    return entry.get("region_field") or _REGION_FIELD_LEGACY_DEFAULT
+
+
 def _read_metrika_logs_rows(raw_dir: Path) -> list[dict[str, str]]:
     """Базовые визиты — только visits_*.csv.gz верхнего уровня (без backfill)."""
     rows: list[dict[str, str]] = []
@@ -523,7 +632,7 @@ def _parse_backfill_int(raw: str | None) -> int | None:
         return None
 
 
-def _parse_backfill_row(row: dict[str, str]) -> dict[str, Any] | None:
+def _parse_backfill_row(row: dict[str, str], region_field: str) -> dict[str, Any] | None:
     """Строка backfill (ym:s:* новые поля) -> канонические поля по visit_id."""
     visit_id = (row.get("ym:s:visitID") or "").strip()
     if not visit_id:
@@ -548,11 +657,13 @@ def _parse_backfill_row(row: dict[str, str]) -> dict[str, Any] | None:
         "screen_height": height,
         "screen_resolution": resolution,
         "region_country": _s("ym:s:regionCountry"),
-        "region_city": _s("ym:s:regionCity"),
+        "region_city": _s(region_field),
     }
 
 
-def _read_metrika_backfill(metrika_dir: Path) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+def _read_metrika_backfill(
+    metrika_dir: Path, region_field: str,
+) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
     """Прочитать backfill/visits_backfill_*.csv.gz в {visit_id: поля} + статистику.
 
     Дедуп ключа детерминированный: файлы и строки обходятся в устойчивом порядке
@@ -567,7 +678,7 @@ def _read_metrika_backfill(metrika_dir: Path) -> tuple[dict[str, dict[str, Any]]
         for path in sorted(backfill_dir.glob("visits_backfill_*.csv.gz")):
             with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
                 for row in csv.DictReader(fh, delimiter="\t"):
-                    parsed = _parse_backfill_row(row)
+                    parsed = _parse_backfill_row(row, region_field)
                     if parsed is None:
                         continue
                     total += 1
@@ -578,7 +689,9 @@ def _read_metrika_backfill(metrika_dir: Path) -> tuple[dict[str, dict[str, Any]]
     return by_visit, {"backfill_rows": total, "backfill_dedup_dropped": dedup_dropped}
 
 
-def _join_backfill(df: pd.DataFrame, metrika_dir: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+def _join_backfill(
+    df: pd.DataFrame, metrika_dir: Path, region_field: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Left join базовых визитов с backfill по visit_id (число строк не растёт).
 
     Визит без backfill сохраняется (новые поля = null). Backfill-ключи, которых
@@ -609,7 +722,7 @@ def _join_backfill(df: pd.DataFrame, metrika_dir: Path) -> tuple[pd.DataFrame, d
         }
         return df, stats
 
-    by_visit, stats = _read_metrika_backfill(metrika_dir)
+    by_visit, stats = _read_metrika_backfill(metrika_dir, region_field)
     base_ids = set(df["visit_id"])
     matched = sum(1 for vid in by_visit if vid in base_ids)
     stats.update({
@@ -640,7 +753,9 @@ def _join_backfill(df: pd.DataFrame, metrika_dir: Path) -> tuple[pd.DataFrame, d
     return merged, stats
 
 
-def _parse_visit_row(row: dict[str, str], goals_cfg: dict[str, Any]) -> dict[str, Any] | None:
+def _parse_visit_row(
+    row: dict[str, str], goals_cfg: dict[str, Any], region_field: str,
+) -> dict[str, Any] | None:
     visit_id = (row.get("ym:s:visitID") or "").strip()
     if not visit_id:
         return None
@@ -670,6 +785,10 @@ def _parse_visit_row(row: dict[str, str], goals_cfg: dict[str, Any]) -> dict[str
         "date": dt.date(),
         "device": map_device(row.get("ym:s:deviceCategory")),
         "source_group": source_group,
+        # Сырой ym:s:lastsignTrafficSource — отдельно от source_group (после
+        # маппинга "undefined" неотличимо от "other"); нужен carry-forward
+        # (resolve_traffic_source, T02/T03) и QA-сверке.
+        "last_sign_traffic_source_raw": _to_optional_str(row.get("ym:s:lastsignTrafficSource")),
         "utm_source_raw": (row.get("ym:s:lastsignUTMSource") or "").strip(),
         "entry_page": normalize_entry_page(row.get("ym:s:startURL")),
         "form_open": flags["form_open"],
@@ -686,7 +805,7 @@ def _parse_visit_row(row: dict[str, str], goals_cfg: dict[str, Any]) -> dict[str
         "screen_height": height,
         "screen_resolution": resolution,
         "region_country": _s("ym:s:regionCountry"),
-        "region_city": _s("ym:s:regionCity"),
+        "region_city": _s(region_field),
     }
 
 
@@ -694,20 +813,31 @@ def _empty_backfill_stats() -> dict[str, Any]:
     return {
         "backfill_rows": 0, "backfill_dedup_dropped": 0, "base_visits": 0,
         "backfill_matched": 0, "backfill_unmatched": 0, "is_robot_available": False,
+        "traffic_source_resolve": {
+            "internal_or_undefined_total": 0, "unresolved_count": 0, "unresolved_frac": 0.0,
+        },
     }
 
 
 def build_visits(
     raw_dir: Path, config: dict[str, Any], defaults: dict[str, Any],
+    manifest_metrika_entry: dict[str, Any] | None = None,
 ) -> tuple[pd.DataFrame, bool, dict[str, Any]]:
     """data/raw/metrika_logs/ -> (визиты, utm_uncertain, статистика backfill).
 
     Базовые визиты — из visits_*.csv.gz; новые поля патча (наивная атрибуция,
     браузер/ОС/экран, гео) join-ятся из backfill/ по visit_id, не размножая строк.
+
+    ``manifest_metrika_entry`` — запись data/raw/manifest.json.sources.metrika_logs
+    (2A-patch): region_field фиксирует фактическое имя поля региона визита,
+    которое реально запрашивал extract (ym:s:regionArea, если API его принял,
+    либо откат ym:s:regionCity, если отклонил — см. _resolve_region_field).
     """
+    region_field = _resolve_region_field(manifest_metrika_entry)
     raw_rows = _read_metrika_logs_rows(raw_dir)
     goals_cfg = config.get("goals") or {}
-    parsed = [r for r in (_parse_visit_row(row, goals_cfg) for row in raw_rows) if r is not None]
+    parsed = [r for r in (_parse_visit_row(row, goals_cfg, region_field) for row in raw_rows)
+              if r is not None]
     if not parsed:
         return pd.DataFrame(), False, _empty_backfill_stats()
 
@@ -721,8 +851,17 @@ def build_visits(
     df["source_final"] = source_final
     df["is_ad"] = df["source_final"] == "ad"
 
-    df, backfill_stats = _join_backfill(df, raw_dir)
-    return df, utm_uncertain, backfill_stats
+    df, backfill_stats = _join_backfill(df, raw_dir, region_field)
+
+    lookback_days = int(
+        ((defaults or {}).get("transform") or {}).get("traffic_resolve_lookback_days", 30)
+    )
+    date_from, _date_to = extract_common.resolve_window(config, defaults)
+    lookback_cutoff = date_from - timedelta(days=lookback_days)
+    df = resolve_traffic_source(df, lookback_cutoff=lookback_cutoff)
+    stats = {**backfill_stats, "traffic_source_resolve": compute_traffic_resolve_stats(df)}
+
+    return df, utm_uncertain, stats
 
 
 # ═══════════════════════════ Чтение сырья: costs / direct ═══════════════════
@@ -794,9 +933,15 @@ _MICROS_PER_RUB = 1_000_000
 
 
 def _parse_cost(raw: Any) -> tuple[int, float]:
-    """Cost-поле из TSV Директа -> (cost_raw_micros: int, cost_normalized_rub: float).
+    """Cost-поле из TSV Директа -> (cost_raw_micros: int, cost_rub: float).
 
+    cost_rub — ТОЛЬКО валютная конверсия (микрорубли -> рубли), НЕ НДС-база.
     Единственное место деления микрорублей — все билдеры используют только его.
+
+    Не путать с cost_normalized (отдельное поле в direct_queries/campaigns/geo,
+    заполняется в compute-слое после ответа на Q01, см. SCHEMAS и
+    docs/implementation_status.md, задача 4X-direct-normalize-2) — до этой
+    задачи оба понятия ошибочно делили одно имя "cost_normalized".
     """
     micros = int(float(raw)) if raw not in (None, "", "nan") else 0
     return micros, round(micros / _MICROS_PER_RUB, 6)
@@ -824,7 +969,10 @@ def build_direct_queries(
 
     Читает из direct/queries/ (новый помесячный формат), если папка есть;
     иначе откатывается на legacy search_query_performance.tsv.
-    cost_raw хранится как int64 микрорублей; cost_normalized = float64 рублей.
+    cost_raw хранится как int64 микрорублей; cost_rub = float64 рублей
+    (валютная конверсия, считается всегда). cost_normalized = null и
+    vat_basis_applied = False на этом слое — НДС-нормализацию применяет
+    compute после ответа на Q01 (см. SCHEMAS["direct_queries"]).
     """
     queries_dir = direct_dir / "queries"
     if queries_dir.exists() and list(queries_dir.glob("*.tsv")):
@@ -837,7 +985,7 @@ def build_direct_queries(
 
     rows: list[dict[str, Any]] = []
     for row in raw_rows:
-        cost_raw, cost_normalized = _parse_cost(row.get("Cost"))
+        cost_raw, cost_rub = _parse_cost(row.get("Cost"))
         rows.append({
             "date": _parse_date_field(row.get("Date")),
             "campaign_id": _to_optional_str(row.get("CampaignId")),
@@ -847,7 +995,9 @@ def build_direct_queries(
             "match_type": _to_optional_str(row.get("MatchType")),
             "device": _to_optional_str(row.get("Device")),
             "cost_raw": cost_raw,
-            "cost_normalized": cost_normalized,
+            "cost_rub": cost_rub,
+            "cost_normalized": None,
+            "vat_basis_applied": False,
             "clicks": _parse_int_field(row.get("Clicks")),
             "impressions": _parse_int_field(row.get("Impressions")),
             "conversions_all": _parse_int_field(row.get("Conversions")),
@@ -870,7 +1020,9 @@ def build_direct_campaigns(
 ) -> pd.DataFrame:
     """CAMPAIGN_PERFORMANCE_REPORT -> direct_campaigns.
 
-    Читает из direct/campaigns/ (новый помесячный формат).
+    Читает из direct/campaigns/ (новый помесячный формат). cost_rub —
+    валютная конверсия (считается всегда); cost_normalized/vat_basis_applied
+    заполняются в compute после Q01 (см. build_direct_queries).
     """
     campaign_dir = direct_dir / "campaigns"
     raw_rows = _read_tsv_dir(campaign_dir)
@@ -879,14 +1031,16 @@ def build_direct_campaigns(
 
     rows: list[dict[str, Any]] = []
     for row in raw_rows:
-        cost_raw, cost_normalized = _parse_cost(row.get("Cost"))
+        cost_raw, cost_rub = _parse_cost(row.get("Cost"))
         rows.append({
             "date": _parse_date_field(row.get("Date")),
             "campaign_id": _to_optional_str(row.get("CampaignId")),
             "campaign_name": _to_optional_str(row.get("CampaignName")),
             "device": _to_optional_str(row.get("Device")),
             "cost_raw": cost_raw,
-            "cost_normalized": cost_normalized,
+            "cost_rub": cost_rub,
+            "cost_normalized": None,
+            "vat_basis_applied": False,
             "clicks": _parse_int_field(row.get("Clicks")),
             "impressions": _parse_int_field(row.get("Impressions")),
             "conversions_all": _parse_int_field(row.get("Conversions")),
@@ -908,7 +1062,9 @@ def build_direct_geo(
 ) -> pd.DataFrame:
     """GEO_PERFORMANCE_REPORT -> direct_geo.
 
-    Читает из direct/geo/ (новый помесячный формат).
+    Читает из direct/geo/ (новый помесячный формат). cost_rub — валютная
+    конверсия (считается всегда); cost_normalized/vat_basis_applied
+    заполняются в compute после Q01 (см. build_direct_queries).
     """
     geo_dir = direct_dir / "geo"
     raw_rows = _read_tsv_dir(geo_dir)
@@ -917,7 +1073,7 @@ def build_direct_geo(
 
     rows: list[dict[str, Any]] = []
     for row in raw_rows:
-        cost_raw, cost_normalized = _parse_cost(row.get("Cost"))
+        cost_raw, cost_rub = _parse_cost(row.get("Cost"))
         rows.append({
             "date": _parse_date_field(row.get("Date")),
             "campaign_id": _to_optional_str(row.get("CampaignId")),
@@ -926,7 +1082,9 @@ def build_direct_geo(
             "location_of_presence_name": _to_optional_str(row.get("LocationOfPresenceName")),
             "device": _to_optional_str(row.get("Device")),
             "cost_raw": cost_raw,
-            "cost_normalized": cost_normalized,
+            "cost_rub": cost_rub,
+            "cost_normalized": None,
+            "vat_basis_applied": False,
             "clicks": _parse_int_field(row.get("Clicks")),
             "impressions": _parse_int_field(row.get("Impressions")),
             "conversions_all": _parse_int_field(row.get("Conversions")),
@@ -941,6 +1099,74 @@ def build_direct_geo(
         df = _join_goal_convs(df, geo_dir / "goals", goal_ids, key_cols)
 
     return df
+
+
+def build_direct_placements(direct_dir: Path) -> pd.DataFrame:
+    """placements/placement_performance.tsv -> direct_placements.
+
+    PLACEMENT_FIELDS (см. src.extract.direct.PLACEMENT_FIELDS) не содержит
+    Date/Impressions — отчёт агрегирован за весь период выгрузки, без
+    разбивки по дням. cost_rub — валютная конверсия (считается всегда);
+    cost_normalized/vat_basis_applied заполняются в compute после Q01
+    (см. build_direct_queries) — тот же контракт, что и у queries/campaigns/geo.
+    """
+    path = direct_dir / "placements" / "placement_performance.tsv"
+    raw_rows = _read_tsv(path)
+    if not raw_rows:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        cost_raw, cost_rub = _parse_cost(row.get("Cost"))
+        rows.append({
+            "placement": _to_optional_str(row.get("Placement")),
+            "ad_network_type": _to_optional_str(row.get("AdNetworkType")),
+            "campaign_id": _to_optional_str(row.get("CampaignId")),
+            "cost_raw": cost_raw,
+            "cost_rub": cost_rub,
+            "cost_normalized": None,
+            "vat_basis_applied": False,
+            "clicks": _parse_int_field(row.get("Clicks")),
+            "conversions_all": _parse_int_field(row.get("Conversions")),
+        })
+    return pd.DataFrame(rows)
+
+
+def build_direct_geo_monthly(direct_dir: Path) -> pd.DataFrame:
+    """direct/geo/????-??.tsv (помесячные чанки) -> geo с явной колонкой month.
+
+    Отдельная таблица от direct_geo (та же исходная выгрузка, но там месяц не
+    зафиксирован явной колонкой) — читает КАЖДЫЙ месячный файл по отдельности,
+    month берётся из имени файла-чанка (YYYY-MM). Исходные помесячные TSV не
+    изменяются и не удаляются (только чтение). cost_rub/cost_normalized/
+    vat_basis_applied — тот же контракт, что у build_direct_queries.
+    """
+    geo_dir = direct_dir / "geo"
+    if not geo_dir.exists():
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for path in sorted(geo_dir.glob("????-??.tsv")):
+        month = path.stem
+        for row in _read_tsv(path):
+            cost_raw, cost_rub = _parse_cost(row.get("Cost"))
+            rows.append({
+                "month": month,
+                "date": _parse_date_field(row.get("Date")),
+                "campaign_id": _to_optional_str(row.get("CampaignId")),
+                "campaign_name": _to_optional_str(row.get("CampaignName")),
+                "location_of_presence_id": _to_optional_str(row.get("LocationOfPresenceId")),
+                "location_of_presence_name": _to_optional_str(row.get("LocationOfPresenceName")),
+                "device": _to_optional_str(row.get("Device")),
+                "cost_raw": cost_raw,
+                "cost_rub": cost_rub,
+                "cost_normalized": None,
+                "vat_basis_applied": False,
+                "clicks": _parse_int_field(row.get("Clicks")),
+                "impressions": _parse_int_field(row.get("Impressions")),
+                "conversions_all": _parse_int_field(row.get("Conversions")),
+            })
+    return pd.DataFrame(rows)
 
 
 def _build_goal_frame(goal_dir: Path, conv_col_name: str = "conversions") -> pd.DataFrame:
@@ -985,7 +1211,9 @@ def _join_goal_convs(
 
     Отсутствующая строка в goal-отчёте -> 0 (не null).
     Если ключ в base_df не уникален — raise (умножение строк расхода недопустимо).
-    Проверяет сумму cost_normalized до и после джойна.
+    Проверяет сумму cost_rub до и после джойна (cost_normalized на этом слое
+    всегда null — сравнивать его сумму бессмысленно, реальная валютная
+    величина, которую нельзя терять/множить джойном — cost_rub).
     """
     key_subset = [c for c in key_cols if c in base_df.columns]
     if not base_df.empty and base_df.duplicated(subset=key_subset).any():
@@ -995,7 +1223,7 @@ def _join_goal_convs(
             f"Первые дубликаты: {dup_sample[key_subset].to_dict('records')}"
         )
 
-    cost_before = float(base_df["cost_normalized"].sum()) if "cost_normalized" in base_df.columns else 0.0
+    cost_before = float(base_df["cost_rub"].sum()) if "cost_rub" in base_df.columns else 0.0
     result = base_df.copy()
 
     for goal_id in goal_ids:
@@ -1022,12 +1250,12 @@ def _join_goal_convs(
         )
         result[col] = result[col].fillna(0).astype("Int64")
 
-    # Инвариант: сумма cost_normalized не должна измениться.
-    if "cost_normalized" in result.columns:
-        cost_after = float(result["cost_normalized"].sum())
+    # Инвариант: сумма cost_rub не должна измениться.
+    if "cost_rub" in result.columns:
+        cost_after = float(result["cost_rub"].sum())
         if abs(cost_before - cost_after) > 0.01:
             raise ValueError(
-                f"cost_normalized изменился после джойна с целями: "
+                f"cost_rub изменился после джойна с целями: "
                 f"{cost_before:.4f} → {cost_after:.4f}. "
                 "Возможно, ключ в goal-отчёте не уникален."
             )
@@ -1281,6 +1509,10 @@ SCHEMAS: dict[str, dict[str, str]] = {
         # is_robot: источник visits его не отдаёт (D11) -> nullable, всегда null,
         # НИКОГДА не false; недоступность фиксируется в flags.metrika_backfill.
         "is_robot": "bool",
+        # T02/T03: carry-forward источника для internal/undefined (resolve_traffic_source).
+        "last_sign_traffic_source_raw": "string",
+        "source_group_resolved": "string",
+        "traffic_source_resolved": "bool",
     },
     "costs": {
         "date": "date", "source_tag": "string", "campaign_id": "string",
@@ -1289,18 +1521,25 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "clicks": "int", "impressions": "int",
     },
     "direct_queries": {
+        # cost_raw — микрорубли (int64), cost_rub — валютная конверсия (float64,
+        # cost_raw/1_000_000, считается всегда). cost_normalized — НДС-нормализация,
+        # null до ответа на Q01 (заполняется в compute); vat_basis_applied — флаг,
+        # применён ли Q01 к этой строке. Не путать cost_rub с cost_normalized
+        # (см. _parse_cost, задача 4X-direct-normalize-2).
         "date": "date",
         "campaign_id": "string", "campaign_name": "string",
         "ad_group_id": "string", "query": "string",
         "match_type": "string", "device": "string",
-        "cost_raw": "int", "cost_normalized": "float",
+        "cost_raw": "int", "cost_rub": "float",
+        "cost_normalized": "float", "vat_basis_applied": "bool",
         "clicks": "int", "impressions": "int", "conversions_all": "int",
         # goal_conv_<id> колонки добавляются динамически через _write_direct_table
     },
     "direct_campaigns": {
         "date": "date",
         "campaign_id": "string", "campaign_name": "string", "device": "string",
-        "cost_raw": "int", "cost_normalized": "float",
+        "cost_raw": "int", "cost_rub": "float",
+        "cost_normalized": "float", "vat_basis_applied": "bool",
         "clicks": "int", "impressions": "int", "conversions_all": "int",
     },
     "direct_geo": {
@@ -1308,7 +1547,25 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "campaign_id": "string", "campaign_name": "string",
         "location_of_presence_id": "string", "location_of_presence_name": "string",
         "device": "string",
-        "cost_raw": "int", "cost_normalized": "float",
+        "cost_raw": "int", "cost_rub": "float",
+        "cost_normalized": "float", "vat_basis_applied": "bool",
+        "clicks": "int", "impressions": "int", "conversions_all": "int",
+    },
+    "direct_placements": {
+        "placement": "string", "ad_network_type": "string", "campaign_id": "string",
+        "cost_raw": "int", "cost_rub": "float",
+        "cost_normalized": "float", "vat_basis_applied": "bool",
+        "clicks": "int", "conversions_all": "int",
+    },
+    "geo": {
+        # Отдельная от direct_geo таблица: та же исходная выгрузка, но с явной
+        # колонкой month (см. build_direct_geo_monthly, задача 4X-direct-normalize).
+        "month": "string", "date": "date",
+        "campaign_id": "string", "campaign_name": "string",
+        "location_of_presence_id": "string", "location_of_presence_name": "string",
+        "device": "string",
+        "cost_raw": "int", "cost_rub": "float",
+        "cost_normalized": "float", "vat_basis_applied": "bool",
         "clicks": "int", "impressions": "int", "conversions_all": "int",
     },
     "campaign_strategies": {
@@ -1412,12 +1669,15 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
 
     if "metrika_logs" in sources:
         visits_df, utm_uncertain, backfill_stats = build_visits(
-            raw_dir / "metrika_logs", config, defaults
+            raw_dir / "metrika_logs", config, defaults, sources.get("metrika_logs")
         )
         if not visits_df.empty:
             write_canonical_table(visits_df, "visits", canonical_dir / "visits.parquet")
             built.append("visits")
             flags["utm_uncertain"] = utm_uncertain
+            # Обязательный caveat T02/T03: доля internal/undefined визитов, которых
+            # carry-forward не смог восстановить (см. resolve_traffic_source).
+            flags["traffic_source_resolve"] = backfill_stats.pop("traffic_source_resolve", {})
             # Статистика склейки base+backfill (в т.ч. unmatched и недоступность
             # is_robot) — фиксируется для аналитика, а не «молча».
             flags["metrika_backfill"] = backfill_stats
@@ -1454,12 +1714,38 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
                                 canonical_dir / "direct_geo.parquet", goal_ids)
             built.append("direct_geo")
 
+        dp_df = build_direct_placements(direct_dir)
+        if not dp_df.empty:
+            write_canonical_table(
+                dp_df, "direct_placements", canonical_dir / "direct_placements.parquet"
+            )
+            built.append("direct_placements")
+
+        geo_monthly_df = build_direct_geo_monthly(direct_dir)
+        if not geo_monthly_df.empty:
+            write_canonical_table(geo_monthly_df, "geo", canonical_dir / "geo.parquet")
+            built.append("geo")
+
         cs_df = build_campaign_strategies(direct_dir)
         if not cs_df.empty:
             write_canonical_table(
                 cs_df, "campaign_strategies", canonical_dir / "campaign_strategies.parquet"
             )
             built.append("campaign_strategies")
+
+        # ad_texts: активные (State=="ACTIVE") -> canonical/ad_texts.json (для
+        # будущей LLM-проверки A20-A24); остальные состояния не удаляются —
+        # пишутся отдельно в canonical/ad_texts_archived.json. Ленивый импорт —
+        # direct_normalize импортирует build_canonical на верхнем уровне, прямой
+        # импорт здесь на верхнем уровне модуля дал бы циклический импорт.
+        from . import direct_normalize as _direct_normalize
+        active_ads, archived_ads = _direct_normalize.filter_ad_texts_by_state(direct_dir)
+        if (direct_dir / "ad_texts.json").exists():
+            with (canonical_dir / "ad_texts.json").open("w", encoding="utf-8") as fh:
+                json.dump({"ads": active_ads}, fh, ensure_ascii=False, indent=2)
+            with (canonical_dir / "ad_texts_archived.json").open("w", encoding="utf-8") as fh:
+                json.dump({"ads": archived_ads}, fh, ensure_ascii=False, indent=2)
+            flags["ad_texts"] = {"active_count": len(active_ads), "archived_count": len(archived_ads)}
 
     seo_frames: list[pd.DataFrame] = []
     if "gsc" in sources:

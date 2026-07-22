@@ -167,7 +167,7 @@ def test_metrika_logs_writes_raw_and_manifest(paths):
     assert entry["schema_version"] == metrika_logs.SCHEMA_VERSION
     for new_field in ("ym:s:lastTrafficSource", "ym:s:browser", "ym:s:operatingSystem",
                       "ym:s:screenWidth", "ym:s:screenHeight",
-                      "ym:s:regionCountry", "ym:s:regionCity"):
+                      "ym:s:regionCountry", "ym:s:regionArea"):
         assert new_field in metrika_logs.VISIT_FIELDS
         assert new_field in entry["patch_fields"]
     # Наивная и last-significant модели атрибуции — ОБЕ (для T02).

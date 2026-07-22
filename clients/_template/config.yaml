@@ -92,7 +92,10 @@ compare_previous_period:
   enabled: false
   offset_months: 12       # 12 = год к году
 
-brand_terms: []       # слова бренда для классификации бренд/небренд
+brand_terms: []       # список вариантов написания бренда (разные формы, транслит);
+                       # используется compute-классификацией is_brand = regex по brand_terms
+
+crux: {enabled: true}
 
 crawl_seed_urls: []   # явные URL для обхода (высший приоритет); напр. ["/", "/booking", "/faq"]
 

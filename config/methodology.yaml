@@ -15,7 +15,15 @@
 #     outputs: [a07]                 артефакты в data/metrics/
 #     type_default: "A"              A|B|Q|A+B|A+Q — уровень проверяемости
 #     type_downgrade_if: "..."       условие пост-хок понижения типа или null
-#     type_downgraded: "B"           тип после понижения или null
+#     type_downgraded: "B"           тип после понижения или null;
+#                                    "permanent_LOW" — особое значение: ограничение
+#                                    источника ПОСТОЯННОЕ (не тарифная/временная
+#                                    деградация конкретного прогона) — захардкожено
+#                                    напрямую, БЕЗ участия type_downgrade_if (см. ниже
+#                                    и CLAUDE.md, раздел «Схема ID проверок»).
+#     downgrade_reason: "..."        человекочитаемая причина понижения (опционально,
+#                                    заполняется вместе с type_downgraded, когда
+#                                    ограничение зафиксировано фактом, а не гипотезой)
 #
 # Уровни проверяемости (type): A — автоматически из выгрузок; B — ручная проверка
 # в интерфейсе/на сайте/в Вебвизоре/замером; Q — требует факта/документа клиента;
@@ -26,6 +34,11 @@
 # берёт type_downgraded, иначе type_default. Отсутствующий флаг трактуется как
 # false. Карту деградации (type_effective, source_modes, confidence_cap) строит
 # src/pipeline/degradation.py.
+#
+# Исключение — type_downgraded: "permanent_LOW" (напр. D11): это ограничение
+# ПОСТОЯННОЕ и не зависит от manifest-флага конкретного прогона, поэтому
+# type_downgrade_if для таких записей остаётся null — понижение читается
+# напрямую по type_downgraded, а не вычисляется условно.
 #
 # Канонические таблицы, на которые ссылаются requires/optional:
 #   visits             — визиты Метрики (Logs API)
@@ -162,7 +175,8 @@ checks:
     outputs: [d11]
     type_default: "A+B"
     type_downgrade_if: null
-    type_downgraded: null
+    type_downgraded: "permanent_LOW"
+    downgrade_reason: "isRobot unavailable for this API access, verified in practice"
 
   - id: "D12"
     legacy_id: null

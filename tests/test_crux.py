@@ -18,9 +18,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import requests  # noqa: E402
+
 from src.extract import _common as C  # noqa: E402
 from src.extract import crux  # noqa: E402
 from src.pipeline import manifest as manifest_mod  # noqa: E402
+from src.pipeline import orchestrator  # noqa: E402
 
 
 # ── Тестовые дублёры ────────────────────────────────────────────────────────
@@ -149,3 +152,102 @@ def test_crux_transient_5xx_raises_source_unavailable(paths, monkeypatch):
 
     # Все MAX_ATTEMPTS попыток должны быть сделаны перед сдачей
     assert len(session.calls) == C.MAX_ATTEMPTS
+
+
+# ── Тест 4: отсутствие ключа — понятная ошибка, а не тихий пустой результат ──
+def test_crux_missing_api_key_raises_clear_error(paths):
+    """Без CRUX_API_KEY в .env extract() падает с внятным SourceUnavailable,
+    а не молча пишет пустой crux.json."""
+    session = FakeSession([])  # ни одного HTTP-вызова быть не должно
+
+    with pytest.raises(C.SourceUnavailable) as exc_info:
+        crux.extract(CONFIG, {}, paths, session=session)
+
+    assert "CRUX_API_KEY" in str(exc_info.value)
+    assert session.calls == []
+    assert not (paths.raw / "crux" / "crux.json").exists()
+
+
+# ── Тест 5: ping() — осмысленный результат ──────────────────────────────────
+def test_ping_true_with_valid_config_and_key():
+    assert crux.ping(CONFIG, ENV) is True
+
+
+def test_ping_false_without_key():
+    assert crux.ping(CONFIG, {}) is False
+
+
+def test_ping_false_without_origin():
+    config_no_origin = {"sources": {"crux": {"enabled": True, "api_key_env": "CRUX_API_KEY"}}}
+    assert crux.ping(config_no_origin, ENV) is False
+
+
+def test_ping_true_via_gsc_site_url_fallback():
+    """origin не задан явно, но есть sources.gsc.site_url — ping должен его подхватить."""
+    config = {
+        "sources": {
+            "crux": {"enabled": True, "api_key_env": "CRUX_API_KEY"},
+            "gsc": {"site_url": "https://example.com/"},
+        },
+    }
+    assert crux.ping(config, ENV) is True
+
+
+# ── Тест 6: crux.extract вызывается из основного оркестратора (полный прогон) ──
+class _OrchestratorPaths:
+    """Минимальный дублёр ClientPaths, достаточный для orchestrator.run_extract."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.config_file = root / "config.yaml"
+        self.env_file = root / ".env"
+        self.raw = root / "data" / "raw"
+
+
+def test_crux_dispatch_wired_in_orchestrator():
+    """Регрессия на карту диспетчеризации: crux не должен молча выпасть из EXTRACTORS."""
+    assert orchestrator.EXTRACTORS.get("crux") == ["crux"]
+    assert orchestrator._modules_for_source("crux", {"enabled": True}) == ["crux"]
+
+
+def test_crux_extract_called_from_orchestrator_full_run(tmp_path, monkeypatch):
+    """Полный прогон run_extract() с одним включённым источником (crux) и
+    замоканным ключом: реальный requests.Session подменяется на уровне
+    Session.request, но диспетчеризация, загрузка .env/config.yaml и запись
+    manifest — настоящие (как в проде)."""
+    root = tmp_path / "client"
+    root.mkdir()
+    (root / "config.yaml").write_text(
+        "sources:\n"
+        "  crux:\n"
+        "    enabled: true\n"
+        "    api_key_env: \"CRUX_API_KEY\"\n"
+        "    origin: \"https://example.com\"\n"
+        "    key_urls: []\n",
+        encoding="utf-8",
+    )
+    (root / ".env").write_text("CRUX_API_KEY=fake-orchestrator-key\n", encoding="utf-8")
+
+    def fake_request(self, method, url, **kwargs):
+        assert "records:queryRecord" in url
+        return FakeResponse(json_data={"record": {
+            "key": {"origin": "https://example.com"},
+            "metrics": {
+                "largest_contentful_paint": {"percentiles": {"p75": 2400}},
+            },
+        }})
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+
+    log_lines: list[str] = []
+    orchestrator.run_extract(_OrchestratorPaths(root), log_lines.append)
+
+    assert (root / "data" / "raw" / "crux" / "crux.json").exists()
+
+    entry = manifest_mod.load_manifest(root / "data" / "raw")["sources"]["crux"]
+    assert entry["cwv_field_data_available"] is True
+
+    summary = "\n".join(log_lines)
+    assert "extract[crux]: старт" in summary
+    assert "выгружено 1" in summary
+    assert "недоступно 0" in summary

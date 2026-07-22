@@ -24,3 +24,10 @@ manual_source_confidence_cap: "MED"   # ни одна проверка, чьи r
 
 crux_min_field_data: true             # если CrUX не отдал полевые данные —
                                        # находки CWV капаются в MED автоматически
+
+transform:
+  # T02/T03: carry-forward источника трафика для internal/undefined визитов
+  # (см. marketing-diagnostics-methodology-v2.md §5). Сколько дней истории
+  # клиента ДО data_window.date_from нужно для восстановления цепочки —
+  # только контекст для resolve, в отчёт/метрики эти визиты не попадают.
+  traffic_resolve_lookback_days: 30

@@ -408,7 +408,11 @@ def test_build_writes_only_tables_with_raw_source(tmp_path):
     assert dq.iloc[0]["campaign_name"] == "Поиск"
     assert str(dq.iloc[0]["date"]) == "2026-06-01"
     assert dq.iloc[0]["cost_raw"] == 2000000
-    assert dq.iloc[0]["cost_normalized"] == pytest.approx(2.0)
+    # cost_rub — валютная конверсия, считается всегда (не зависит от Q01).
+    assert dq.iloc[0]["cost_rub"] == pytest.approx(2.0)
+    # cost_normalized — НДС-нормализация; на этом слое ещё null (Q01 не применён).
+    assert pd.isna(dq.iloc[0]["cost_normalized"])
+    assert dq.iloc[0]["vat_basis_applied"] == False  # noqa: E712 — numpy bool, `is` fails
     assert dq.iloc[0]["conversions_all"] == 1
     assert dq.iloc[0]["match_type"] == "broad"
 
@@ -418,6 +422,248 @@ def test_build_writes_only_tables_with_raw_source(tmp_path):
     canonical_manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
     assert set(canonical_manifest["tables"]) == set(built)
     assert canonical_manifest["flags"]["utm_uncertain"] is False
+
+
+# ═════ direct_queries/campaigns/geo: cost_rub vs cost_normalized (Q01) ═════
+# cost_rub — валютная конверсия (cost_raw / 1_000_000), считается всегда,
+# независимо от того, получен ли ответ на Q01 (finance.vat_basis_by_source).
+# cost_normalized — НДС-нормализация; на слое transform всегда null,
+# vat_basis_applied всегда False — их заполняет compute после Q01. Не путать
+# с costs.parquet, где cost_normalized/cost_status считаются уже здесь, в
+# transform, через _vat_lookup/_apply_vat_to_rows (другая таблица, другой
+# контракт) — см. test_costs_vat_* ниже.
+
+def _write_direct_queries_fixture(direct_dir: Path) -> None:
+    queries_dir = direct_dir / "queries"
+    queries_dir.mkdir(parents=True, exist_ok=True)
+    (queries_dir / "2026-06.tsv").write_text(
+        "Date\tCampaignId\tCampaignName\tAdGroupId\tQuery\tMatchType\tDevice\t"
+        "Cost\tClicks\tImpressions\tConversions\n"
+        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t65630000\t3\t50\t1\n",
+        encoding="utf-8",
+    )
+
+
+def test_build_direct_queries_cost_rub_always_computed_cost_normalized_null(tmp_path):
+    direct_dir = tmp_path / "direct"
+    _write_direct_queries_fixture(direct_dir)
+
+    df = bc.build_direct_queries(direct_dir, None)
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["cost_raw"] == 65630000
+    assert row["cost_rub"] == pytest.approx(65.63)
+    assert pd.isna(row["cost_normalized"])
+    assert row["vat_basis_applied"] == False  # noqa: E712
+
+
+def _write_direct_campaigns_fixture(direct_dir: Path) -> None:
+    campaigns_dir = direct_dir / "campaigns"
+    campaigns_dir.mkdir(parents=True, exist_ok=True)
+    (campaigns_dir / "2026-06.tsv").write_text(
+        "Date\tCampaignId\tCampaignName\tDevice\tCost\tClicks\tImpressions\tConversions\n"
+        "2026-06-01\t1\tПоиск\tDESKTOP\t65630000\t3\t50\t1\n",
+        encoding="utf-8",
+    )
+
+
+def test_build_direct_campaigns_cost_rub_always_computed_cost_normalized_null(tmp_path):
+    direct_dir = tmp_path / "direct"
+    _write_direct_campaigns_fixture(direct_dir)
+
+    df = bc.build_direct_campaigns(direct_dir, None)
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["cost_raw"] == 65630000
+    assert row["cost_rub"] == pytest.approx(65.63)
+    assert pd.isna(row["cost_normalized"])
+    assert row["vat_basis_applied"] == False  # noqa: E712
+
+
+def _write_direct_geo_fixture(direct_dir: Path) -> None:
+    geo_dir = direct_dir / "geo"
+    geo_dir.mkdir(parents=True, exist_ok=True)
+    (geo_dir / "2026-06.tsv").write_text(
+        "Date\tCampaignId\tCampaignName\tLocationOfPresenceId\tLocationOfPresenceName\t"
+        "Device\tCost\tClicks\tImpressions\tConversions\n"
+        "2026-06-01\t1\tПоиск\t213\tМосква\tDESKTOP\t65630000\t3\t50\t1\n",
+        encoding="utf-8",
+    )
+
+
+def test_build_direct_geo_cost_rub_always_computed_cost_normalized_null(tmp_path):
+    direct_dir = tmp_path / "direct"
+    _write_direct_geo_fixture(direct_dir)
+
+    df = bc.build_direct_geo(direct_dir, None)
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert row["cost_raw"] == 65630000
+    assert row["cost_rub"] == pytest.approx(65.63)
+    assert pd.isna(row["cost_normalized"])
+    assert row["vat_basis_applied"] == False  # noqa: E712
+
+
+def test_direct_queries_parquet_schema_has_cost_rub_and_cost_normalized(tmp_path):
+    """Схема parquet: cost_rub float64 (никогда null здесь), cost_normalized
+
+    float64 (всегда null на этом слое), vat_basis_applied bool (всегда False).
+    """
+    import pyarrow.parquet as pq
+
+    direct_dir = tmp_path / "direct"
+    _write_direct_queries_fixture(direct_dir)
+    df = bc.build_direct_queries(direct_dir, None)
+
+    out_path = tmp_path / "direct_queries.parquet"
+    bc._write_direct_table(df, "direct_queries", out_path)
+
+    schema = pq.read_schema(out_path)
+    assert str(schema.field("cost_rub").type) == "double"
+    assert str(schema.field("cost_normalized").type) == "double"
+    assert str(schema.field("vat_basis_applied").type) == "bool"
+
+    written = pd.read_parquet(out_path)
+    assert written.iloc[0]["cost_rub"] == pytest.approx(65.63)
+    assert pd.isna(written.iloc[0]["cost_normalized"])
+    assert written.iloc[0]["vat_basis_applied"] == False  # noqa: E712
+
+
+def test_join_goal_convs_invariant_uses_cost_rub_not_cost_normalized(tmp_path):
+    """_join_goal_convs проверяет сумму cost_rub (реальная валютная величина);
+
+    cost_normalized всегда null на этом слое, сравнивать его сумму бессмысленно
+    и раньше приводило бы к ложному инварианту (0.0 == 0.0 всегда).
+    """
+    direct_dir = tmp_path / "direct"
+    _write_direct_queries_fixture(direct_dir)
+
+    goals_dir = direct_dir / "queries" / "goals" / "goal_10"
+    goals_dir.mkdir(parents=True, exist_ok=True)
+    (goals_dir / "2026-06.tsv").write_text(
+        "Date\tCampaignId\tCampaignName\tAdGroupId\tQuery\tMatchType\tDevice\tConversions\n"
+        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t1\n",
+        encoding="utf-8",
+    )
+
+    df = bc.build_direct_queries(
+        direct_dir, None, macro_goals=[{"id": 10}],
+    )
+    assert "goal_conv_10" in df.columns
+    assert df.iloc[0]["goal_conv_10"] == 1
+    # cost_rub не изменился джойном (иначе _join_goal_convs бросил бы ValueError).
+    assert df.iloc[0]["cost_rub"] == pytest.approx(65.63)
+
+
+# ═════════════════ build(): placements/geo-monthly/ad_texts подключены ═════
+def test_build_wires_placements_geo_monthly_and_ad_texts(tmp_path):
+    """Сквозной build() производит direct_placements.parquet/geo.parquet/
+
+    ad_texts.json+ad_texts_archived.json — не только модули существуют
+    изолированно (задача 4X-direct-wiring).
+    """
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    direct_dir = paths.raw / "direct"
+    direct_dir.mkdir(parents=True, exist_ok=True)
+
+    placements_dir = direct_dir / "placements"
+    placements_dir.mkdir(parents=True, exist_ok=True)
+    (placements_dir / "placement_performance.tsv").write_text(
+        "Placement\tAdNetworkType\tCampaignId\tCost\tClicks\tConversions\n"
+        "site.ru\tYANDEX_NETWORK\t1\t65630000\t12\t2\n",
+        encoding="utf-8",
+    )
+
+    geo_dir = direct_dir / "geo"
+    geo_dir.mkdir(parents=True, exist_ok=True)
+    (geo_dir / "2026-05.tsv").write_text(
+        "Date\tCampaignId\tCampaignName\tLocationOfPresenceId\tLocationOfPresenceName\t"
+        "Device\tCost\tClicks\tImpressions\tConversions\n"
+        "2026-05-10\t1\tПоиск\t213\tМосква\tDESKTOP\t5000000\t10\t100\t1\n",
+        encoding="utf-8",
+    )
+    (geo_dir / "2026-06.tsv").write_text(
+        "Date\tCampaignId\tCampaignName\tLocationOfPresenceId\tLocationOfPresenceName\t"
+        "Device\tCost\tClicks\tImpressions\tConversions\n"
+        "2026-06-01\t1\tПоиск\t213\tМосква\tDESKTOP\t2000000\t4\t40\t0\n",
+        encoding="utf-8",
+    )
+
+    (direct_dir / "ad_texts.json").write_text(
+        json.dumps({"ads": [
+            {"Id": 1, "CampaignId": 1, "State": "ACTIVE", "TextAd": {"Title": "A"}},
+            {"Id": 2, "CampaignId": 1, "State": "ARCHIVED", "TextAd": {"Title": "B"}},
+        ], "extensions": []}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    manifest_mod.update_source(
+        paths.raw, "direct", date_from="2026-05-01", date_to="2026-06-30",
+        rows=0, script_version="test", canonical_tables=["costs", "direct_queries"],
+    )
+
+    config = {"data_window": {"date_from": "2026-05-01", "date_to": "2026-06-30"}}
+    defaults = {"utm_undefined_threshold": 0.25}
+
+    built = bc.build(paths, config, defaults)
+
+    assert "direct_placements" in built
+    assert "geo" in built
+
+    dp = pd.read_parquet(paths.canonical / "direct_placements.parquet")
+    assert len(dp) == 1
+    assert dp.iloc[0]["cost_raw"] == 65630000
+    assert dp.iloc[0]["cost_rub"] == pytest.approx(65.63)
+    assert pd.isna(dp.iloc[0]["cost_normalized"])
+
+    geo = pd.read_parquet(paths.canonical / "geo.parquet")
+    assert len(geo) == 2
+    assert set(geo["month"]) == {"2026-05", "2026-06"}
+    # Исходные помесячные файлы geo не потеряны/не изменены.
+    assert (geo_dir / "2026-05.tsv").exists()
+    assert (geo_dir / "2026-06.tsv").exists()
+
+    active_path = paths.canonical / "ad_texts.json"
+    archived_path = paths.canonical / "ad_texts_archived.json"
+    assert active_path.exists()
+    assert archived_path.exists()
+    active_payload = json.loads(active_path.read_text(encoding="utf-8"))
+    archived_payload = json.loads(archived_path.read_text(encoding="utf-8"))
+    assert {a["Id"] for a in active_payload["ads"]} == {1}
+    assert {a["Id"] for a in archived_payload["ads"]} == {2}
+
+    canonical_manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
+    assert "direct_placements" in canonical_manifest["tables"]
+    assert "geo" in canonical_manifest["tables"]
+
+
+def test_build_no_ad_texts_source_writes_no_ad_texts_files(tmp_path):
+    """Без raw ad_texts.json — canonical ad_texts.json/ad_texts_archived.json не создаются."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    direct_dir = paths.raw / "direct"
+    queries_dir = direct_dir / "queries"
+    queries_dir.mkdir(parents=True, exist_ok=True)
+    (queries_dir / "2026-06.tsv").write_text(
+        "Date\tCampaignId\tCampaignName\tAdGroupId\tQuery\tMatchType\tDevice\t"
+        "Cost\tClicks\tImpressions\tConversions\n"
+        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t2000000\t3\t50\t1\n",
+        encoding="utf-8",
+    )
+    manifest_mod.update_source(
+        paths.raw, "direct", date_from="2026-06-01", date_to="2026-06-30",
+        rows=1, script_version="test", canonical_tables=["direct_queries"],
+    )
+
+    bc.build(paths, {"data_window": {"date_from": "2026-06-01", "date_to": "2026-06-30"}},
+              {"utm_undefined_threshold": 0.25})
+
+    assert not (paths.canonical / "ad_texts.json").exists()
+    assert not (paths.canonical / "ad_texts_archived.json").exists()
 
 
 # ═════════════════════ build_visits: склейка base + backfill ═══════════════
@@ -788,14 +1034,19 @@ def test_dedupe_new_fields_use_last_dt_row(tmp_path):
             "ym:s:screenWidth": "1920",
             "ym:s:screenHeight": "1080",
             "ym:s:regionCountry": "Russia",
-            "ym:s:regionCity": city,
+            "ym:s:regionArea": city,
         })
         lines.append("\t".join(cells[f] for f in VISIT_FIELDS))
 
     with _gzip.open(metrika / "visits_2026-06-01.csv.gz", "wt", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
-    df, _, _ = bc.build_visits(metrika, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+    # 2A-patch: имя поля региона (regionArea вместо regionCity) читается из
+    # manifest.region_field, не хардкодится — CSV выше уже написан под regionArea.
+    manifest_entry = {"region_field": "ym:s:regionArea", "region_field_verified": True}
+    df, _, _ = bc.build_visits(
+        metrika, {"goals": {}}, {"utm_undefined_threshold": 0.25}, manifest_entry,
+    )
 
     assert len(df) == 1                        # дедуп: одна строка
     v1 = df.iloc[0]
@@ -804,6 +1055,85 @@ def test_dedupe_new_fields_use_last_dt_row(tmp_path):
     assert v1["screen_resolution"] == "1920x1080"
     assert v1["os"] == "windows"
     assert v1["region_country"] == "Russia"
+
+
+def test_region_field_falls_back_to_region_city_when_not_verified(tmp_path):
+    """2A-patch: manifest.region_field_verified=false -> extract уже откатился на
+    ym:s:regionCity (API отклонил regionArea в этом прогоне) и записал именно это
+    имя в manifest.region_field. build_visits обязан прочитать факт из raw CSV
+    (колонка ym:s:regionCity реально там), а не молча дать region_city=None.
+    """
+    import gzip as _gzip
+
+    metrika = tmp_path / "metrika_logs"
+    metrika.mkdir(parents=True, exist_ok=True)
+
+    # Откат: в этом прогоне extract запрашивал ym:s:regionCity, а НЕ regionArea
+    # (см. metrika_logs._resolve_region_field) — raw CSV реально содержит regionCity,
+    # не оба поля сразу.
+    fields = [f for f in VISIT_FIELDS if f != "ym:s:regionArea"] + ["ym:s:regionCity"]
+    lines = ["\t".join(fields)]
+    cells = {f: "" for f in fields}
+    cells.update({
+        "ym:s:visitID": "v1",
+        "ym:s:clientID": "c1",
+        "ym:s:dateTime": "2026-06-01 08:00:00",
+        "ym:s:lastsignTrafficSource": "direct",
+        "ym:s:deviceCategory": "1",
+        "ym:s:startURL": "https://site.ru/",
+        "ym:s:regionCountry": "Russia",
+        "ym:s:regionCity": "Kazan",
+    })
+    lines.append("\t".join(cells[f] for f in fields))
+
+    with _gzip.open(metrika / "visits_2026-06-01.csv.gz", "wt", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    manifest_entry = {
+        "region_field": "ym:s:regionCity",
+        "region_field_verified": False,
+        "region_field_error": "Unknown field in the request: ym:s:regionArea for the source visits",
+    }
+    df, _, _ = bc.build_visits(
+        metrika, {"goals": {}}, {"utm_undefined_threshold": 0.25}, manifest_entry,
+    )
+
+    assert len(df) == 1
+    assert df.iloc[0]["region_city"] == "Kazan"   # деградация на regionCity, не None
+
+
+def test_region_field_defaults_to_region_city_without_manifest_entry(tmp_path):
+    """Manifest без записи region_field (выгрузка до 2A-patch, manifest_metrika_entry=None
+    или запись без этого ключа) -> тоже откат на исторически известное ym:s:regionCity,
+    а не пустая колонка."""
+    import gzip as _gzip
+
+    metrika = tmp_path / "metrika_logs"
+    metrika.mkdir(parents=True, exist_ok=True)
+
+    # Выгрузка до 2A-patch: raw CSV написан старым extract под regionCity.
+    fields = [f for f in VISIT_FIELDS if f != "ym:s:regionArea"] + ["ym:s:regionCity"]
+    lines = ["\t".join(fields)]
+    cells = {f: "" for f in fields}
+    cells.update({
+        "ym:s:visitID": "v1",
+        "ym:s:clientID": "c1",
+        "ym:s:dateTime": "2026-06-01 08:00:00",
+        "ym:s:lastsignTrafficSource": "direct",
+        "ym:s:deviceCategory": "1",
+        "ym:s:startURL": "https://site.ru/",
+        "ym:s:regionCountry": "Russia",
+        "ym:s:regionCity": "Kazan",
+    })
+    lines.append("\t".join(cells[f] for f in fields))
+
+    with _gzip.open(metrika / "visits_2026-06-01.csv.gz", "wt", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+    df, _, _ = bc.build_visits(metrika, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+
+    assert len(df) == 1
+    assert df.iloc[0]["region_city"] == "Kazan"
 
 
 # ═════════════════════════ costs: VAT-нормализация ═══════════════════════════

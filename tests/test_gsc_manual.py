@@ -92,6 +92,15 @@ def _queries_csv(rows: str = "") -> str:
     return header + (rows or "аренда авто,10,200,5%,3.5\nпрокат машин,5,100,5%,6.0\n")
 
 
+def _queries_csv_combined(rows: str = "") -> str:
+    """Запросы.csv комбинированного формата (contract 3A): query+page+device в одной строке."""
+    header = "Популярные запросы,Популярные страницы,Устройство,Kлики,Показы,CTR,Позиция\n"
+    return header + (rows or (
+        "аренда авто,https://pognali.rent/avto,Мобильный,10,200,5%,3.5\n"
+        "прокат машин,https://pognali.rent/prokat,ПК,5,100,5%,6.0\n"
+    ))
+
+
 def _diagram_csv(rows: str = "") -> str:
     header = "Дата,Kлики,Показы,CTR,Позиция\n"
     return header + (rows or "2025-04-01,8,150,5.3%,4.1\n2025-04-02,7,150,4.7%,4.2\n")
@@ -252,6 +261,83 @@ def test_gsc_missing_required_file_skips_month(paths):
     assert len(missing_caveats) == 1
     assert missing_caveats[0]["month"] == "2025-04"
     assert "queries" in missing_caveats[0]["missing"]
+
+
+# ── Contract 3A: комбинированный формат Запросы.csv ──────────────────────────
+
+def test_gsc_combined_dimensions_parses_page_device_from_queries_csv(paths):
+    """Комбинированный Запросы.csv (query+page+device в одной строке) — contract 3A
+    выполнен полностью: page/device реальные, incomplete_dimensions=false."""
+    d = _month_dir(paths, "2025-04")
+    _write(d, "Запросы.csv", _queries_csv_combined())
+    _write(d, "Диаграмма.csv", _diagram_csv())
+    _write(d, "Страницы.csv", _pages_csv())
+
+    result = gsc_manual.extract(CONFIG_MANUAL, {}, paths)
+
+    assert result["incomplete_dimensions"] is False
+    assert result["incomplete_dimensions_months"] == []
+    assert "2025-04" not in result["device_missing_months"]
+    assert result["combined_dimensions_by_month"]["2025-04"] is True
+    assert not any(c.get("type") == "incomplete_dimensions" for c in result["caveats"])
+
+    lines = (paths.raw / "gsc" / "gsc_2025-04.csv").read_text("utf-8").splitlines()
+    header = lines[0].split(",")
+    row = dict(zip(header, lines[1].split(",")))
+    assert row["page"] == "https://pognali.rent/avto"
+    assert row["device"] == "Мобильный"
+
+
+def test_gsc_combined_dimensions_makes_pages_file_optional(paths):
+    """Комбинированный формат делает отдельный Страницы.csv необязательным —
+    он больше не нужен, потому что page уже приходит из Запросы.csv."""
+    d = _month_dir(paths, "2025-04")
+    _write(d, "Запросы.csv", _queries_csv_combined())
+    _write(d, "Диаграмма.csv", _diagram_csv())
+    # Страницы.csv намеренно не кладём
+
+    result = gsc_manual.extract(CONFIG_MANUAL, {}, paths)
+
+    assert result["months"] == ["2025-04"]
+    assert result["incomplete_dimensions"] is False
+    assert not (paths.raw / "gsc" / "gsc_pages_2025-04.csv").exists()
+
+
+def test_gsc_legacy_format_flags_incomplete_dimensions(paths):
+    """Старый раздельный формат (только query в Запросы.csv) парсится без падения,
+    но помечается caveat'ом и флагом incomplete_dimensions=true."""
+    d = _month_dir(paths, "2025-04")
+    _write(d, "Запросы.csv", _queries_csv())  # только query, без page/device
+    _write(d, "Диаграмма.csv", _diagram_csv())
+    _write(d, "Страницы.csv", _pages_csv())
+
+    result = gsc_manual.extract(CONFIG_MANUAL, {}, paths)
+
+    assert result["months"] == ["2025-04"]
+    assert result["incomplete_dimensions"] is True
+    assert result["incomplete_dimensions_months"] == ["2025-04"]
+    assert result["combined_dimensions_by_month"]["2025-04"] is False
+
+    incomplete_caveats = [c for c in result["caveats"] if c.get("type") == "incomplete_dimensions"]
+    assert len(incomplete_caveats) == 1
+    assert incomplete_caveats[0]["month"] == "2025-04"
+
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["gsc"]
+    assert entry["incomplete_dimensions_months"] == ["2025-04"]
+    assert entry["incomplete_dimensions"] is True
+    assert any("incomplete_dimensions" in n for n in entry["notes"])
+
+
+def test_gsc_legacy_format_still_requires_pages_file(paths):
+    """Раздельный (legacy) формат без Страницы.csv по-прежнему пропускает месяц —
+    требование pages ослаблено только для комбинированного Запросы.csv."""
+    d = _month_dir(paths, "2025-04")
+    _write(d, "Запросы.csv", _queries_csv())
+    _write(d, "Диаграмма.csv", _diagram_csv())
+    # Страницы.csv не кладём
+
+    with pytest.raises(C.SourceUnavailable):
+        gsc_manual.extract(CONFIG_MANUAL, {}, paths)
 
 
 # ── Сценарий 5: два месяца ────────────────────────────────────────────────────

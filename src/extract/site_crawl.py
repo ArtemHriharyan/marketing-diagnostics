@@ -34,6 +34,7 @@ crawled_at       — ISO-8601 UTC.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -43,13 +44,27 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-SCRIPT_VERSION = "0.3.0"
+SCRIPT_VERSION = "0.4.0"
 SOURCE = "site_crawl"
 CANONICAL_TABLES: list[str] = ["pages"]
 
 DEFAULT_MAX_URLS = 30
-CRAWL_TIMEOUT_SEC = 15
+CRAWL_TIMEOUT_SEC = 15  # read-таймаут (бездействие сокета между чтениями)
+CRAWL_CONNECT_TIMEOUT_SEC = 5  # таймаут установления соединения
+CRAWL_HARD_TIMEOUT_SEC = 30  # жёсткий предел общей длительности запроса
 MAX_BFS_DEPTH = 3
+
+# Content-Type, тело которых краулеру не нужно (картинки, PDF, видео и т.п.) —
+# пропускаются без скачивания тела, снижая риск зависания на бинарных ответах.
+_SKIP_CONTENT_TYPE_PREFIXES = (
+    "image/",
+    "video/",
+    "audio/",
+    "font/",
+    "application/pdf",
+    "application/zip",
+    "application/octet-stream",
+)
 
 # Колонки выходной таблицы pages — строгий контракт (3.5B/3.5C).
 PAGES_SCHEMA: list[str] = [

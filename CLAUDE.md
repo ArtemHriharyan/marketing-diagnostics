@@ -84,6 +84,12 @@
 Итоговый `type_effective`, `source_modes` и `confidence_cap` считает
 `src/pipeline/degradation.py`.
 
+**D11 — постоянное понижение (не через `type_downgrade_if`):** `ym:s:isRobot`
+недоступен для используемого доступа к Metrika Logs API. `confidence_cap`
+для D11 захардкожен в `permanent_LOW` в `config/methodology.yaml`, а не
+вычисляется условно из manifest-флага — это отличие от обычного механизма
+`type_downgrade_if`, так как ограничение не зависит от конкретного прогона.
+
 ## Гейты
 
 - `report` **запрещено** запускать, если `findings/approved/` пуст. Аналитик

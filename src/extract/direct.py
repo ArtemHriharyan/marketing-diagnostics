@@ -50,6 +50,20 @@
     macro_goals_configured — True если config.sources.direct.macro_goals не пуст.
     period_logs — список {date_from, date_to, rows} по каждому чанку каждого отчёта
         (для диагностики расхождений типа «UI vs export» — step0 issue).
+    strategy_field_present (2A-direct-strategy-fix) — True если хотя бы одна
+        кампания в ответе campaigns.get вернула вложенное поле
+        TextCampaign.BiddingStrategy (запрошено через отдельный параметр
+        TextCampaignFieldNames, НЕ через верхнеуровневый FieldNames — "Strategy"
+        не входит в enum campaigns.get, подтверждено боевым error 8000 2026-07-22,
+        см. CAMPAIGNS_FIELD_NAMES_ENUM). Сырые образцы (Search/Network ->
+        BiddingStrategyType) фиксируются по факту в strategy_field_samples,
+        имя поля не угадывается.
+    statistics_field_scope (2A-direct-strategy) — период поля Statistics в
+        campaigns.get: "rolling_window" | "all_time" | "unknown". Код НЕ передаёт
+        StatisticsCrit в campaigns.get (такого параметра там нет — см.
+        _fetch_strategies), поэтому сравнение «с явным периодом vs без» невозможно
+        без живого прогона с реальным токеном; до этого поле = "unknown" (не
+        угадывается, principle 5.d).
 
 ВНИМАНИЕ ПРО ДЕНЬГИ (принцип 7):
     Поле Cost в отчётах Директа приходит в МИКРОРУБЛЯХ — рубли = Cost / 1_000_000.
@@ -143,6 +157,13 @@ PLACEMENT_FIELDS = ["Placement", "AdNetworkType", "CampaignId", "Cost", "Clicks"
 # а не по текущему статусу; ARCHIVED обязателен, иначе расход остановленных
 # кампаний за прошлые месяцы потеряется.
 CAMPAIGN_STATES_ALL = ["ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"]
+
+# CAMPAIGN_FIELD_NAMES — верхнеуровневые поля campaigns.get. "Strategy" сюда НЕ
+# входит: боевой прогон 2026-07-22 подтвердил error 8000 (см.
+# clients/pognali.rent/logs/extract_20260722_012238.log:63) — API вернул полный
+# перечень допустимых значений enum, Strategy среди них нет. Список ниже —
+# ровно этот перечень (см. CAMPAIGNS_FIELD_NAMES_ENUM), без CreateTime (не
+# нужен для текущих проверок, но валиден и может быть добавлен позже).
 CAMPAIGN_FIELD_NAMES = [
     "Id", "Name", "ClientInfo", "StartDate", "EndDate", "Type",
     "Status", "State", "StatusPayment", "StatusClarification",
@@ -150,6 +171,38 @@ CAMPAIGN_FIELD_NAMES = [
     "RepresentedBy", "Notification", "BlockedIps", "ExcludedSites",
     "TimeTargeting", "TimeZone",
 ]
+
+# Enum допустимых значений верхнеуровневого FieldNames campaigns.get — взят
+# ДОСЛОВНО из текста ошибки error 8000 боевого прогона 2026-07-22 (единственный
+# надёжный источник на момент задачи 2A-direct-strategy-fix, см. лог выше).
+# Используется _validate_field_names для проверки ДО отправки запроса, чтобы
+# невалидное имя поля (опечатка, устаревшее поле вроде Strategy) не роняло
+# источник целиком повторно в будущем.
+CAMPAIGNS_FIELD_NAMES_ENUM = frozenset({
+    "BlockedIps", "ExcludedSites", "Currency", "DailyBudget", "Notification",
+    "EndDate", "Funds", "ClientInfo", "Id", "Name", "NegativeKeywords",
+    "RepresentedBy", "StartDate", "CreateTime", "Statistics", "State",
+    "Status", "StatusPayment", "StatusClarification", "SourceId",
+    "TimeTargeting", "TimeZone", "Type",
+})
+
+# BiddingStrategy запрашивается ОТДЕЛЬНО через TextCampaignFieldNames — это не
+# элемент enum верхнеуровневого FieldNames (оттуда и была ошибка 8000 со
+# "Strategy"). TEXT_CAMPAIGN — единственный тип кампаний, встречающийся у
+# клиента на данный момент. Если позже появятся кампании других типов
+# (MOBILE_APP_CAMPAIGN, CPM_BANNER_CAMPAIGN, UNIFIED_CAMPAIGN) — потребуется
+# соответствующий свой *CampaignFieldNames для каждого типа; это НЕ
+# реализовано сейчас — известное ограничение для однотипных (TEXT_CAMPAIGN)
+# клиентов, а не молчаливый пробел.
+TEXT_CAMPAIGN_FIELD_NAMES = ["BiddingStrategy"]
+
+# statistics_field_scope: период поля Statistics в campaigns.get не задокументирован
+# эмпирически, а JSON API v5 campaigns.get не принимает параметр периода —
+# StatisticsCrit нигде не передаётся (см. _fetch_strategies ниже). Определить
+# rolling_window/all_time можно только сравнением двух живых вызовов; до этого —
+# "unknown". Значение НЕ может быть null по контракту задачи 2A-direct-strategy.
+STATISTICS_FIELD_SCOPE_UNKNOWN = "unknown"
+STATISTICS_FIELD_SCOPE_VALUES = ("rolling_window", "all_time", "unknown")
 
 # Директ отдаёт ошибки JSON-API как HTTP 200 с телом {"error": {...}} — статус
 # 200 сам по себе НЕ значит успех. Разбираем error_code, чтобы падать внятно и
@@ -479,7 +532,7 @@ def _run_window_extract(
         notes.append(f"отчёт по площадкам РСЯ недоступен: {exc}")
 
     # 5. Стратегии кампаний со States=ALL (0.4 «клики vs конверсии» + D08).
-    campaigns = _fetch_strategies(session, headers)
+    campaigns = _fetch_strategies(session, headers, log=log)
     with (out_dir / "campaign_strategies.json").open("w", encoding="utf-8") as fh:
         json.dump(campaigns, fh, ensure_ascii=False, indent=2)
     archived_retrievable = _archived_retrievable(campaigns)
@@ -487,6 +540,22 @@ def _run_window_extract(
         notes.append("campaigns.get со States=ALL не вернул ни одной ARCHIVED-кампании: "
                      "это либо отсутствие архивных у клиента, либо ограничение доступа — "
                      "D08 нельзя утверждать как достоверный, см. archived_campaigns_retrievable")
+
+    # 2A-direct-strategy-fix: BiddingStrategy запрошен через TextCampaignFieldNames
+    # (не верхнеуровневый FieldNames, см. CAMPAIGNS_FIELD_NAMES_ENUM) — фиксируем
+    # факт наличия и сырую структуру, не угадывая форму вложенного объекта.
+    strategy_field_present = _strategy_field_present(campaigns)
+    strategy_field_samples = _strategy_field_samples(campaigns)
+    if not strategy_field_present:
+        notes.append("campaigns.get вернул кампании без вложенного "
+                     "TextCampaign.BiddingStrategy, хотя оно запрошено в "
+                     "TextCampaignFieldNames — либо кампании не TEXT_CAMPAIGN, либо "
+                     "поле пустое; нужна проверка на живом аккаунте, см. "
+                     "strategy_field_present")
+    # campaigns.get не принимает параметр периода (StatisticsCrit нигде не
+    # передаётся) — без живого сравнения двух вызовов период поля Statistics
+    # не определить; фиксируем как unknown, а не угадываем (2A-direct-strategy).
+    statistics_field_scope = STATISTICS_FIELD_SCOPE_UNKNOWN
 
     # CampaignIds для вторичных вызовов JSON API v5 (adgroups/ads/keywords.get
     # требуют непустой SelectionCriteria — Ids/CampaignIds/AdGroupIds, error 4001).
@@ -614,6 +683,9 @@ def _run_window_extract(
         archived_retrievable=archived_retrievable,
         feed_used=feed_used,
         macro_goals_configured=macro_goals_configured,
+        strategy_field_present=strategy_field_present,
+        strategy_field_samples=strategy_field_samples,
+        statistics_field_scope=statistics_field_scope,
         campaign_period_logs=campaign_period_logs,
         query_period_logs=query_period_logs,
         geo_period_logs=geo_period_logs,
@@ -643,6 +715,8 @@ def _run_window_extract(
         "archived_campaigns_retrievable": archived_retrievable,
         "feed_used": feed_used,
         "macro_goals_configured": macro_goals_configured,
+        "strategy_field_present": strategy_field_present,
+        "statistics_field_scope": statistics_field_scope,
         "date_from": C.fmt(date_from),
         "date_to": C.fmt(date_to),
         "canonical_tables": CANONICAL_TABLES,
@@ -938,16 +1012,94 @@ def _get_all(
     return items
 
 
-def _fetch_strategies(session, headers) -> list[dict[str, Any]]:
-    """campaigns.get со States=ALL (включая ARCHIVED) и стратегиями (D08 + 0.4)."""
+def _validate_field_names(
+    field_names: list[str], valid_names: frozenset[str], *,
+    param_name: str, context: str, log: Callable[[str], None],
+) -> list[str]:
+    """Сверить имена полей с локально сохранённым enum ДО отправки запроса.
+
+    Невалидное имя (опечатка, устаревшее поле вроде Strategy) роняло раньше
+    источник целиком: error 8000 Директа приходит одной строкой на весь
+    массив FieldNames, без указания конкретного элемента, и до этой задачи
+    вызов ничем не был обёрнут. Отфильтровываем и логируем ДО вызова API —
+    не разбираем ошибку постфактум — чтобы один невалидный элемент не блокировал
+    остальные валидные поля и не убивал источник.
+    """
+    invalid = [f for f in field_names if f not in valid_names]
+    if invalid:
+        log(f"    {context}: невалидные {param_name} отфильтрованы до запроса "
+            f"(нет в сохранённом enum, не будут отправлены): {invalid}")
+    return [f for f in field_names if f in valid_names]
+
+
+def _fetch_strategies(
+    session, headers, log: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
+    """campaigns.get со States=ALL (включая ARCHIVED) и стратегиями (D08 + 0.4).
+
+    BiddingStrategy запрашивается через TextCampaignFieldNames, а не через
+    верхнеуровневый FieldNames (там валидного поля Strategy нет — error 8000,
+    см. CAMPAIGNS_FIELD_NAMES_ENUM). TEXT_CAMPAIGN — единственный тип кампаний
+    у клиента на данный момент; для остальных типов (MOBILE_APP_CAMPAIGN,
+    CPM_BANNER_CAMPAIGN, UNIFIED_CAMPAIGN) свой *CampaignFieldNames не
+    реализован — известное ограничение (2A-direct-strategy-fix).
+    """
+    log = log or (lambda _msg: None)
+    field_names = _validate_field_names(
+        CAMPAIGN_FIELD_NAMES, CAMPAIGNS_FIELD_NAMES_ENUM,
+        param_name="FieldNames", context="campaigns.get", log=log,
+    )
     return _get_all(
         session, headers, CAMPAIGNS_URL,
         {
             "SelectionCriteria": {"States": CAMPAIGN_STATES_ALL},
-            "FieldNames": CAMPAIGN_FIELD_NAMES,
+            "FieldNames": field_names,
+            "TextCampaignFieldNames": TEXT_CAMPAIGN_FIELD_NAMES,
         },
         result_key="Campaigns", context="campaigns.get",
     )
+
+
+def _text_campaign_bidding_strategy(campaign: dict[str, Any]) -> dict[str, Any] | None:
+    """Извлечь TextCampaign.BiddingStrategy из кампании (или None, если нет).
+
+    Ответ приходит вложенным (result.Campaigns[].TextCampaign.BiddingStrategy.
+    Search/Network.BiddingStrategyType) — плоского поля Strategy на верхнем
+    уровне объекта нет и не ожидается (2A-direct-strategy-fix).
+    """
+    text_campaign = campaign.get("TextCampaign")
+    if not isinstance(text_campaign, dict):
+        return None
+    return text_campaign.get("BiddingStrategy")
+
+
+def _strategy_field_present(campaigns: list[dict[str, Any]]) -> bool:
+    """True, если хотя бы одна кампания вернула TextCampaign.BiddingStrategy.
+
+    BiddingStrategy запрошен через TextCampaignFieldNames (2A-direct-strategy-fix),
+    но API может как не вернуть его для не-TEXT_CAMPAIGN кампаний, так и не
+    вернуть вовсе — сначала проверяем факт наличия, не предполагаем его.
+    """
+    return any(_text_campaign_bidding_strategy(c) is not None for c in campaigns)
+
+
+def _strategy_field_samples(
+    campaigns: list[dict[str, Any]], limit: int = 3,
+) -> list[dict[str, Any]]:
+    """Сырые значения TextCampaign.BiddingStrategy (до limit) — реальная структура.
+
+    Не выдумываем форму объекта: в manifest пишутся фактические объекты
+    BiddingStrategy, как их вернул API (Search/Network.BiddingStrategyType),
+    чтобы аналитик/следующая задача читали факт, а не предположение.
+    """
+    samples: list[dict[str, Any]] = []
+    for c in campaigns:
+        strategy = _text_campaign_bidding_strategy(c)
+        if strategy is not None:
+            samples.append(strategy)
+        if len(samples) >= limit:
+            break
+    return samples
 
 
 def _archived_retrievable(campaigns: list[dict[str, Any]]) -> bool:
@@ -1088,6 +1240,9 @@ def _record_manifest(
     paths, source_key, date_from, date_to, rows, *,
     has_lost_is: bool, archived_retrievable: bool, feed_used: bool,
     macro_goals_configured: bool,
+    strategy_field_present: bool = False,
+    strategy_field_samples: list[dict[str, Any]] | None = None,
+    statistics_field_scope: str = STATISTICS_FIELD_SCOPE_UNKNOWN,
     campaign_period_logs: list[dict],
     query_period_logs: list[dict],
     geo_period_logs: list[dict],
@@ -1099,6 +1254,9 @@ def _record_manifest(
 ) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
+    if statistics_field_scope not in STATISTICS_FIELD_SCOPE_VALUES:
+        statistics_field_scope = STATISTICS_FIELD_SCOPE_UNKNOWN
+
     extra: dict[str, Any] = {
         # Базис расхода: НЕТТО без НДС, Cost в микрорублях (деление — в transform).
         "cost_basis": COST_BASIS,
@@ -1108,6 +1266,13 @@ def _record_manifest(
         "archived_campaigns_retrievable": archived_retrievable,
         "feed_used": feed_used,
         "geo_report_available": geo_report_available,
+        # 2A-direct-strategy: Strategy — факт наличия + сырые образцы структуры
+        # (не угадываем optimize_for и т.п.). statistics_field_scope — период
+        # поля Statistics, "unknown" до живого сравнения (campaigns.get не
+        # принимает StatisticsCrit).
+        "strategy_field_present": strategy_field_present,
+        "strategy_field_samples": strategy_field_samples or [],
+        "statistics_field_scope": statistics_field_scope,
         # Целевые конверсии.
         "macro_goals_configured": macro_goals_configured,
         # Статус по типу отчёта (изоляция ошибок).
