@@ -1,0 +1,20 @@
+[33md047032[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m, [m[1;31morigin/master[m[33m)[m save before reset
+[33md5aa955[m all extraction done once again (wordstat)
+[33me18f88e[m all extraction done once again (direct)
+[33m0f4c935[m all extraction done once again (webmaster)
+[33m1293104[m all extraction done
+[33mfa9a039[m initial commit
+[33m9e587da[m First 3 promts
+[33m3043847[m 4E — CHECKPOINT transform
+[33m3b67f48[m site и SEO canonical
+[33m9cb0f15[m 4C — canonical Direct-таблицы
+[33m704d949[m 4A — visits.parquet
+[33m4d26584[m 3.5D — CHECKPOINT crawler
+[33m8673fcc[m 3.5C — headless diff и внутренний граф
+[33mff78432[m .5B — HTTP, redirects, meta и sitemap
+[33m1c52545[m 3.5A — конфиг, лимит URL и ручные input-схемы
+[33m0204996[m 3D — CHECKPOINT источников 3
+[33m0bf8019[m 3C — CrUX
+[33md36e5b0[m 3B — Webmaster manual + API stub
+[33m0568215[m 3A — GSC manual + API stub
+[33m02c2be0[m 1D — CHECKPOINT схемы и intake

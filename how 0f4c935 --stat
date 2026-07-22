@@ -1,0 +1,14 @@
+[33mcommit d5aa95579d0250bdf2b57ecceb00e6c835944023[m
+Author: Artem <artemhriharyan@gmail.com>
+Date:   Tue Jul 21 15:31:51 2026 +0300
+
+    all extraction done once again (wordstat)
+
+ clients/_template/config.yaml                    |  11 [32m+[m[31m-[m
+ clients/_template/inputs/wordstat_stopwords.yaml |  44 [32m++[m
+ docs/implementation_status.md                    |  35 [32m++[m
+ src/extract/wordstat.py                          | 503 [32m++++++++++++++++[m[31m-------[m
+ src/extract/wordstat_config.py                   |  72 [32m++++[m
+ tests/test_wordstat.py                           | 267 [32m++++++++++++[m
+ tests/test_wordstat_config.py                    |  96 [32m+++++[m
+ 7 files changed, 867 insertions(+), 161 deletions(-)
