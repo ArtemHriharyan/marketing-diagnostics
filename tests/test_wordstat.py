@@ -1,15 +1,19 @@
-"""Тесты src/extract/wordstat.py — topRequests + dynamics (task_id WS-1).
+"""Тесты src/extract/wordstat.py — topRequests + dynamics (task_id
+wordstat-transport-cloud-v2-migration, WS-2).
 
-Полная замена прежнего месячного агрегата: старый экстрактор ходил в очередь
-отчётов Wordstat (legacy v4 Директа), новый — в Wordstat API
-(api.wordstat.yandex.net, topRequests/dynamics). Сценарии:
+Транспорт — Yandex Cloud Search API v2 (searchapi.api.cloud.yandex.net,
+Api-Key). Модель данных и отбор target_queries не менялись с WS-1 — тесты на
+эту логику (стоп-слова, дедуп, purpose/scope) перенесены как есть, только
+фикстуры HTTP переведены на v2-формат (results вместо topRequests, folderId
+в теле, count/date как protobuf-JSON). Сценарии:
     1. topRequests: нормальный ответ, пустой ответ (маска без данных).
     2. Фильтр стоп-слов: совпадение по подстроке, отсутствие ложных срабатываний.
     3. core_queries: seed-маска добавляется, даже если не в топе; дедуп работает.
-    4. dynamics: полный диапазон в один вызов на фразу, weekly-гранулярность.
-    5. HTTP 503 (квота Wordstat): retry с backoff, manifest фиксирует
-       wordstat_quota_hit=true/false и wordstat_calls_made.
-    6. Регрессия: отсутствие seeds по-прежнему падает SourceUnavailable.
+    4. dynamics: полный диапазон в один вызов на фразу, weekly-гранулярность,
+       период/даты в формате v2 (PERIOD_WEEKLY, RFC3339).
+    5. Api-Key аутентификация и folderId в каждом запросе.
+    6. Регрессия: отсутствие seeds по-прежнему падает SourceUnavailable;
+       отсутствие folder_id — тоже SourceUnavailable (обязателен в v2).
 """
 
 from __future__ import annotations
@@ -87,11 +91,11 @@ def _write_stopwords(paths, entries_yaml: str) -> None:
 
 
 NO_SLEEP = lambda _sec: None
-ENV = {"WORDSTAT_TOKEN": "fake-ws-token"}
+ENV = {"WORDSTAT_API_KEY": "fake-ws-api-key"}
 
 CONFIG = {
     "wordstat_seeds": ["аренда авто"],
-    "sources": {"wordstat": {"regions": [213], "devices": ["all"]}},
+    "sources": {"wordstat": {"regions": [213], "devices": ["all"], "folder_id": "b1gfake000folder"}},
     "top_n_gap": 2,
     "top_n_seasonality": 2,
     "data_window": {"date_from": "2026-01-01", "date_to": "2026-01-31"},
@@ -111,27 +115,33 @@ entries:
     added_at: "2026-07-21"
 """
 
+# v2 GetTopResponse: "results" (не "topRequests"), count как int64-строка
+# (protobuf JSON), плюс totalCount/associations, которые wordstat.py игнорирует.
 TOP_REQUESTS_RESPONSE = {
-    "topRequests": [
-        {"phrase": "аренда авто без водителя", "count": 100},
-        {"phrase": "аренда авто конкурент-бренд", "count": 90},   # junk
-        {"phrase": "что такое аренда авто", "count": 80},          # general
-        {"phrase": "аренда авто владивосток", "count": 70},
-    ]
+    "totalCount": "340",
+    "results": [
+        {"phrase": "аренда авто без водителя", "count": "100"},
+        {"phrase": "аренда авто конкурент-бренд", "count": "90"},   # junk
+        {"phrase": "что такое аренда авто", "count": "80"},          # general
+        {"phrase": "аренда авто владивосток", "count": "70"},
+    ],
+    "associations": [{"phrase": "прокат машин", "count": "50"}],
 }
 
+# v2 GetDynamicsResponse: "results" (не "dynamics"), date как RFC3339-Timestamp,
+# count как int64-строка.
 DYNAMICS_RESPONSE = {
-    "dynamics": [
-        {"date": "2026-01-05", "count": 10, "share": 0.01},
-        {"date": "2026-01-12", "count": 12, "share": 0.012},
+    "results": [
+        {"date": "2026-01-05T00:00:00Z", "count": "10", "share": 0.01},
+        {"date": "2026-01-12T00:00:00Z", "count": "12", "share": 0.012},
     ]
 }
 
 
 def _routes(top_requests_resp, dynamics_resp):
     return [
-        (_contains("/v1/topRequests"), lambda _n: FakeResponse(json_data=top_requests_resp)),
-        (_contains("/v1/dynamics"), lambda _n: FakeResponse(json_data=dynamics_resp)),
+        (_contains("/v2/wordstat/topRequests"), lambda _n: FakeResponse(json_data=top_requests_resp)),
+        (_contains("/v2/wordstat/dynamics"), lambda _n: FakeResponse(json_data=dynamics_resp)),
     ]
 
 
@@ -164,26 +174,34 @@ def test_extract_builds_core_queries_and_weekly_with_dedup(paths):
     assert list(both_row["purpose"]) == ["gap", "seasonality"]
     assert both_row["scope"] == "gap-specific"
 
+    # associations не участвуют в модели (не входили в контракт WS-1).
+    assert "прокат машин" not in phrases
+
     assert result["target_queries"] == len(core) == 4
     # 4 уникальные фразы x 2 недельные точки каждая.
     assert len(weekly) == 8
+    # date приведён из RFC3339-Timestamp обратно к "YYYY-MM-DD" (контракт WS-1).
     assert set(weekly["date"]) == {"2026-01-05", "2026-01-12"}
+    # count приведён из int64-строки к int.
+    assert set(weekly["count"]) == {10, 12}
 
     raw_dump = paths.raw / "wordstat" / "topRequests_raw" / "аренда_авто.json"
     assert json.loads(raw_dump.read_text("utf-8")) == TOP_REQUESTS_RESPONSE
 
     entry = manifest_mod.load_manifest(paths.raw)["sources"]["wordstat"]
     assert entry["canonical_tables"] == ["wordstat"]
-    assert entry["wordstat_quota_hit"] is False
     assert entry["wordstat_calls_made"] == 1 + 4  # 1 topRequests + 4 dynamics (по фразе)
     assert entry["wordstat_stopwords_empty"] is False
+    assert entry["api_version_used"] == "cloud_search_v2"
+    assert "отключён" in entry["migration_reason"]
+    assert entry["folder_id"] == "b1gfake000folder"
 
 
 # ── 1. topRequests пустой ответ (маска без данных) ──────────────────────────
 def test_extract_handles_empty_top_requests(paths):
     _write_stopwords(paths, STOPWORDS_YAML)
     config = {**CONFIG, "wordstat_seeds": ["маска без данных"]}
-    session = FakeSession(_routes({"topRequests": []}, DYNAMICS_RESPONSE))
+    session = FakeSession(_routes({"results": []}, DYNAMICS_RESPONSE))
 
     result = wordstat.extract(config, ENV, paths, session=session, sleeper=NO_SLEEP)
 
@@ -200,8 +218,8 @@ def test_merge_candidates_stopword_substring_and_no_false_positive():
         {"phrase": "что такое", "scope": "general", "reason": "т"},
     ]
     items = [
-        {"phrase": "аренда авто конкурент-бренд владивосток", "count": 50},  # junk по подстроке
-        {"phrase": "аренда авто владивосток", "count": 40},                   # не содержит стоп-фраз
+        {"phrase": "аренда авто конкурент-бренд владивосток", "count": "50"},  # junk по подстроке
+        {"phrase": "аренда авто владивосток", "count": "40"},                   # не содержит стоп-фраз
     ]
     target: dict = {}
     wordstat._merge_gap_candidates(target, "аренда авто", items, top_n=5, stopword_entries=entries)
@@ -210,58 +228,51 @@ def test_merge_candidates_stopword_substring_and_no_false_positive():
     assert "аренда авто владивосток" in phrases  # ложного срабатывания нет
 
 
-# ── 4. dynamics: один вызов на фразу, полный диапазон, weekly ──────────────
+# ── 4. dynamics: один вызов на фразу, полный диапазон, weekly, v2-формат ───
 def test_dynamics_called_once_per_phrase_with_full_range(paths):
     _write_stopwords(paths, STOPWORDS_YAML)
     session = FakeSession(_routes(TOP_REQUESTS_RESPONSE, DYNAMICS_RESPONSE))
 
     wordstat.extract(CONFIG, ENV, paths, session=session, sleeper=NO_SLEEP)
 
-    dyn_calls = [c for c in session.calls if "/v1/dynamics" in c[1]]
+    dyn_calls = [c for c in session.calls if "/v2/wordstat/dynamics" in c[1]]
     # 4 уникальные фразы -> ровно 4 вызова dynamics, ни один не по неделям в цикле.
     assert len(dyn_calls) == 4
     for call in dyn_calls:
         body = call[2]["json"]
-        assert body["period"] == "weekly"
-        assert body["fromDate"] == "2026-01-01"
-        assert body["toDate"] == "2026-01-31"
+        assert body["period"] == "PERIOD_WEEKLY"
+        assert body["fromDate"] == "2026-01-01T00:00:00Z"
+        assert body["toDate"] == "2026-01-31T00:00:00Z"
+        assert body["folderId"] == "b1gfake000folder"
 
 
-# ── 5. HTTP 503 (квота): retry с backoff, manifest фиксирует wordstat_quota_hit ─
-def test_quota_503_retries_and_flags_manifest(paths):
+# ── 5. Api-Key аутентификация + folderId/devices/regions в каждом запросе ──
+def test_requests_use_api_key_auth_and_v2_body_shape(paths):
     _write_stopwords(paths, STOPWORDS_YAML)
+    session = FakeSession(_routes(TOP_REQUESTS_RESPONSE, DYNAMICS_RESPONSE))
 
-    def top_requests_responder(n):
-        if n == 0:
-            return FakeResponse(status_code=503)
-        return FakeResponse(json_data=TOP_REQUESTS_RESPONSE)
+    wordstat.extract(CONFIG, ENV, paths, session=session, sleeper=NO_SLEEP)
 
-    routes = [
-        (_contains("/v1/topRequests"), top_requests_responder),
-        (_contains("/v1/dynamics"), lambda _n: FakeResponse(json_data=DYNAMICS_RESPONSE)),
-    ]
-    session = FakeSession(routes)
+    top_call = next(c for c in session.calls if "/v2/wordstat/topRequests" in c[1])
+    headers = top_call[2]["headers"]
+    assert headers["Authorization"] == "Api-Key fake-ws-api-key"
 
-    result = wordstat.extract(CONFIG, ENV, paths, session=session, sleeper=NO_SLEEP)
-
-    assert result["target_queries"] == 4
-    entry = manifest_mod.load_manifest(paths.raw)["sources"]["wordstat"]
-    assert entry["wordstat_quota_hit"] is True
-    # 1 неудачная (503, не в счётчике calls_made) + 1 успешная topRequests + 4 dynamics.
-    assert entry["wordstat_calls_made"] == 1 + 4
+    body = top_call[2]["json"]
+    assert body["folderId"] == "b1gfake000folder"
+    assert body["regions"] == ["213"]          # region ID -> строка (v2: repeated string)
+    assert body["devices"] == ["DEVICE_ALL"]   # enum-имя, не голая строка "all"
+    assert body["numPhrases"] == wordstat.TOP_REQUESTS_NUM_PHRASES
 
 
-def test_quota_503_exhausted_raises(paths):
-    _write_stopwords(paths, STOPWORDS_YAML)
-    routes = [(_contains("/v1/topRequests"), lambda _n: FakeResponse(status_code=503))]
-    session = FakeSession(routes)
-
-    with pytest.raises(C.SourceUnavailable):
-        wordstat.extract(CONFIG, ENV, paths, session=session, sleeper=NO_SLEEP)
-
-
-# ── 6. Регрессия: без seeds — SourceUnavailable (поведение не изменилось) ──
+# ── 6. Регрессия: без seeds / без folder_id — SourceUnavailable ────────────
 def test_extract_no_seeds_raises(paths):
     with pytest.raises(C.SourceUnavailable):
         wordstat.extract({"wordstat_seeds": []}, ENV, paths,
                           session=FakeSession([]), sleeper=NO_SLEEP)
+
+
+def test_extract_missing_folder_id_raises(paths):
+    _write_stopwords(paths, STOPWORDS_YAML)
+    config = {**CONFIG, "sources": {"wordstat": {"regions": [213], "devices": ["all"]}}}
+    with pytest.raises(C.SourceUnavailable):
+        wordstat.extract(config, ENV, paths, session=FakeSession([]), sleeper=NO_SLEEP)

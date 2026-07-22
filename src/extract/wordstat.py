@@ -1,13 +1,13 @@
 """Экстрактор: Яндекс Wordstat — основные запросы (topRequests) и их недельная
-динамика спроса (dynamics). Полная замена прежнего месячного агрегата (WS-1).
+динамика спроса (dynamics). Транспорт — Yandex Cloud Search API v2 (WS-2).
 
 Контракт:
     Читает   — config.wordstat_seeds (маски запросов), config.sources.wordstat
-               (regions, devices), config.top_n_gap / config.top_n_seasonality,
+               (regions, devices, folder_id), config.top_n_gap / config.top_n_seasonality,
                inputs/wordstat_stopwords.yaml (см. wordstat_config.py),
-               WORDSTAT_TOKEN, окно дат (primary_window из manifest intake).
+               WORDSTAT_API_KEY, окно дат (primary_window из manifest intake).
     Пишет    — data/raw/wordstat/topRequests_raw/<маска>.json (сырой ответ
-               topRequests как есть, по одному файлу на маску) +
+               GetTop как есть, по одному файлу на маску) +
                data/raw/wordstat/wordstat_weekly.parquet (недельные точки
                спроса по каждой отобранной фразе) +
                data/raw/wordstat/wordstat_core_queries.parquet (сами отобранные
@@ -17,49 +17,64 @@
     Деградация — опционален; без него S05/S06/S07/S26 уходят в degradation.
     LLM      — не используется.
 
-Механика (Wordstat API, https://api.wordstat.yandex.net, см. WS-1):
-    Авторизация — Authorization: Bearer <WORDSTAT_TOKEN> (не легаси v4 токен
-    Директа — это отдельный OAuth-токен именно для Wordstat API).
+Модель данных (target_queries, purpose, scope) и конфигурация (wordstat_seeds,
+top_n_gap/top_n_seasonality, wordstat_stopwords.yaml) сохранены из версии 0.3.0
+(WS-1) без изменений — эта задача (WS-2, task_id
+wordstat-transport-cloud-v2-migration) меняет только транспорт.
 
-    1. Для каждой seed-маски — POST /v1/topRequests
-       {"phrase": <маска>, "regions": [...], "devices": [...]} ->
-       {"topRequests": [{"phrase": ..., "count": ...}, ...]}.
-       Сырой ответ сохраняется как есть (топ-запросы за последние 30 дней —
-       так работает сам метод API, окно не настраивается).
+ПРИЧИНА МИГРАЦИИ: api.wordstat.yandex.net (REST v1, Bearer-токен) отключён
+Яндексом безвозвратно — подтверждено поддержкой Яндекса, это не временная
+проблема сертификата. Старый транспорт полностью удалён (мёртвый код никто не
+держит, в отличие от легаси Direct v4, который ещё формально жив).
 
-    2. Из ответа строятся два подсписка (см. _merge_gap_candidates /
-       _merge_seasonality_candidates):
-         a) gap_candidates — топ top_n_gap после исключения junk И general
-            (wordstat_config.classify) — назначение S07 (спрос без посадочной).
-         b) seasonality_candidates — сама seed-маска (безусловно, даже если её
-            нет в ответе topRequests) + топ top_n_seasonality по чистой частоте
-            с исключением только junk (general остаётся) — назначение
-            S05/S06 (сезонность) и S26 (гео-спрос).
+Механика (Yandex Cloud Search API v2 — WordstatService, см.
+https://searchapi.api.cloud.yandex.net):
+    Авторизация — Authorization: Api-Key <WORDSTAT_API_KEY> (сервисный ключ
+    Yandex Cloud; НЕ путать со старым Bearer-токеном Wordstat v1 — это другой
+    секрет). ``folderId`` обязателен в теле КАЖДОГО запроса (config.sources.
+    wordstat.folder_id) — без него API отвечает INVALID_ARGUMENT.
 
-    3. target_queries — дедуп gap_candidates + seasonality_candidates по
-       normalize(phrase) (wordstat_config.normalize). Каждая запись несёт
-       purpose (["gap"] | ["seasonality"] | ["gap","seasonality"]) и scope
-       ("junk" | "general" | "gap-specific" — junk на практике сюда не
-       попадает, т.к. вырезается из обоих подсписков раньше; "gap-specific" —
-       фраза, для которой classify() не сработал ни на junk, ни на general).
+    1. Для каждой seed-маски — POST /v2/wordstat/topRequests
+       {"phrase":.., "numPhrases":.., "regions":[<строки>], "devices":[<enum>],
+       "folderId":..} -> {"totalCount":.., "results":[{"phrase":..,"count":..}],
+       "associations":[...]}. Используется только "results" (аналог topRequests
+       из WS-1); "associations" (семантически похожие запросы) в модель не
+       включаются — это расширило бы candidate-пул за пределы контракта WS-1.
+       int64-поля (count, totalCount) сериализуются протобуфом как JSON-строки
+       — конвертируются в int в _add_candidate (уже устойчив к строкам).
+       Сырой ответ сохраняется как есть.
+
+    2-3. Отбор gap_candidates / seasonality_candidates / target_queries —
+       БЕЗ ИЗМЕНЕНИЙ, см. wordstat_config.classify() и _merge_*_candidates ниже
+       (WS-1 п.2-3).
 
     4. Для каждой уникальной фразы target_queries — ОДИН вызов POST
-       /v1/dynamics {"phrase":.., "regions":[...], "devices":[...],
-       "period":"weekly", "fromDate":.., "toDate":..} -> {"dynamics":
-       [{"date":.., "count":.., "share":..}, ...]}. Полный диапазон окна одним
-       вызовом — недельная бинуемость приходит от API, цикла по неделям нет.
+       /v2/wordstat/dynamics {"phrase":.., "period":"PERIOD_WEEKLY",
+       "fromDate":.., "toDate":.., "regions":[...], "devices":[...],
+       "folderId":..} -> {"results":[{"date":.., "count":.., "share":..}]}.
+       fromDate/toDate — google.protobuf.Timestamp, сериализуется как RFC3339
+       ("2026-01-01T00:00:00Z"); count — тоже JSON-строка. Ответ приводится к
+       прежнему контракту (date -> "YYYY-MM-DD", count -> int) в _call_dynamics.
 
-RATE LIMITS / КВОТА (жёсткие, но размер квоты не документирован заранее):
-    Транспорт (сеть, 5xx кроме 503, 429) идёт через общий C.http_request с
-    экспоненциальным бэкоффом — тот же механизм, что у Директа. HTTP 503 —
-    отдельный код: превышена дневная квота Wordstat API ("Service unavailable,
-    try again later" по документации метода). Это НЕ временный сетевой сбой,
-    поэтому 503 обрабатывается отдельным внешним циклом (_post): ждём и
-    повторяем с тем же экспоненциальным бэкоффом, а факт хотя бы одного 503 за
-    прогон и итоговое число успешных вызовов API фиксируются в manifest как
-    wordstat_quota_hit / wordstat_calls_made. Размер квоты нигде не
-    хардкодится — так фактический лимит проявляется только по итогам первого
-    боевого прогона на реальном клиенте, а не предполагается заранее.
+    ОПЕРАТОРЫ МАСОК: v2 API операторы Wordstat (!слово, +слово, [слово],
+    сравнение нескольких фраз через |) НЕ поддерживает — подтверждено
+    документацией и независимым источником при миграции (2026-07-22). Сейчас
+    wordstat_seeds по факту не использует эти операторы (обычные фразы), но
+    если в будущем кто-то добавит маску с оператором — API примет её как
+    буквальный текст фразы, без интерпретации оператора. Явно фиксируем здесь,
+    чтобы не потерялось молча.
+
+RATE LIMITS: Транспорт (сеть, 5xx, 429) идёт через общий C.http_request с
+    экспоненциальным бэкоффом — тот же механизм, что у Директа (429 уважает
+    Retry-After). Отдельного 503-цикла квоты, как в WS-1 (v1 API), больше нет:
+    он был специфичен для документированного поведения старого API ("503 =
+    дневная квота"); для v2 такое поведение нигде не подтверждено, ограничения
+    — стандартный RPS-рейтлимит Yandex Cloud, уже покрытый C.http_request.
+    Число успешных вызовов API по-прежнему фиксируется в manifest
+    (wordstat_calls_made) для прозрачности. Тарификация Wordstat в составе
+    Search API на момент миграции (2026-07-22) — бесплатная (см. описание
+    задачи); отдельного учёта стоимости в manifest не ведём, пока это не
+    изменится.
 """
 
 from __future__ import annotations
@@ -72,25 +87,35 @@ from typing import Any, Callable
 from . import _common as C
 from . import wordstat_config as WC
 
-SCRIPT_VERSION = "0.3.0"
+SCRIPT_VERSION = "0.4.0"
 SOURCE = "wordstat"
 # Будущая canonical-таблица (transform для wordstat пока не реализован, см.
 # build_canonical.py) — НЕ путать с именами сырых parquet-файлов ниже, у них
 # своя раскладка (wordstat_weekly / wordstat_core_queries).
 CANONICAL_TABLES = ["wordstat"]
 
-API_BASE_URL = "https://api.wordstat.yandex.net"
-TOP_REQUESTS_PATH = "/v1/topRequests"
-DYNAMICS_PATH = "/v1/dynamics"
-REGIONS_TREE_PATH = "/v1/getRegionsTree"  # не тратит дневную квоту — годится для ping
+API_VERSION_USED = "cloud_search_v2"
+MIGRATION_REASON = (
+    "api.wordstat.yandex.net (REST v1) отключён Яндексом безвозвратно — "
+    "подтверждено поддержкой Яндекса, не временная проблема сертификата "
+    "(task_id wordstat-transport-cloud-v2-migration, 2026-07-22)."
+)
+
+API_BASE_URL = "https://searchapi.api.cloud.yandex.net"
+TOP_REQUESTS_PATH = "/v2/wordstat/topRequests"
+DYNAMICS_PATH = "/v2/wordstat/dynamics"
+REGIONS_TREE_PATH = "/v2/wordstat/getRegionsTree"  # бесплатен — годится для ping
 
 DEFAULT_TOP_N_GAP = 15
 DEFAULT_TOP_N_SEASONALITY = 10
 DEFAULT_DEVICES = ["all"]
 
-# Внешний ретрай именно для 503 (квота) — отдельно от общего C.http_request,
-# т.к. 503 квоты не «временный сбой сети», а осмысленное ожидание окна квоты.
-QUOTA_RETRY_MAX_ATTEMPTS = 5
+# GetTopRequest.num_phrases: 1-2000 (проверено по proto WordstatService). Берём
+# максимум, чтобы сохранить прежний охват topRequests (WS-1 не ограничивал
+# кандидатов на входе — фильтрация top_n происходит уже после ответа API).
+TOP_REQUESTS_NUM_PHRASES = 2000
+
+PERIOD_WEEKLY = "PERIOD_WEEKLY"
 
 WEEKLY_FIELDS = ["phrase", "normalized_phrase", "date", "count", "share", "purpose"]
 CORE_FIELDS = [
@@ -98,27 +123,33 @@ CORE_FIELDS = [
 ]
 
 
-def _auth_headers(token: str) -> dict[str, str]:
-    """Заголовок авторизации Wordstat API. Токен нигде не логируется."""
+def _auth_headers(api_key: str) -> dict[str, str]:
+    """Заголовок авторизации Yandex Cloud Search API. Ключ нигде не логируется."""
     return {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Api-Key {api_key}",
         "Content-Type": "application/json; charset=utf-8",
     }
 
 
 def ping(config: dict[str, Any], env: dict[str, str]) -> bool:
-    """Лёгкая проверка живости WORDSTAT_TOKEN через getRegionsTree (без квоты)."""
+    """Лёгкая проверка живости WORDSTAT_API_KEY через getRegionsTree (бесплатно)."""
     import requests
 
     try:
-        token = C.get_token(env, "WORDSTAT_TOKEN", SOURCE)
+        api_key = C.get_token(env, "WORDSTAT_API_KEY", SOURCE)
     except C.AuthError:
+        return False
+    ws_cfg = (config.get("sources") or {}).get("wordstat") or {}
+    try:
+        folder_id = _folder_id(ws_cfg)
+    except C.SourceUnavailable:
         return False
     session = requests.Session()
     try:
         resp = C.http_request(
             session, "POST", API_BASE_URL + REGIONS_TREE_PATH,
-            source=SOURCE, headers=_auth_headers(token), json={}, timeout=30,
+            source=SOURCE, headers=_auth_headers(api_key),
+            json={"folderId": folder_id}, timeout=30,
         )
         C.ensure_ok(resp, SOURCE, REGIONS_TREE_PATH)
         return True
@@ -152,11 +183,12 @@ def extract(
     ws_cfg = (config.get("sources") or {}).get("wordstat") or {}
     regions = _region_ids(ws_cfg)
     devices = _device_list(ws_cfg)
+    folder_id = _folder_id(ws_cfg)
     top_n_gap = int(config.get("top_n_gap") or DEFAULT_TOP_N_GAP)
     top_n_seasonality = int(config.get("top_n_seasonality") or DEFAULT_TOP_N_SEASONALITY)
 
-    token = C.get_token(env, "WORDSTAT_TOKEN", SOURCE)
-    headers = _auth_headers(token)
+    api_key = C.get_token(env, "WORDSTAT_API_KEY", SOURCE)
+    headers = _auth_headers(api_key)
     fmt = C.resolve_raw_format(ws_cfg)
 
     stopwords_path = Path(getattr(paths, "root", None) or ".") / "inputs" / "wordstat_stopwords.yaml"
@@ -169,16 +201,18 @@ def extract(
 
     (date_from, date_to), _compare = C.resolve_windows(paths.raw, config, defaults, today=today)
 
-    quota_state = {"hit": False, "calls_made": 0}
+    calls_made = {"count": 0}
     log(f"{SOURCE}: масок {len(seeds)}, регионы {regions or 'вся Россия'}, устройства {devices}")
 
     # ── Шаги 1-3: topRequests -> target_queries (дедуп по normalize(phrase)) ──
     target_queries: dict[str, dict[str, Any]] = {}
     used_slugs: set[str] = set()
     for mask in seeds:
-        raw = _call_top_requests(session, headers, mask, regions, devices, sleeper, log, quota_state)
+        raw = _call_top_requests(
+            session, headers, mask, regions, devices, folder_id, sleeper, calls_made,
+        )
         _dump_json(_raw_dump_path(raw_top_dir, mask, used_slugs), raw)
-        items = list(raw.get("topRequests") or [])
+        items = list(raw.get("results") or [])
         _merge_gap_candidates(target_queries, mask, items, top_n_gap, stopword_entries)
         _merge_seasonality_candidates(target_queries, mask, items, top_n_seasonality, stopword_entries)
 
@@ -191,15 +225,15 @@ def extract(
     for norm_phrase, entry in target_queries.items():
         purpose = sorted(entry["purpose"])
         dyn = _call_dynamics(
-            session, headers, entry["phrase"], regions, devices,
-            date_from, date_to, sleeper, log, quota_state,
+            session, headers, entry["phrase"], regions, devices, folder_id,
+            date_from, date_to, sleeper, calls_made,
         )
-        for point in list(dyn.get("dynamics") or []):
+        for point in list(dyn.get("results") or []):
             weekly_rows.append({
                 "phrase": entry["phrase"],
                 "normalized_phrase": norm_phrase,
-                "date": point.get("date"),
-                "count": point.get("count"),
+                "date": _timestamp_to_date(point.get("date")),
+                "count": _to_int(point.get("count")),
                 "share": point.get("share"),
                 "purpose": purpose,
             })
@@ -216,13 +250,13 @@ def extract(
     C.write_table(out_dir / "wordstat_core_queries", core_rows, CORE_FIELDS, fmt)
 
     manifest = _record_manifest(
-        paths, regions, devices, date_from, date_to,
+        paths, regions, devices, folder_id, date_from, date_to,
         rows=len(weekly_rows), core_rows=len(core_rows),
-        quota_state=quota_state, stopwords_empty=stopwords_empty,
+        calls_made=calls_made["count"], stopwords_empty=stopwords_empty,
     )
     log(
         f"{SOURCE}: готово — {len(target_queries)} фраз, {len(weekly_rows)} недельных точек, "
-        f"вызовов API: {quota_state['calls_made']}, квота исчерпывалась: {quota_state['hit']}"
+        f"вызовов API: {calls_made['count']}"
     )
 
     return {
@@ -252,7 +286,27 @@ def _device_list(ws_cfg: dict[str, Any]) -> list[str]:
     return devices or list(DEFAULT_DEVICES)
 
 
-# ── Отбор target_queries (WS-1 п.2-3) ────────────────────────────────────────
+def _folder_id(ws_cfg: dict[str, Any]) -> str:
+    """folder_id из config.sources.wordstat.folder_id — обязателен в каждом
+    запросе Yandex Cloud Search API v2 (без него API отвечает INVALID_ARGUMENT).
+    """
+    folder_id = str(ws_cfg.get("folder_id") or "").strip()
+    if not folder_id:
+        raise C.SourceUnavailable(
+            SOURCE,
+            "не задан sources.wordstat.folder_id в config.yaml — обязателен "
+            "для Yandex Cloud Search API v2 (folderId в теле каждого запроса)",
+        )
+    return folder_id
+
+
+def _device_enum(device: str) -> str:
+    """Значение конфига (all|desktop|phone|tablet) -> имя enum Device в proto
+    (DEVICE_ALL|DEVICE_DESKTOP|DEVICE_PHONE|DEVICE_TABLET)."""
+    return f"DEVICE_{device.strip().upper()}"
+
+
+# ── Отбор target_queries (WS-1 п.2-3, без изменений) ─────────────────────────
 def _count_key(item: dict[str, Any]) -> int:
     """Ключ сортировки по убыванию частоты; битые/отсутствующие count — в конец."""
     try:
@@ -273,11 +327,7 @@ def _add_candidate(
     norm = WC.normalize(phrase)
     if not norm:
         return
-    count = item.get("count")
-    try:
-        count = int(count) if count is not None else None
-    except (TypeError, ValueError):
-        count = None
+    count = _to_int(item.get("count"))
 
     cls = WC.classify(phrase, stopword_entries)
     scope = cls if cls in ("junk", "general") else "gap-specific"
@@ -341,56 +391,70 @@ def _merge_seasonality_candidates(
         kept += 1
 
 
-# ── Wordstat API (topRequests / dynamics) ────────────────────────────────────
-def _call_top_requests(session, headers, phrase, regions, devices, sleeper, log, quota_state):
-    body: dict[str, Any] = {"phrase": phrase, "devices": list(devices)}
-    if regions:
-        body["regions"] = list(regions)
-    return _post(session, headers, TOP_REQUESTS_PATH, body, sleeper, log, quota_state)
-
-
-def _call_dynamics(session, headers, phrase, regions, devices, date_from, date_to,
-                    sleeper, log, quota_state):
+# ── Yandex Cloud Search API v2 — WordstatService (GetTop / GetDynamics) ──────
+def _call_top_requests(session, headers, phrase, regions, devices, folder_id, sleeper, calls_made):
     body: dict[str, Any] = {
         "phrase": phrase,
-        "devices": list(devices),
-        "period": "weekly",
-        "fromDate": C.fmt(date_from),
-        "toDate": C.fmt(date_to),
+        "numPhrases": TOP_REQUESTS_NUM_PHRASES,
+        "devices": [_device_enum(d) for d in devices],
+        "folderId": folder_id,
     }
     if regions:
-        body["regions"] = list(regions)
-    return _post(session, headers, DYNAMICS_PATH, body, sleeper, log, quota_state)
+        body["regions"] = [str(r) for r in regions]
+    return _post(session, headers, TOP_REQUESTS_PATH, body, sleeper, calls_made)
 
 
-def _post(session, headers, path, body, sleeper, log, quota_state) -> dict[str, Any]:
-    """POST с ретраями. 5xx (кроме 503)/сеть/429 — через C.http_request (как у
-    Директа). 503 — квота: отдельный внешний цикл с бэкоффом, учёт в quota_state
-    (manifest: wordstat_quota_hit / wordstat_calls_made)."""
+def _call_dynamics(session, headers, phrase, regions, devices, folder_id, date_from, date_to,
+                    sleeper, calls_made):
+    body: dict[str, Any] = {
+        "phrase": phrase,
+        "period": PERIOD_WEEKLY,
+        "fromDate": _rfc3339(date_from),
+        "toDate": _rfc3339(date_to),
+        "devices": [_device_enum(d) for d in devices],
+        "folderId": folder_id,
+    }
+    if regions:
+        body["regions"] = [str(r) for r in regions]
+    return _post(session, headers, DYNAMICS_PATH, body, sleeper, calls_made)
+
+
+def _post(session, headers, path, body, sleeper, calls_made) -> dict[str, Any]:
+    """POST с ретраями через общий C.http_request (5xx/429/сеть — как у Директа).
+
+    Отдельного цикла для квоты, в отличие от WS-1 (v1 API, 503), больше нет —
+    см. докстринг модуля."""
     url = API_BASE_URL + path
-    for attempt in range(1, QUOTA_RETRY_MAX_ATTEMPTS + 1):
-        resp = C.http_request(
-            session, "POST", url,
-            source=SOURCE, headers=headers, json=body, timeout=60,
-            retry_statuses=(500, 502, 504),  # 503 обрабатываем сами ниже
-            sleeper=sleeper,
-        )
-        if getattr(resp, "status_code", None) == 503:
-            quota_state["hit"] = True
-            if attempt >= QUOTA_RETRY_MAX_ATTEMPTS:
-                raise C.SourceUnavailable(
-                    SOURCE,
-                    f"{path}: квота Wordstat (503) не отпустила за "
-                    f"{QUOTA_RETRY_MAX_ATTEMPTS} попыток",
-                )
-            log(f"{SOURCE}: квота исчерпана (503) на {path} — пауза и повтор "
-                f"({attempt}/{QUOTA_RETRY_MAX_ATTEMPTS})")
-            sleeper(C.backoff_delay(attempt))
-            continue
-        C.ensure_ok(resp, SOURCE, path)
-        quota_state["calls_made"] += 1
-        return resp.json() or {}
-    raise C.SourceUnavailable(SOURCE, f"{path}: исчерпаны попытки")  # pragma: no cover
+    resp = C.http_request(
+        session, "POST", url,
+        source=SOURCE, headers=headers, json=body, timeout=60, sleeper=sleeper,
+    )
+    C.ensure_ok(resp, SOURCE, path)
+    calls_made["count"] += 1
+    return resp.json() or {}
+
+
+# ── Преобразование protobuf JSON (Timestamp/int64-строки) в контракт WS-1 ───
+def _rfc3339(d) -> str:
+    """date -> RFC3339 UTC-строка для google.protobuf.Timestamp ("...T00:00:00Z")."""
+    return f"{C.fmt(d)}T00:00:00Z"
+
+
+def _timestamp_to_date(value: Any) -> str | None:
+    """RFC3339-строка ("2026-01-05T00:00:00Z") -> "YYYY-MM-DD" (контракт WS-1)."""
+    if not value:
+        return None
+    return str(value).split("T", 1)[0]
+
+
+def _to_int(value: Any) -> int | None:
+    """int64 protobuf-поле (JSON-строка или число) -> int | None."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # ── Файлы ────────────────────────────────────────────────────────────────────
@@ -420,8 +484,8 @@ def _dump_json(path: Path, obj: Any) -> None:
 
 
 def _record_manifest(
-    paths, regions, devices, date_from, date_to, *,
-    rows: int, core_rows: int, quota_state: dict[str, Any], stopwords_empty: bool,
+    paths, regions, devices, folder_id, date_from, date_to, *,
+    rows: int, core_rows: int, calls_made: int, stopwords_empty: bool,
 ) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
@@ -433,9 +497,11 @@ def _record_manifest(
         extra={
             "regions": regions,
             "devices": devices,
+            "folder_id": folder_id,
             "core_query_rows": core_rows,
-            "wordstat_quota_hit": quota_state["hit"],
-            "wordstat_calls_made": quota_state["calls_made"],
+            "wordstat_calls_made": calls_made,
             "wordstat_stopwords_empty": stopwords_empty,
+            "api_version_used": API_VERSION_USED,
+            "migration_reason": MIGRATION_REASON,
         },
     )
