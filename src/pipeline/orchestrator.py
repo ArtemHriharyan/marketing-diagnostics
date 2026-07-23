@@ -483,9 +483,13 @@ def run_compute(paths: ClientPaths, log: StageLogger) -> None:
     """canonical -> data/metrics/ + degradation_report.json.
 
     Считаются только проверки, чьи requires удовлетворены. Непокрытые уходят в
-    degradation_report (см. src.pipeline.degradation).
+    degradation_report (см. src.pipeline.degradation). Диспетчеризация по
+    блокам (block0..block6) и запись metrics_summary — см. src.compute.common;
+    сами блоки пока не реализуют бизнес-проверки D/A/T/C/S (заглушки).
     """
     import json
+
+    from ..compute import common as compute_common
 
     paths.metrics.mkdir(parents=True, exist_ok=True)
     methodology = load_methodology()
@@ -505,7 +509,17 @@ def run_compute(paths: ClientPaths, log: StageLogger) -> None:
         f"compute: выполнимо {counts['runnable']}/{counts['total']} проверок, "
         f"пропущено {counts['skipped']}. degradation_report -> {out}"
     )
-    log("compute: расчёт метрик (block0..block6) — заглушка, ещё не реализован.")
+
+    dispatch_result = compute_common.dispatch_blocks(paths, defaults, report)
+    summary = compute_common.build_metrics_summary(report, dispatch_result)
+    summary_path = compute_common.write_json_atomic(
+        paths.metrics / "metrics_summary.json", summary
+    )
+
+    log("compute: расчёт метрик по блокам:")
+    for name, status in dispatch_result["block_status"].items():
+        log(f"  {name}: {status}")
+    log(f"compute: metrics_summary -> {summary_path}")
 
 
 def run_analyze(paths: ClientPaths, log: StageLogger) -> None:
