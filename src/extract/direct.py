@@ -291,6 +291,13 @@ def _auth_headers(token: str, client_login: str | None) -> dict[str, str]:
         "processingMode": "auto",
         # Расход БЕЗ НДС и в валюте кабинета (рубли), Cost — в микрорублях.
         "returnMoneyInMicros": "true",
+        # skipReportHeader истинно ломает выгрузку SEARCH_QUERY_PERFORMANCE_REPORT
+        # и CUSTOM_REPORT (геоотчёт, площадки) на боевом аккаунте — API отвечает
+        # ошибкой для этих двух типов отчёта (CAMPAIGN_PERFORMANCE_REPORT при этом
+        # отрабатывает нормально). Возвращено на "false": защита от служебной
+        # строки-названия отчёта реализована на стороне transform (_read_tsv в
+        # build_canonical.py — отбрасывает первую/последнюю строку без табуляции)
+        # и не зависит от этого заголовка API вообще.
         "skipReportHeader": "false",
         "skipReportSummaryRow": "true",
     }

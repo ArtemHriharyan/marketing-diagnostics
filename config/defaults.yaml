@@ -31,3 +31,9 @@ transform:
   # клиента ДО data_window.date_from нужно для восстановления цепочки —
   # только контекст для resolve, в отчёт/метрики эти визиты не попадают.
   traffic_resolve_lookback_days: 30
+
+  # Единый порог для GSC и Вебмастер: запросы с total_shows ниже этого
+  # значения — шум (единичные показы без статистической значимости) и
+  # отбрасываются на этапе build canonical seo_queries, чтобы не тащить
+  # его дальше в compute/analyze.
+  seo_queries_min_total_shows: 10

@@ -36,11 +36,13 @@ from typing import Any
 def filter_ad_texts_by_state(direct_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """ad_texts.json -> (active_ads, archived_ads) по полю State.
 
-    Только State=="ACTIVE" идёт в LLM-проверку текстов (A20-A24). Остальные
-    состояния (ARCHIVED, SUSPENDED, MODERATION и т.п., а также отсутствие
-    поля State вовсе) не удаляются — они возвращаются отдельным списком для
-    сохранения (см. build_canonical.build(), которая пишет оба списка в
-    canonical/ad_texts.json и canonical/ad_texts_archived.json).
+    Только State=="ON" идёт в LLM-проверку текстов (A20-A24). Допустимые
+    значения State по объекту Ad — ON/OFF/SUSPENDED/ARCHIVED (значения
+    "ACTIVE" в API не существует). Остальные состояния (OFF, SUSPENDED,
+    ARCHIVED, а также отсутствие поля State вовсе) не удаляются — они
+    возвращаются отдельным списком для сохранения (см. build_canonical.build(),
+    которая пишет оба списка в canonical/ad_texts.json и
+    canonical/ad_texts_archived.json).
     """
     path = Path(direct_dir) / "ad_texts.json"
     if not path.exists():
@@ -48,6 +50,6 @@ def filter_ad_texts_by_state(direct_dir: Path) -> tuple[list[dict[str, Any]], li
     with path.open("r", encoding="utf-8") as fh:
         payload = json.load(fh) or {}
     ads = payload.get("ads") or []
-    active = [a for a in ads if (a.get("State") or "").strip().upper() == "ACTIVE"]
-    archived = [a for a in ads if (a.get("State") or "").strip().upper() != "ACTIVE"]
+    active = [a for a in ads if (a.get("State") or "").strip().upper() == "ON"]
+    archived = [a for a in ads if (a.get("State") or "").strip().upper() != "ON"]
     return active, archived

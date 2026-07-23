@@ -61,8 +61,20 @@ class AuthError(SourceUnavailable):
     """Мёртвый или отсутствующий токен. Частный случай недоступности источника."""
 
 
-def auth_dead_message(source: str) -> str:
-    """Понятное аналитику сообщение о протухшем токене."""
+def auth_dead_message(source: str, status: int | None = None) -> str:
+    """Понятное аналитику сообщение об ошибке авторизации.
+
+    401 (UNAUTHENTICATED, ``status`` не 403) — ключ невалиден/мёртв, чинится
+    заменой в .env. 403 (PERMISSION_DENIED) — ключ валиден, но не хватает
+    прав/биллинга/роли: замена токена в .env тут не поможет, нужно проверить
+    доступ сервисного аккаунта в кабинете источника.
+    """
+    if status == 403:
+        return (
+            f"{source.upper()}: доступ запрещён (403) — ключ валиден, но не "
+            f"хватает прав. Проверь роль сервисного аккаунта/биллинг в "
+            f"кабинете {source.upper()}, замена токена в .env не поможет"
+        )
     return f"токен {source.upper()} мёртв, обнови в .env (clients/<name>/.env)"
 
 
@@ -255,7 +267,9 @@ def http_request(
     """Один HTTP-вызов с экспоненциальным бэкоффом и уважением rate limits.
 
     Политика:
-        - 401/403          -> сразу AuthError (токен мёртв, ретраить бесполезно);
+        - 401/403          -> сразу AuthError (ретраить бесполезно; 401 —
+                              токен мёртв, 403 — токен жив, но не хватает прав,
+                              см. auth_dead_message());
         - 429              -> ждём Retry-After и повторяем (в рамках max_attempts);
         - 5xx / сетевой сбой -> экспоненциальный бэкофф и повтор;
         - иначе            -> возвращаем ответ (статус проверяет вызывающий код).
@@ -280,7 +294,7 @@ def http_request(
         status = getattr(response, "status_code", None)
 
         if status in AUTH_STATUSES:
-            raise AuthError(source, auth_dead_message(source))
+            raise AuthError(source, auth_dead_message(source, status))
 
         if status == RATE_LIMIT_STATUS:
             if attempt < max_attempts:
@@ -309,7 +323,7 @@ def ensure_ok(response: Any, source: str, context: str = "") -> Any:
     """Проверить финальный статус ответа (после ретраев). 401/403 -> AuthError."""
     status = getattr(response, "status_code", None)
     if status in AUTH_STATUSES:
-        raise AuthError(source, auth_dead_message(source))
+        raise AuthError(source, auth_dead_message(source, status))
     if status is None or status >= 400:
         suffix = f" ({context})" if context else ""
         raise SourceUnavailable(source, f"HTTP {status}{suffix}")

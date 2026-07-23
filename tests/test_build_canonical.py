@@ -203,7 +203,8 @@ def test_goal_flags_marks_visit_level_achievements_and_counts_submits():
     flags = bc.goal_flags(["10", "20", "20", "99"], goals_cfg)
     assert flags == {
         "form_open": True, "form_submit": True, "call_click": False,
-        "messenger_click": False, "form_submit_count": 2,
+        "messenger_click": False, "form_open_count": 1, "form_submit_count": 2,
+        "call_click_count": 0, "messenger_click_count": 0,
     }
 
 
@@ -212,6 +213,31 @@ def test_goal_flags_no_achievements():
     flags = bc.goal_flags([], goals_cfg)
     assert flags["form_open"] is False
     assert flags["form_submit_count"] == 0
+    assert flags["form_open_count"] == 0
+    assert flags["call_click_count"] == 0
+    assert flags["messenger_click_count"] == 0
+
+
+def test_goal_flags_counts_overtrigger_symmetrically_across_all_groups():
+    """goal-flags-overtrigger-symmetry-check: переотработка не уникальна для
+    form_submit — на реальных данных Pognali form_open (51.7% визитов-хитов),
+    messenger_click (22.9%) и call_click (9.6%) тоже дают >1 срабатывание за
+    визит. Фикстура с продублированными id в разных группах проверяет, что
+    все четыре *_count считаются одинаково, без асимметрии.
+    """
+    goals_cfg = {
+        "form_open_goal_ids": [10],
+        "form_submit_goal_ids": [20],
+        "call_click_goal_ids": [30],
+        "messenger_goal_ids": [40],
+    }
+    goal_ids = ["10", "10", "10", "20", "20", "30", "30", "30", "30", "40", "40"]
+    flags = bc.goal_flags(goal_ids, goals_cfg)
+    assert flags == {
+        "form_open": True, "form_submit": True, "call_click": True,
+        "messenger_click": True, "form_open_count": 3, "form_submit_count": 2,
+        "call_click_count": 4, "messenger_click_count": 2,
+    }
 
 
 # ═════════════════════════════ normalize_entry_page ═══════════════════════
@@ -322,9 +348,13 @@ def _write_direct_fixture(raw_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Legacy flat file — используется build_costs (CAMPAIGN_PERFORMANCE_REPORT).
+    # Реалистичный формат: служебная первая строка (название отчёта + период)
+    # без табуляции перед настоящим заголовком колонок — см. _read_tsv.
     (out_dir / "campaign_performance.tsv").write_text(
+        '"campaign_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
         "CampaignId\tCampaignName\tCost\tClicks\tImpressions\tDate\n"
-        "1\tПоиск\t5000000\t10\t200\t2026-06-01\n",
+        "1\tПоиск\t5000000\t10\t200\t2026-06-01\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
 
@@ -332,16 +362,20 @@ def _write_direct_fixture(raw_dir: Path) -> None:
     queries_dir = out_dir / "queries"
     queries_dir.mkdir(parents=True, exist_ok=True)
     (queries_dir / "2026-06.tsv").write_text(
+        '"search_query_performance_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
         "Date\tCampaignId\tCampaignName\tAdGroupId\tQuery\tMatchType\tDevice\t"
         "Cost\tClicks\tImpressions\tConversions\n"
-        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t2000000\t3\t50\t1\n",
+        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t2000000\t3\t50\t1\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
 
     # Legacy файл (для smoke-тестов экстрактора, не используется transform).
     (out_dir / "search_query_performance.tsv").write_text(
+        '"search_query_performance_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
         "Query\tCampaignId\tAdGroupId\tCost\tClicks\tConversions\n"
-        "купить машину\t1\t11\t2000000\t3\t1\n",
+        "купить машину\t1\t11\t2000000\t3\t1\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
 
@@ -437,9 +471,11 @@ def _write_direct_queries_fixture(direct_dir: Path) -> None:
     queries_dir = direct_dir / "queries"
     queries_dir.mkdir(parents=True, exist_ok=True)
     (queries_dir / "2026-06.tsv").write_text(
+        '"search_query_performance_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
         "Date\tCampaignId\tCampaignName\tAdGroupId\tQuery\tMatchType\tDevice\t"
         "Cost\tClicks\tImpressions\tConversions\n"
-        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t65630000\t3\t50\t1\n",
+        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t65630000\t3\t50\t1\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
 
@@ -462,8 +498,10 @@ def _write_direct_campaigns_fixture(direct_dir: Path) -> None:
     campaigns_dir = direct_dir / "campaigns"
     campaigns_dir.mkdir(parents=True, exist_ok=True)
     (campaigns_dir / "2026-06.tsv").write_text(
+        '"campaign_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
         "Date\tCampaignId\tCampaignName\tDevice\tCost\tClicks\tImpressions\tConversions\n"
-        "2026-06-01\t1\tПоиск\tDESKTOP\t65630000\t3\t50\t1\n",
+        "2026-06-01\t1\tПоиск\tDESKTOP\t65630000\t3\t50\t1\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
 
@@ -486,9 +524,11 @@ def _write_direct_geo_fixture(direct_dir: Path) -> None:
     geo_dir = direct_dir / "geo"
     geo_dir.mkdir(parents=True, exist_ok=True)
     (geo_dir / "2026-06.tsv").write_text(
+        '"geo_performance_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
         "Date\tCampaignId\tCampaignName\tLocationOfPresenceId\tLocationOfPresenceName\t"
         "Device\tCost\tClicks\tImpressions\tConversions\n"
-        "2026-06-01\t1\tПоиск\t213\tМосква\tDESKTOP\t65630000\t3\t50\t1\n",
+        "2026-06-01\t1\tПоиск\t213\tМосква\tDESKTOP\t65630000\t3\t50\t1\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
 
@@ -505,6 +545,72 @@ def test_build_direct_geo_cost_rub_always_computed_cost_normalized_null(tmp_path
     assert row["cost_rub"] == pytest.approx(65.63)
     assert pd.isna(row["cost_normalized"])
     assert row["vat_basis_applied"] == False  # noqa: E712
+    # month — вычисляется из date, не отдельный источник правды (4H-geo-dedup)
+    assert row["month"] == "2026-06"
+
+
+# ═════ _read_tsv: служебная строка-название отчёта Директа (без табуляции) ══
+# Реальные выгрузки несут первую строку вида "campaign_2025-04_... (...)"
+# перед настоящим TSV-заголовком (см. диагностику
+# direct-campaigns-geo-empty-fields-diag) — даже при skipReportHeader=true
+# на уровне API не полагаемся на единственную точку защиты.
+def test_read_tsv_skips_stray_report_title_line(tmp_path):
+    path = tmp_path / "campaign_performance.tsv"
+    path.write_text(
+        '"campaign_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
+        "Date\tCampaignId\tCampaignName\tDevice\tCost\tClicks\tImpressions\tConversions\n"
+        "2026-06-01\t1\tПоиск\tDESKTOP\t65630000\t3\t50\t1\n",
+        encoding="utf-8",
+    )
+    rows = bc._read_tsv(path)
+    assert len(rows) == 1
+    assert rows[0]["Date"] == "2026-06-01"
+    assert rows[0]["CampaignId"] == "1"
+    assert rows[0]["Cost"] == "65630000"
+
+
+def test_read_tsv_skips_stray_footer_total_rows_line(tmp_path):
+    """Реальные выгрузки несут "Total rows: N" последней строкой (footer
+
+    без табуляции), несмотря на skipReportSummaryRow=true в extract/direct.py
+    (уже скачанное сырьё это не чинит) — должна отбрасываться так же, как
+    строка-название отчёта в начале файла.
+    """
+    path = tmp_path / "campaign_performance.tsv"
+    path.write_text(
+        '"campaign_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
+        "Date\tCampaignId\tCampaignName\tDevice\tCost\tClicks\tImpressions\tConversions\n"
+        "2026-06-01\t1\tПоиск\tDESKTOP\t65630000\t3\t50\t1\n"
+        "2026-06-02\t1\tПоиск\tMOBILE\t10000000\t1\t5\t0\n"
+        "Total rows: 2\n",
+        encoding="utf-8",
+    )
+    rows = bc._read_tsv(path)
+    assert len(rows) == 2
+    assert rows[0]["Date"] == "2026-06-01"
+    assert rows[1]["Date"] == "2026-06-02"
+    assert rows[1]["Cost"] == "10000000"
+
+
+def test_read_tsv_without_stray_title_line_still_parses(tmp_path):
+    """Файл без служебной строки (старый формат фикстур/другой источник)
+
+    не должен ломаться: первая строка с табуляцией остаётся заголовком.
+    """
+    path = tmp_path / "campaign_performance.tsv"
+    path.write_text(
+        "Date\tCampaignId\tCampaignName\tDevice\tCost\tClicks\tImpressions\tConversions\n"
+        "2026-06-01\t1\tПоиск\tDESKTOP\t65630000\t3\t50\t1\n",
+        encoding="utf-8",
+    )
+    rows = bc._read_tsv(path)
+    assert len(rows) == 1
+    assert rows[0]["Date"] == "2026-06-01"
+    assert rows[0]["CampaignId"] == "1"
+
+
+def test_read_tsv_missing_file_returns_empty():
+    assert bc._read_tsv(Path("nonexistent_dir_xyz") / "missing.tsv") == []
 
 
 def test_direct_queries_parquet_schema_has_cost_rub_and_cost_normalized(tmp_path):
@@ -544,8 +650,10 @@ def test_join_goal_convs_invariant_uses_cost_rub_not_cost_normalized(tmp_path):
     goals_dir = direct_dir / "queries" / "goals" / "goal_10"
     goals_dir.mkdir(parents=True, exist_ok=True)
     (goals_dir / "2026-06.tsv").write_text(
+        '"search_query_performance_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
         "Date\tCampaignId\tCampaignName\tAdGroupId\tQuery\tMatchType\tDevice\tConversions\n"
-        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t1\n",
+        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t1\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
 
@@ -558,12 +666,78 @@ def test_join_goal_convs_invariant_uses_cost_rub_not_cost_normalized(tmp_path):
     assert df.iloc[0]["cost_rub"] == pytest.approx(65.63)
 
 
-# ═════════════════ build(): placements/geo-monthly/ad_texts подключены ═════
-def test_build_wires_placements_geo_monthly_and_ad_texts(tmp_path):
-    """Сквозной build() производит direct_placements.parquet/geo.parquet/
+# ═════════════════════════════ build_ad_texts ═════════════════════════════
+def test_build_ad_texts_filters_by_state_on():
+    """build_ad_texts: State=ON -> ad_texts.parquet, остальные -> ad_texts_archived.parquet."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        direct_dir = Path(td)
+        (direct_dir / "ad_texts.json").write_text(
+            json.dumps({"ads": [
+                {
+                    "Id": 1, "CampaignId": 101, "AdGroupId": 1001, "Type": "text",
+                    "State": "ON", "Status": "ACCEPTED",
+                    "TextAd": {"Title": "Active Ad", "Text": "Buy now", "Href": "https://site.ru"}
+                },
+                {
+                    "Id": 2, "CampaignId": 101, "AdGroupId": 1002, "Type": "text",
+                    "State": "OFF", "Status": "ACCEPTED",
+                    "TextAd": {"Title": "Off Ad", "Text": "Old", "Href": "https://site.ru/old"}
+                },
+                {
+                    "Id": 3, "CampaignId": 101, "AdGroupId": 1003, "Type": "text",
+                    "State": "SUSPENDED", "Status": "ACCEPTED",
+                    "TextAd": {"Title": "Suspended", "Text": "Paused", "Href": "https://site.ru/pause"}
+                },
+                {
+                    "Id": 4, "CampaignId": 101, "AdGroupId": 1004, "Type": "text",
+                    "State": "ARCHIVED", "Status": "ACCEPTED",
+                    "TextAd": {"Title": "Archived", "Text": "Old", "Href": "https://site.ru/arch"}
+                },
+                {
+                    "Id": 5, "CampaignId": 101, "AdGroupId": 1005, "Type": "text",
+                    "Status": "ACCEPTED",
+                    "TextAd": {"Title": "No State", "Text": "Missing", "Href": "https://site.ru/no"}
+                },
+            ], "extensions": []}, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
-    ad_texts.json+ad_texts_archived.json — не только модули существуют
-    изолированно (задача 4X-direct-wiring).
+        active_df, archived_df = bc.build_ad_texts(direct_dir)
+
+    assert len(active_df) == 1
+    assert active_df.iloc[0]["ad_id"] == "1"
+    assert active_df.iloc[0]["state"] == "ON"
+    assert active_df.iloc[0]["title"] == "Active Ad"
+
+    assert len(archived_df) == 4
+    archived_ids = {r["ad_id"] for r in archived_df.to_dict("records")}
+    assert archived_ids == {"2", "3", "4", "5"}
+    # Проверим одну из архивных
+    off_ad = archived_df[archived_df["ad_id"] == "2"].iloc[0]
+    assert off_ad["state"] == "OFF"
+    assert off_ad["title"] == "Off Ad"
+
+
+def test_build_ad_texts_empty_source_returns_empty_dfs():
+    """Отсутствие ad_texts.json -> две пустые dataframe."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        direct_dir = Path(td)
+        active_df, archived_df = bc.build_ad_texts(direct_dir)
+        assert active_df.empty
+        assert archived_df.empty
+
+
+# ═════════════════ build(): placements/direct_geo/ad_texts подключены ══════
+def test_build_wires_placements_direct_geo_and_ad_texts(tmp_path):
+    """Сквозной build() производит direct_placements.parquet/direct_geo.parquet/
+
+    ad_texts.parquet+ad_texts_archived.parquet — не только модули существуют
+    изолированно (задача 4F-ad-texts-parquet). direct_geo консолидирует все
+    месячные чанки geo/ в одну таблицу с вычисляемой колонкой month — до
+    задачи 4H-geo-dedup эта же консолидация писалась ВТОРОЙ раз отдельным
+    geo.parquet (build_direct_geo_monthly), устранено как дублирование.
     """
     paths = _Paths(tmp_path)
     paths.raw.mkdir(parents=True, exist_ok=True)
@@ -573,29 +747,35 @@ def test_build_wires_placements_geo_monthly_and_ad_texts(tmp_path):
     placements_dir = direct_dir / "placements"
     placements_dir.mkdir(parents=True, exist_ok=True)
     (placements_dir / "placement_performance.tsv").write_text(
+        '"placement_performance_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
         "Placement\tAdNetworkType\tCampaignId\tCost\tClicks\tConversions\n"
-        "site.ru\tYANDEX_NETWORK\t1\t65630000\t12\t2\n",
+        "site.ru\tYANDEX_NETWORK\t1\t65630000\t12\t2\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
 
     geo_dir = direct_dir / "geo"
     geo_dir.mkdir(parents=True, exist_ok=True)
     (geo_dir / "2026-05.tsv").write_text(
+        '"geo_performance_2026-05_2026-05-01_2026-05-31 (2026-05-01 - 2026-05-31)"\n'
         "Date\tCampaignId\tCampaignName\tLocationOfPresenceId\tLocationOfPresenceName\t"
         "Device\tCost\tClicks\tImpressions\tConversions\n"
-        "2026-05-10\t1\tПоиск\t213\tМосква\tDESKTOP\t5000000\t10\t100\t1\n",
+        "2026-05-10\t1\tПоиск\t213\tМосква\tDESKTOP\t5000000\t10\t100\t1\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
     (geo_dir / "2026-06.tsv").write_text(
+        '"geo_performance_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
         "Date\tCampaignId\tCampaignName\tLocationOfPresenceId\tLocationOfPresenceName\t"
         "Device\tCost\tClicks\tImpressions\tConversions\n"
-        "2026-06-01\t1\tПоиск\t213\tМосква\tDESKTOP\t2000000\t4\t40\t0\n",
+        "2026-06-01\t1\tПоиск\t213\tМосква\tDESKTOP\t2000000\t4\t40\t0\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
 
     (direct_dir / "ad_texts.json").write_text(
         json.dumps({"ads": [
-            {"Id": 1, "CampaignId": 1, "State": "ACTIVE", "TextAd": {"Title": "A"}},
+            {"Id": 1, "CampaignId": 1, "State": "ON", "TextAd": {"Title": "A"}},
             {"Id": 2, "CampaignId": 1, "State": "ARCHIVED", "TextAd": {"Title": "B"}},
         ], "extensions": []}, ensure_ascii=False),
         encoding="utf-8",
@@ -612,7 +792,10 @@ def test_build_wires_placements_geo_monthly_and_ad_texts(tmp_path):
     built = bc.build(paths, config, defaults)
 
     assert "direct_placements" in built
-    assert "geo" in built
+    assert "direct_geo" in built
+    assert "geo" not in built
+    assert "ad_texts" in built
+    assert "ad_texts_archived" in built
 
     dp = pd.read_parquet(paths.canonical / "direct_placements.parquet")
     assert len(dp) == 1
@@ -620,25 +803,34 @@ def test_build_wires_placements_geo_monthly_and_ad_texts(tmp_path):
     assert dp.iloc[0]["cost_rub"] == pytest.approx(65.63)
     assert pd.isna(dp.iloc[0]["cost_normalized"])
 
-    geo = pd.read_parquet(paths.canonical / "geo.parquet")
+    geo = pd.read_parquet(paths.canonical / "direct_geo.parquet")
     assert len(geo) == 2
     assert set(geo["month"]) == {"2026-05", "2026-06"}
+    # month соответствует своей строке, а не общей выгрузке (вычислена из date).
+    assert set(geo.loc[geo["month"] == "2026-05", "date"].astype(str)) == {"2026-05-10"}
+    assert set(geo.loc[geo["month"] == "2026-06", "date"].astype(str)) == {"2026-06-01"}
     # Исходные помесячные файлы geo не потеряны/не изменены.
     assert (geo_dir / "2026-05.tsv").exists()
     assert (geo_dir / "2026-06.tsv").exists()
+    # geo.parquet больше не создаётся на выходе transform (4H-geo-dedup).
+    assert not (paths.canonical / "geo.parquet").exists()
 
-    active_path = paths.canonical / "ad_texts.json"
-    archived_path = paths.canonical / "ad_texts_archived.json"
+    # ad_texts: ON -> ad_texts.parquet, ARCHIVED -> ad_texts_archived.parquet
+    active_path = paths.canonical / "ad_texts.parquet"
+    archived_path = paths.canonical / "ad_texts_archived.parquet"
     assert active_path.exists()
     assert archived_path.exists()
-    active_payload = json.loads(active_path.read_text(encoding="utf-8"))
-    archived_payload = json.loads(archived_path.read_text(encoding="utf-8"))
-    assert {a["Id"] for a in active_payload["ads"]} == {1}
-    assert {a["Id"] for a in archived_payload["ads"]} == {2}
+    active = pd.read_parquet(active_path)
+    archived = pd.read_parquet(archived_path)
+    assert len(active) == 1 and active.iloc[0]["ad_id"] == "1"
+    assert len(archived) == 1 and archived.iloc[0]["ad_id"] == "2"
 
     canonical_manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
     assert "direct_placements" in canonical_manifest["tables"]
-    assert "geo" in canonical_manifest["tables"]
+    assert "direct_geo" in canonical_manifest["tables"]
+    assert "geo" not in canonical_manifest["tables"]
+    assert "ad_texts" in canonical_manifest["tables"]
+    assert "ad_texts_archived" in canonical_manifest["tables"]
 
 
 def test_build_no_ad_texts_source_writes_no_ad_texts_files(tmp_path):
@@ -649,9 +841,11 @@ def test_build_no_ad_texts_source_writes_no_ad_texts_files(tmp_path):
     queries_dir = direct_dir / "queries"
     queries_dir.mkdir(parents=True, exist_ok=True)
     (queries_dir / "2026-06.tsv").write_text(
+        '"search_query_performance_2026-06_2026-06-01_2026-06-30 (2026-06-01 - 2026-06-30)"\n'
         "Date\tCampaignId\tCampaignName\tAdGroupId\tQuery\tMatchType\tDevice\t"
         "Cost\tClicks\tImpressions\tConversions\n"
-        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t2000000\t3\t50\t1\n",
+        "2026-06-01\t1\tПоиск\t11\tкупить машину\tbroad\tDESKTOP\t2000000\t3\t50\t1\n"
+        "Total rows: 1\n",
         encoding="utf-8",
     )
     manifest_mod.update_source(
@@ -755,8 +949,8 @@ def test_build_visits_base_plus_backfill_integration(tmp_path):
     assert pd.isna(v3["screen_width"]) and pd.isna(v3["screen_resolution"])
     assert v3["source_group"] == "organic"
 
-    # is_robot присутствует, но НЕ заполнен (API не отдаёт) — нигде не false.
-    assert df["is_robot"].isna().all()
+    # is_robot не существует как колонка вообще (API флаг не отдаёт, D11).
+    assert "is_robot" not in df.columns
 
     assert stats["backfill_rows"] == 3
     assert stats["backfill_dedup_dropped"] == 1
@@ -790,15 +984,15 @@ def test_build_visits_without_backfill_keeps_base_null_fields(tmp_path):
 
     assert len(df) == 1
     for col in ("last_traffic_source_naive", "browser", "os", "screen_width",
-                "screen_height", "screen_resolution", "region_country", "region_city",
-                "is_robot"):
+                "screen_height", "screen_resolution", "region_country", "region_city"):
         assert col in df.columns
         assert pd.isna(df.iloc[0][col])
+    assert "is_robot" not in df.columns
     assert stats["backfill_rows"] == 0 and stats["backfill_unmatched"] == 0
 
 
 def test_build_visits_parquet_dtypes_and_original_columns(tmp_path):
-    """Сквозной build(): screen_* — int64 nullable, is_robot — bool nullable, 16 базовых на месте."""
+    """Сквозной build(): screen_* — int64 nullable, is_robot колонки нет вовсе, 16 базовых на месте."""
     import pyarrow.parquet as pq
 
     paths = _Paths(tmp_path)
@@ -820,12 +1014,12 @@ def test_build_visits_parquet_dtypes_and_original_columns(tmp_path):
     schema = pq.read_schema(paths.canonical / "visits.parquet")
     assert str(schema.field("screen_width").type) == "int64"
     assert str(schema.field("screen_height").type) == "int64"
-    assert str(schema.field("is_robot").type) == "bool"
+    assert "is_robot" not in schema.names
 
     visits = pd.read_parquet(paths.canonical / "visits.parquet")
     assert visits.iloc[0]["screen_width"] == 360
     assert visits.iloc[0]["last_traffic_source_naive"] == "ad"
-    assert visits["is_robot"].isna().all()
+    assert "is_robot" not in visits.columns
 
     # Исходные 16 колонок и их наличие не изменены.
     for col in ("visit_id", "client_id", "dt", "date", "device", "source_group",
@@ -1065,7 +1259,12 @@ def test_build_crm_missing_dir_returns_empty(tmp_path):
 
 
 # ═════════════════════════════ seo_queries builders ════════════════════════
-def test_build_seo_queries_gsc_aggregates_devices_and_flags_brand():
+def test_build_seo_queries_gsc_keeps_devices_separate_and_flags_brand():
+    """device участвует в группировке (задача 4G-seo-queries-device) — device-срезы
+
+    GSC больше не схлопываются в одну строку query+page+month, каждый device
+    остаётся отдельной строкой (нужно для S08-S10, S23, S24).
+    """
     gsc_dir_content = (
         "month,query,page,device,clicks,impressions,ctr,position\n"
         "2026-05-01,аренда погнали,https://site.ru/cars,DESKTOP,5,50,0.1,3.0\n"
@@ -1086,13 +1285,67 @@ def test_build_seo_queries_gsc_aggregates_devices_and_flags_brand():
 
     assert set(df["source"]) == {"gsc"}
     assert df["month"].iloc[0] == "2026-05"
-    branded = df[df["query"] == "аренда погнали"].iloc[0]
-    assert branded["total_clicks"] == 8            # 5 + 3, device-срезы объединены
-    assert branded["total_shows"] == 80            # 50 + 30
-    assert branded["avg_show_position"] == pytest.approx((3.0 * 50 + 5.0 * 30) / 80)
-    assert bool(branded["is_brand"]) is True
+    branded = df[df["query"] == "аренда погнали"]
+    assert len(branded) == 2                       # DESKTOP и MOBILE — отдельные строки
+    assert set(branded["device"]) == {"DESKTOP", "MOBILE"}
+    desktop = branded[branded["device"] == "DESKTOP"].iloc[0]
+    assert desktop["total_clicks"] == 5
+    assert desktop["total_shows"] == 50
+    assert desktop["avg_show_position"] == pytest.approx(3.0)
+    mobile = branded[branded["device"] == "MOBILE"].iloc[0]
+    assert mobile["total_clicks"] == 3
+    assert mobile["total_shows"] == 30
+    assert bool(desktop["is_brand"]) is True
+    assert bool(mobile["is_brand"]) is True
     nonbrand = df[df["query"] == "прокат авто"].iloc[0]
+    assert nonbrand["device"] == "DESKTOP"
     assert bool(nonbrand["is_brand"]) is False
+
+
+def test_build_seo_queries_gsc_missing_device_column_falls_back_to_unknown(tmp_path):
+    """Колонка device отсутствует в CSV целиком -> device="unknown" построчно, строка не теряется."""
+    gsc_dir = tmp_path / "gsc"
+    gsc_dir.mkdir()
+    (gsc_dir / "gsc_2026-05.csv").write_text(
+        "month,query,page,clicks,impressions,ctr,position\n"
+        "2026-05-01,аренда авто,https://site.ru/cars,5,50,0.1,3.0\n",
+        encoding="utf-8",
+    )
+    df = bc.build_seo_queries_gsc(gsc_dir, {"brand_terms": []})
+    assert len(df) == 1
+    assert df.iloc[0]["device"] == "unknown"
+
+
+def test_build_seo_queries_gsc_empty_device_value_falls_back_to_unknown(tmp_path):
+    """Строка с пустым device (легаси раздельный экспорт до contract 3A) -> "unknown"."""
+    gsc_dir = tmp_path / "gsc"
+    gsc_dir.mkdir()
+    (gsc_dir / "gsc_2026-05.csv").write_text(
+        "month,query,page,device,clicks,impressions,ctr,position\n"
+        "2026-05-01,аренда авто,https://site.ru/cars,,5,50,0.1,3.0\n",
+        encoding="utf-8",
+    )
+    df = bc.build_seo_queries_gsc(gsc_dir, {"brand_terms": []})
+    assert len(df) == 1
+    assert df.iloc[0]["device"] == "unknown"
+
+
+def test_build_seo_queries_webmaster_device_is_always_unknown():
+    """Вебмастер не отдаёт device вовсе -> каждая строка получает device="unknown"."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        wm_dir = Path(td) / "webmaster"
+        wm_dir.mkdir()
+        popular = [{"query_text": "погнали аренда", "page": "/catalog/",
+                    "indicators": {"TOTAL_SHOWS": 500, "TOTAL_CLICKS": 25,
+                                   "AVG_SHOW_POSITION": 3.0}}]
+        (wm_dir / "search_queries_popular.json").write_text(
+            json.dumps(popular, ensure_ascii=False), encoding="utf-8"
+        )
+        entry = {"date_from": "2026-05-01", "date_to": "2026-06-30"}
+        df = bc.build_seo_queries_webmaster(wm_dir, entry, {"brand_terms": []})
+
+    assert df.iloc[0]["device"] == "unknown"
 
 
 def test_build_seo_queries_webmaster_uses_window_end_month():
@@ -1510,10 +1763,11 @@ def test_build_seo_queries_webmaster_manual_unverified():
 
 
 def test_build_seo_queries_gsc_month_without_device_not_dropped(tmp_path):
-    """Месяц без device-колонки (или device='unknown') не удаляется из seo_queries.
+    """Месяц без device-колонки (device="unknown") не удаляется из seo_queries.
 
-    device не входит в каноническую схему и не используется в группировке,
-    поэтому отсутствие разбивки по устройствам не приводит к потере строк.
+    device участвует в группировке (задача 4G-seo-queries-device), но
+    отсутствие разбивки по устройствам не приводит к потере строк — они
+    просто получают единое device="unknown".
     """
     gsc_dir = tmp_path / "gsc"
     gsc_dir.mkdir()
@@ -1528,6 +1782,7 @@ def test_build_seo_queries_gsc_month_without_device_not_dropped(tmp_path):
     assert len(df) == 2
     assert set(df["month"]) == {"2026-05"}
     assert set(df["source"]) == {"gsc"}
+    assert set(df["device"]) == {"unknown"}
 
 
 # ══════════════════ seo_queries: новые поля page / ctr / demand ═══════════════
@@ -1695,3 +1950,227 @@ def test_seo_queries_build_deduplicates_via_orchestrator(tmp_path):
     row2 = seo[seo["query"] == "прокат авто"].iloc[0]
     assert pd.isna(row2["ctr"])
     assert pd.isna(row2["demand"])
+
+
+# ═════════════════════════════ seo_queries: порог total_shows ═══════════════
+def test_filter_seo_queries_min_shows_excludes_below_threshold():
+    df = pd.DataFrame({
+        "query": ["мало показов", "норм показов"],
+        "total_shows": [9, 10],
+    })
+    filtered = bc.filter_seo_queries_min_shows(df, min_shows=10)
+    assert list(filtered["query"]) == ["норм показов"]
+
+
+def test_filter_seo_queries_min_shows_empty_df_passthrough():
+    df = pd.DataFrame({"query": [], "total_shows": []})
+    filtered = bc.filter_seo_queries_min_shows(df, min_shows=10)
+    assert filtered.empty
+
+
+def test_seo_queries_build_filters_low_impressions_via_orchestrator(tmp_path):
+    """Сквозной тест: build() исключает запросы с total_shows < порога (по умолчанию 10)."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+
+    wm_dir = paths.raw / "webmaster"
+    wm_dir.mkdir()
+    popular = [
+        {"query_text": "редкий запрос", "page": "/rare/",
+         "indicators": {"TOTAL_SHOWS": 9, "TOTAL_CLICKS": 0, "AVG_SHOW_POSITION": 15.0}},
+        {"query_text": "обычный запрос", "page": "/normal/",
+         "indicators": {"TOTAL_SHOWS": 10, "TOTAL_CLICKS": 1, "AVG_SHOW_POSITION": 5.0}},
+    ]
+    (wm_dir / "search_queries_popular.json").write_text(
+        json.dumps(popular, ensure_ascii=False), encoding="utf-8"
+    )
+
+    manifest_mod.update_source(
+        paths.raw, "webmaster", date_from="2026-05-01", date_to="2026-06-30",
+        rows=2, script_version="test", canonical_tables=["seo_queries"],
+    )
+
+    built = bc.build(paths, {"brand_terms": []}, {"utm_undefined_threshold": 0.25})
+    assert "seo_queries" in built
+
+    seo = pd.read_parquet(paths.canonical / "seo_queries.parquet")
+    assert list(seo["query"]) == ["обычный запрос"]
+
+
+def test_seo_queries_build_respects_configured_threshold(tmp_path):
+    """defaults.transform.seo_queries_min_total_shows переопределяет порог по умолчанию."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+
+    wm_dir = paths.raw / "webmaster"
+    wm_dir.mkdir()
+    popular = [
+        {"query_text": "средний запрос", "page": "/mid/",
+         "indicators": {"TOTAL_SHOWS": 15, "TOTAL_CLICKS": 1, "AVG_SHOW_POSITION": 5.0}},
+    ]
+    (wm_dir / "search_queries_popular.json").write_text(
+        json.dumps(popular, ensure_ascii=False), encoding="utf-8"
+    )
+
+    manifest_mod.update_source(
+        paths.raw, "webmaster", date_from="2026-05-01", date_to="2026-06-30",
+        rows=1, script_version="test", canonical_tables=["seo_queries"],
+    )
+
+    defaults = {"utm_undefined_threshold": 0.25, "transform": {"seo_queries_min_total_shows": 20}}
+    built = bc.build(paths, {"brand_terms": []}, defaults)
+    assert "seo_queries" not in built
+    assert not (paths.canonical / "seo_queries.parquet").exists()
+
+
+# ═════════════════════════════ build_goals (4I-goals-canonical) ═════════════
+def _write_goals_list_fixture(metrika_reports_dir: Path, goals: list[dict] | None = None) -> None:
+    """Структура ниже воспроизводит реальный goals_list.json Pognali (Management API):
+
+    action/url цели с плоскими conditions, составная ("step") цель без
+    conditions верхнего уровня (вложены в steps), автоцель без conditions вовсе.
+    """
+    metrika_reports_dir.mkdir(parents=True, exist_ok=True)
+    if goals is None:
+        goals = [
+            {
+                "id": 371487439, "name": "Вызов формы обратной связи", "type": "action",
+                "default_price": 0.0, "is_retargeting": 0, "goal_source": "user",
+                "is_favorite": 0, "status": "Active", "labels": [],
+                "conditions": [{"type": "exact", "url": "call_click"}],
+            },
+            {
+                "id": 371496777, "name": "Переход в контакты", "type": "url",
+                "default_price": 0.0, "is_retargeting": 0, "goal_source": "user",
+                "is_favorite": 0, "status": "Active", "labels": [],
+                "conditions": [{"type": "contain", "url": "/contacts"}],
+            },
+            {
+                "id": 395964629, "name": "Все макроконверсии", "type": "step",
+                "default_price": 0.0, "is_retargeting": 0, "goal_source": "user",
+                "is_favorite": 0, "status": "Active",
+                "steps": [
+                    {
+                        "id": 395964641, "name": "Все макроконверсии", "type": "url",
+                        "default_price": 0.0, "is_retargeting": 0, "goal_source": "user",
+                        "is_favorite": 0, "status": "Active",
+                        "conditions": [{"type": "contain_action", "url": "send"}],
+                    }
+                ],
+            },
+            {
+                "id": 413242651, "name": "Автоцель: клик по email", "type": "email",
+                "default_price": 0.0, "is_retargeting": 0, "goal_source": "auto",
+                "is_favorite": 0, "status": "Active", "labels": [], "conditions": [],
+            },
+        ]
+    (metrika_reports_dir / "goals_list.json").write_text(
+        json.dumps(goals, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def test_build_goals_schema_on_real_fixture(tmp_path):
+    """Схема goals.parquet на структуре, воспроизводящей реальный goals_list.json Pognali."""
+    metrika_reports = tmp_path / "metrika_reports"
+    _write_goals_list_fixture(metrika_reports)
+
+    df = bc.build_goals(metrika_reports)
+    assert set(df.columns) == {
+        "goal_id", "name", "type", "url_pattern", "conditions_raw",
+        "created_at", "updated_at",
+    }
+    assert len(df) == 4
+
+    action_goal = df[df["goal_id"] == "371487439"].iloc[0]
+    assert action_goal["type"] == "action"
+    assert action_goal["url_pattern"] == "call_click"
+    assert json.loads(action_goal["conditions_raw"]) == [{"type": "exact", "url": "call_click"}]
+
+    url_goal = df[df["goal_id"] == "371496777"].iloc[0]
+    assert url_goal["type"] == "url"
+    assert url_goal["url_pattern"] == "/contacts"
+
+    # Составная цель ("step"): conditions верхнего уровня пусты — url_pattern и
+    # conditions_raw берутся из вложенных steps, не теряются молча.
+    composite_goal = df[df["goal_id"] == "395964629"].iloc[0]
+    assert composite_goal["type"] == "step"
+    assert composite_goal["url_pattern"] == "send"
+    assert json.loads(composite_goal["conditions_raw"])[0]["id"] == 395964641
+
+    # Автоцель без conditions вовсе (email) -> url_pattern пуст, conditions_raw — пустой список.
+    auto_goal = df[df["goal_id"] == "413242651"].iloc[0]
+    assert pd.isna(auto_goal["url_pattern"])
+    assert json.loads(auto_goal["conditions_raw"]) == []
+
+    # created_at/updated_at: поля из data-export-spec-v2.md, которых нет в
+    # реальной выгрузке, — не выдумываются, остаются null.
+    assert df["created_at"].isna().all()
+    assert df["updated_at"].isna().all()
+
+
+def test_build_goals_missing_file_returns_empty(tmp_path):
+    assert bc.build_goals(tmp_path / "nope").empty
+
+
+def test_collect_visit_goal_ids_reads_goalsid_from_logs(tmp_path):
+    _write_metrika_logs_fixture(tmp_path)  # пишет в tmp_path/metrika_logs/
+    assert bc.collect_visit_goal_ids(tmp_path / "metrika_logs") == {"20"}
+
+
+def test_collect_visit_goal_ids_missing_dir_returns_empty(tmp_path):
+    assert bc.collect_visit_goal_ids(tmp_path / "nope") == set()
+
+
+def test_goals_qa_caveat_flags_mismatch():
+    assert bc.goals_qa_caveat(["1", "2"], {"1"}) == {
+        "missing_in_visits": ["2"], "mismatch": True,
+    }
+
+
+def test_goals_qa_caveat_no_mismatch():
+    assert bc.goals_qa_caveat(["1"], {"1", "2"}) == {
+        "missing_in_visits": [], "mismatch": False,
+    }
+
+
+def test_build_wires_goals_table_and_qa_caveat(tmp_path):
+    """Сквозной build(): goals.parquet строится, попадает в built, расхождение
+
+    goal_id между goals.parquet и реально пришедшими goalsID (Logs API)
+    пишется в canonical manifest.json как caveat, не проглатывается молча.
+    """
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    _write_metrika_logs_fixture(paths.raw)  # несёт goalsID "20" (см. фикстуру)
+    metrika_reports = paths.raw / "metrika_reports"
+    # id=20 совпадает с visits; id=999 — искусственное расхождение.
+    _write_goals_list_fixture(metrika_reports, goals=[
+        {"id": 20, "name": "Целевое действие", "type": "action",
+         "conditions": [{"type": "exact", "url": "target_click"}]},
+        {"id": 999, "name": "Цель без визитов", "type": "action",
+         "conditions": [{"type": "exact", "url": "orphan_click"}]},
+    ])
+
+    manifest_mod.update_source(
+        paths.raw, "metrika_logs", date_from="2026-06-01", date_to="2026-06-30",
+        rows=3, script_version="test", canonical_tables=["visits"],
+    )
+    manifest_mod.update_source(
+        paths.raw, "metrika_reports", date_from="2026-06-01", date_to="2026-06-30",
+        rows=2, script_version="test", canonical_tables=[],
+    )
+
+    config = {"goals": {"form_submit_goal_ids": [20]}, "brand_terms": []}
+    defaults = {"utm_undefined_threshold": 0.25}
+
+    built = bc.build(paths, config, defaults)
+    assert "goals" in built
+
+    goals = pd.read_parquet(paths.canonical / "goals.parquet")
+    assert set(goals["goal_id"]) == {"20", "999"}
+
+    canonical_manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
+    assert canonical_manifest["flags"]["goals_missing_fields"] == ["created_at", "updated_at"]
+    assert canonical_manifest["flags"]["goals_qa"] == {
+        "missing_in_visits": ["999"], "mismatch": True,
+    }

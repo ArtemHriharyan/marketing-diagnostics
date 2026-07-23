@@ -205,7 +205,8 @@ def parse_goal_ids(raw: str | None) -> list[str]:
 
     Разделители: запятая, точка с запятой, вертикальная черта. Дубликаты
     (если один и тот же id встретился несколько раз — визит достигал цель
-    повторно) сохраняются: они нужны для form_submit_count.
+    повторно) сохраняются: они нужны для *_count (form_open_count,
+    form_submit_count, call_click_count, messenger_click_count).
     """
     if not raw or not raw.strip():
         return []
@@ -217,9 +218,15 @@ def goal_flags(goal_ids: list[str], goals_cfg: dict[str, Any]) -> dict[str, Any]
     """goal_ids визита + config.goals -> флаги достижений визит-уровня.
 
     form_open/form_submit/call_click/messenger_click — хотя бы одно
-    достижение соответствующей группы целей за визит. form_submit_count —
-    сколько раз за визит встретился любой из form_submit_goal_ids (для
-    расчёта переотработки, проверка 0.1).
+    достижение соответствующей группы целей за визит. *_count — сколько раз
+    за визит встретился любой id соответствующей группы (для расчёта
+    переотработки). Переотработка подтверждена на реальных данных Pognali
+    для всех четырёх групп, не только form_submit (см. задачу
+    goal-flags-overtrigger-symmetry-check, docs/implementation_status.md):
+    form_submit — 87.9% визитов-хитов дают >1 срабатывание, form_open —
+    51.7%, messenger_click — 22.9%, call_click — 9.6%. Асимметрии "считаем
+    count только там, где уже нашли проблему" быть не должно — все четыре
+    группы получают собственный count.
     """
     form_open_ids = {str(g) for g in goals_cfg.get("form_open_goal_ids") or []}
     form_submit_ids = {str(g) for g in goals_cfg.get("form_submit_goal_ids") or []}
@@ -230,8 +237,98 @@ def goal_flags(goal_ids: list[str], goals_cfg: dict[str, Any]) -> dict[str, Any]
         "form_submit": any(g in form_submit_ids for g in goal_ids),
         "call_click": any(g in call_click_ids for g in goal_ids),
         "messenger_click": any(g in messenger_ids for g in goal_ids),
+        "form_open_count": sum(1 for g in goal_ids if g in form_open_ids),
         "form_submit_count": sum(1 for g in goal_ids if g in form_submit_ids),
+        "call_click_count": sum(1 for g in goal_ids if g in call_click_ids),
+        "messenger_click_count": sum(1 for g in goal_ids if g in messenger_ids),
     }
+
+
+# ═════════════════════════════ Правила: goals (D02/D03) ═════════════════════
+def _goal_condition_url(conditions: list[dict[str, Any]] | None) -> str | None:
+    """Первый непустой url/паттерн среди conditions цели, если применимо."""
+    for cond in conditions or []:
+        url = cond.get("url")
+        if url:
+            return str(url)
+    return None
+
+
+def build_goals(metrika_reports_dir: Path) -> pd.DataFrame:
+    """data/raw/metrika_reports/goals_list.json -> goals (1 строка = 1 цель счётчика).
+
+    Читает ТОЛЬКО реальные поля goals_list.json (Management API): id, name,
+    type, conditions. Составные цели ("step") не несут conditions на верхнем
+    уровне — url_pattern/conditions_raw в этом случае берутся из вложенных
+    steps[*].conditions, а не из абстрактной спеки.
+
+    created_at/updated_at, которые упоминает data-export-spec-v2.md §B
+    ("дата создания/последнего изменения"), в реальной выгрузке счётчика
+    отсутствуют целиком (подтверждено на фактическом goals_list.json Pognali) —
+    колонки остаются null; вызывающий код (build()) фиксирует их отсутствие
+    в canonical manifest.json, а не додумывает значения.
+    """
+    path = Path(metrika_reports_dir) / "goals_list.json"
+    if not path.exists():
+        return pd.DataFrame()
+    with path.open("r", encoding="utf-8") as fh:
+        goals = json.load(fh)
+    if not goals:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for goal in goals:
+        goal_id = goal.get("id")
+        if goal_id is None:
+            continue
+        conditions = goal.get("conditions") or []
+        steps = goal.get("steps") or []
+        conditions_raw: list[Any] = conditions
+        url_pattern = _goal_condition_url(conditions)
+        if not conditions and steps:
+            conditions_raw = steps
+            url_pattern = _goal_condition_url(
+                [c for step in steps for c in (step.get("conditions") or [])]
+            )
+        rows.append({
+            "goal_id": str(goal_id),
+            "name": _to_optional_str(goal.get("name")),
+            "type": _to_optional_str(goal.get("type")),
+            "url_pattern": url_pattern,
+            "conditions_raw": json.dumps(conditions_raw, ensure_ascii=False),
+            "created_at": None,
+            "updated_at": None,
+        })
+    return pd.DataFrame(rows)
+
+
+def collect_visit_goal_ids(metrika_logs_dir: Path) -> set[str]:
+    """Множество всех goal_id из ym:s:goalsID базовых visits_*.csv.gz (Logs API).
+
+    Только для QA-сверки конфигурации целей со счётчиком (см. build_goals /
+    goals_qa_caveat) — visits.parquet не хранит сырой список goal_id по визиту
+    (там достижения — булевы флаги по группам, см. goal_flags), поэтому сверка
+    читает то же сырьё Logs API, что и build_visits, а не канонический visits.
+    """
+    metrika_logs_dir = Path(metrika_logs_dir)
+    if not metrika_logs_dir.exists():
+        return set()
+    ids: set[str] = set()
+    for row in _read_metrika_logs_rows(metrika_logs_dir):
+        ids.update(parse_goal_ids(row.get("ym:s:goalsID")))
+    return ids
+
+
+def goals_qa_caveat(goal_ids: Iterable[str], visit_goal_ids: set[str]) -> dict[str, Any]:
+    """Сверить goal_id счётчика (Management API) с реально пришедшими goalsID (Logs API).
+
+    Расхождение (goal_id из goals.parquet, которого нет ни в одном визите) —
+    сигнал рассинхронизации конфигурации целей со счётчиком
+    (data-export-spec-v2.md §B, "QA"), а не ошибка transform — фиксируется как
+    caveat в canonical manifest.json, не проглатывается молча.
+    """
+    missing = sorted(set(goal_ids) - set(visit_goal_ids))
+    return {"missing_in_visits": missing, "mismatch": bool(missing)}
 
 
 def dedupe_site_pages(df: pd.DataFrame) -> pd.DataFrame:
@@ -508,6 +605,17 @@ def is_brand_query(query: str | None, brand_terms: Iterable[Any]) -> bool:
     return any(term in q for term in terms)
 
 
+def filter_seo_queries_min_shows(df: pd.DataFrame, min_shows: int) -> pd.DataFrame:
+    """Отбросить строки seo_queries с total_shows < min_shows (шумовые запросы).
+
+    Единый порог для всех source (GSC, Вебмастер) — см.
+    defaults.transform.seo_queries_min_total_shows.
+    """
+    if df.empty:
+        return df
+    return df[df["total_shows"] >= min_shows].reset_index(drop=True)
+
+
 # ═════════════════════════════ Правила: crm ═════════════════════════════════
 def normalize_crm_status(raw_status: str | None) -> str:
     """CRM status (уже пропущенный через config.crm_csv.status_map) -> enum.
@@ -572,9 +680,9 @@ def _to_optional_str(value: Any) -> str | None:
 # неизменяем, backfill добавляет только новые колонки, не размножая строки.
 BACKFILL_SUBDIR = "backfill"
 
-# Соответствие полей backfill (ym:s:*) -> канонические колонки. is_robot сюда НЕ
-# входит: источник visits его не отдаёт (см. manifest.dropped_fields Метрики),
-# поэтому в canonical он присутствует как nullable-колонка без значения.
+# Соответствие полей backfill (ym:s:*) -> канонические колонки. is_robot сюда
+# не входит и в canonical не попадает вообще: источник visits его не отдаёт
+# (см. manifest.dropped_fields Метрики, D11 — постоянное ограничение).
 _BACKFILL_COLUMNS = [
     "last_traffic_source_naive",
     "browser",
@@ -731,7 +839,6 @@ def _join_backfill(
     )
     if no_backfill_files:
         df = df.copy()
-        df["is_robot"] = None
         stats = {
             "backfill_rows": 0,
             "backfill_dedup_dropped": 0,
@@ -768,8 +875,6 @@ def _join_backfill(
         raise AssertionError(
             f"backfill join изменил число строк: {n_before} -> {len(merged)}"
         )
-    # is_robot присутствует в схеме как nullable, но НЕ заполняется (API не отдаёт).
-    merged["is_robot"] = None
     return merged, stats
 
 
@@ -815,7 +920,10 @@ def _parse_visit_row(
         "form_submit": flags["form_submit"],
         "call_click": flags["call_click"],
         "messenger_click": flags["messenger_click"],
+        "form_open_count": flags["form_open_count"],
         "form_submit_count": flags["form_submit_count"],
+        "call_click_count": flags["call_click_count"],
+        "messenger_click_count": flags["messenger_click_count"],
         "is_new_user": parse_bool_flag(row.get("ym:s:isNewUser")),
         # patch fields: present when schema_version=visits-v2 (patch_backfill=false)
         "last_traffic_source_naive": _s("ym:s:lastTrafficSource"),
@@ -927,10 +1035,31 @@ def build_visits(
 
 # ═══════════════════════════ Чтение сырья: costs / direct ═══════════════════
 def _read_tsv(path: Path) -> list[dict[str, str]]:
+    """Прочитать TSV-выгрузку Директа в список dict-строк.
+
+    Реальные отчёты Директа несут служебные строки без табуляции по краям
+    файла: название отчёта и период вида "campaign_2025-04_... (2025-04-07 -
+    2025-04-30)" — первой строкой (перед настоящим заголовком колонок Date,
+    CampaignId и т.д.), и итоговую "Total rows: N" — последней строкой.
+    Если их не отбросить, csv.DictReader примет строку названия за fieldnames,
+    и тогда каждая строка данных (включая саму строку заголовка) читается
+    как несовпадающая — все поля уходят в None (см. диагностику
+    direct-campaigns-geo-empty-fields-diag); футер аналогично не совпадает
+    ни с одним полем и даёт ещё одну пустую строку. Защита не полагается
+    только на skipReportHeader=true/skipReportSummaryRow=true в
+    extract/direct.py: любая строка без табуляции на границе файла
+    отбрасывается независимо от источника (уже скачанное сырьё, другой
+    источник, изменение поведения API).
+    """
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8", newline="") as fh:
-        return list(csv.DictReader(fh, delimiter="\t"))
+        lines = fh.readlines()
+    if lines and "\t" not in lines[0]:
+        lines = lines[1:]
+    if lines and "\t" not in lines[-1]:
+        lines = lines[:-1]
+    return list(csv.DictReader(lines, delimiter="\t"))
 
 
 def _read_tsv_dir(path: Path) -> list[dict[str, str]]:
@@ -1123,9 +1252,14 @@ def build_direct_geo(
 ) -> pd.DataFrame:
     """GEO_PERFORMANCE_REPORT -> direct_geo.
 
-    Читает из direct/geo/ (новый помесячный формат). cost_rub — валютная
-    конверсия (считается всегда); cost_normalized/vat_basis_applied
-    заполняются в compute после Q01 (см. build_direct_queries).
+    Читает из direct/geo/ (помесячный формат, все *.tsv в каталоге —
+    консолидация по спеке data-export-spec-v2.md §C, "Консолидация geo").
+    ``month`` — вычисляемая колонка (``date.strftime("%Y-%m")``), а не
+    отдельный источник правды: месяц тривиально выводится из даты строки,
+    хранить его отдельно от build_direct_geo_monthly (удалена задачей
+    4H-geo-dedup как дублирующая эту же таблицу) больше не нужно.
+    cost_rub — валютная конверсия (считается всегда); cost_normalized/
+    vat_basis_applied заполняются в compute после Q01 (см. build_direct_queries).
     """
     geo_dir = direct_dir / "geo"
     raw_rows = _read_tsv_dir(geo_dir)
@@ -1135,8 +1269,10 @@ def build_direct_geo(
     rows: list[dict[str, Any]] = []
     for row in raw_rows:
         cost_raw, cost_rub = _parse_cost(row.get("Cost"))
+        parsed_date = _parse_date_field(row.get("Date"))
         rows.append({
-            "date": _parse_date_field(row.get("Date")),
+            "date": parsed_date,
+            "month": parsed_date.strftime("%Y-%m") if parsed_date else None,
             "campaign_id": _to_optional_str(row.get("CampaignId")),
             "campaign_name": _to_optional_str(row.get("CampaignName")),
             "location_of_presence_id": _to_optional_str(row.get("LocationOfPresenceId")),
@@ -1190,43 +1326,6 @@ def build_direct_placements(direct_dir: Path) -> pd.DataFrame:
             "clicks": _parse_int_field(row.get("Clicks")),
             "conversions_all": _parse_int_field(row.get("Conversions")),
         })
-    return pd.DataFrame(rows)
-
-
-def build_direct_geo_monthly(direct_dir: Path) -> pd.DataFrame:
-    """direct/geo/????-??.tsv (помесячные чанки) -> geo с явной колонкой month.
-
-    Отдельная таблица от direct_geo (та же исходная выгрузка, но там месяц не
-    зафиксирован явной колонкой) — читает КАЖДЫЙ месячный файл по отдельности,
-    month берётся из имени файла-чанка (YYYY-MM). Исходные помесячные TSV не
-    изменяются и не удаляются (только чтение). cost_rub/cost_normalized/
-    vat_basis_applied — тот же контракт, что у build_direct_queries.
-    """
-    geo_dir = direct_dir / "geo"
-    if not geo_dir.exists():
-        return pd.DataFrame()
-
-    rows: list[dict[str, Any]] = []
-    for path in sorted(geo_dir.glob("????-??.tsv")):
-        month = path.stem
-        for row in _read_tsv(path):
-            cost_raw, cost_rub = _parse_cost(row.get("Cost"))
-            rows.append({
-                "month": month,
-                "date": _parse_date_field(row.get("Date")),
-                "campaign_id": _to_optional_str(row.get("CampaignId")),
-                "campaign_name": _to_optional_str(row.get("CampaignName")),
-                "location_of_presence_id": _to_optional_str(row.get("LocationOfPresenceId")),
-                "location_of_presence_name": _to_optional_str(row.get("LocationOfPresenceName")),
-                "device": _to_optional_str(row.get("Device")),
-                "cost_raw": cost_raw,
-                "cost_rub": cost_rub,
-                "cost_normalized": None,
-                "vat_basis_applied": False,
-                "clicks": _parse_int_field(row.get("Clicks")),
-                "impressions": _parse_int_field(row.get("Impressions")),
-                "conversions_all": _parse_int_field(row.get("Conversions")),
-            })
     return pd.DataFrame(rows)
 
 
@@ -1366,6 +1465,51 @@ def build_campaign_strategies(direct_dir: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def build_ad_texts(direct_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """data/raw/direct/ad_texts.json -> (ad_texts, ad_texts_archived).
+
+    Фильтр по State (не Status!): State=ON -> ad_texts.parquet,
+    все остальные состояния (OFF, SUSPENDED, ARCHIVED, отсутствие) ->
+    ad_texts_archived.parquet. Обе таблицы имеют одинаковую схему.
+    """
+    path = direct_dir / "ad_texts.json"
+    if not path.exists():
+        return pd.DataFrame(), pd.DataFrame()
+
+    with path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh) or {}
+    ads = payload.get("ads") or []
+
+    active_rows: list[dict[str, Any]] = []
+    archived_rows: list[dict[str, Any]] = []
+
+    for ad in ads:
+        text_ad = ad.get("TextAd") or {}
+        row = {
+            "ad_id": _to_optional_str(ad.get("Id")),
+            "campaign_id": _to_optional_str(ad.get("CampaignId")),
+            "ad_group_id": _to_optional_str(ad.get("AdGroupId")),
+            "type": _to_optional_str(ad.get("Type")),
+            "state": _to_optional_str(ad.get("State")),
+            "status": _to_optional_str(ad.get("Status")),
+            "title": _to_optional_str(text_ad.get("Title")),
+            "title2": _to_optional_str(text_ad.get("Title2")),
+            "text": _to_optional_str(text_ad.get("Text")),
+            "href": _to_optional_str(text_ad.get("Href")),
+            "display_url_path": _to_optional_str(text_ad.get("DisplayUrlPath")),
+        }
+
+        state = (ad.get("State") or "").strip().upper()
+        if state == "ON":
+            active_rows.append(row)
+        else:
+            archived_rows.append(row)
+
+    active_df = pd.DataFrame(active_rows) if active_rows else pd.DataFrame()
+    archived_df = pd.DataFrame(archived_rows) if archived_rows else pd.DataFrame()
+    return active_df, archived_df
+
+
 # ═══════════════════════════ Чтение сырья: seo_queries ═══════════════════════
 def _read_gsc_frames(gsc_dir: Path) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
@@ -1385,10 +1529,13 @@ def build_seo_queries_gsc(
 ) -> pd.DataFrame:
     """data/raw/gsc/gsc_*.{csv,parquet} -> строки seo_queries (engine=google).
 
-    GSC даёт срез (query, page, device); device в канонической схеме нет,
-    поэтому агрегируем по (query, page, month), суммируя clicks/impressions
-    и беря средневзвешенную по impressions позицию. Месяц без device («unknown»)
-    не отбрасывается — device не участвует в группировке.
+    GSC даёт срез (query, page, device); агрегируем по (query, page, device,
+    month), суммируя clicks/impressions и беря средневзвешенную по impressions
+    позицию — device участвует в группировке (нужен для S08-S10, S23, S24).
+    Значение device берётся из сырья как есть (contract 3A, combined-экспорт
+    пишет реальное устройство). Отсутствующая колонка device в CSV (старый
+    раздельный экспорт до contract 3A) -> device="unknown" построчно; строка
+    не отбрасывается, только выпадает из будущего device-разреза.
     source_mode/completeness берутся из manifest_gsc_entry (по умолчанию api/verified).
     """
     raw = _read_gsc_frames(gsc_dir)
@@ -1399,9 +1546,14 @@ def build_seo_queries_gsc(
     raw["impressions"] = pd.to_numeric(raw["impressions"], errors="coerce").fillna(0)
     raw["position"] = pd.to_numeric(raw["position"], errors="coerce")
     raw["month"] = raw["month"].astype(str).str.slice(0, 7)
+    if "device" in raw.columns:
+        raw["device"] = raw["device"].fillna("unknown").astype(str).str.strip()
+        raw.loc[raw["device"] == "", "device"] = "unknown"
+    else:
+        raw["device"] = "unknown"
 
     raw["_pos_weighted"] = raw["position"] * raw["impressions"]
-    grouped = raw.groupby(["query", "page", "month"], as_index=False).agg(
+    grouped = raw.groupby(["query", "page", "device", "month"], as_index=False).agg(
         clicks=("clicks", "sum"),
         impressions=("impressions", "sum"),
         _pos_weighted=("_pos_weighted", "sum"),
@@ -1420,6 +1572,7 @@ def build_seo_queries_gsc(
         "page": grouped["page"],
         "source": "gsc",
         "month": grouped["month"],
+        "device": grouped["device"],
         "total_shows": grouped["impressions"].astype(int),
         "total_clicks": grouped["clicks"].astype(int),
         "avg_show_position": grouped["position_avg"],
@@ -1441,6 +1594,9 @@ def build_seo_queries_webmaster(
     Поле page берётся из JSON-объекта (новый контракт после 3B-patch);
     при отсутствии поля — null (обратная совместимость со старым форматом).
     ctr/demand — из indicators.CTR/DEMAND; null при отсутствии.
+    device: Вебмастер (summary/popular-queries) не отдаёт разбивку по
+    устройствам вообще (has_device_column=False у обоих экстракторов,
+    manual и api) — не выдумываем, пишем "unknown" для каждой строки.
     """
     path = webmaster_dir / "search_queries_popular.json"
     if not path.exists():
@@ -1470,6 +1626,7 @@ def build_seo_queries_webmaster(
             "page": item.get("page"),   # null если поле отсутствует (старый формат)
             "source": "webmaster",
             "month": month,
+            "device": "unknown",  # Вебмастер не отдаёт device (has_device_column=False)
             "total_shows": int(indicators.get("TOTAL_SHOWS") or 0),
             "total_clicks": int(indicators.get("TOTAL_CLICKS") or 0),
             "avg_show_position": float(position_avg) if position_avg is not None else None,
@@ -1558,6 +1715,9 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "source_final": "string", "is_ad": "bool", "entry_page": "string",
         "form_open": "bool", "form_submit": "bool", "call_click": "bool",
         "messenger_click": "bool", "form_submit_count": "int", "is_new_user": "bool",
+        # ── Симметричные *_count (goal-flags-overtrigger-symmetry-check) ────
+        "form_open_count": "int", "call_click_count": "int",
+        "messenger_click_count": "int",
         # ── Поля патча (из backfill; отсутствие -> null) ────────────────────
         "last_traffic_source_naive": "string",  # T02: наивная модель атрибуции
         "browser": "string",                    # C21
@@ -1567,9 +1727,9 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "screen_resolution": "string",          # "<width>x<height>" при наличии обоих
         "region_country": "string",             # A12 / S26
         "region_city": "string",                # A12 / S26
-        # is_robot: источник visits его не отдаёт (D11) -> nullable, всегда null,
-        # НИКОГДА не false; недоступность фиксируется в flags.metrika_backfill.
-        "is_robot": "bool",
+        # is_robot НЕ входит в схему: источник visits флаг робота не отдаёт
+        # вовсе (D11, постоянное ограничение) — недоступность фиксируется в
+        # flags.metrika_backfill.is_robot_available, колонки в parquet нет.
         # T02/T03: carry-forward источника для internal/undefined (resolve_traffic_source).
         "last_sign_traffic_source_raw": "string",
         "source_group_resolved": "string",
@@ -1604,7 +1764,11 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "clicks": "int", "impressions": "int", "conversions_all": "int",
     },
     "direct_geo": {
-        "date": "date",
+        # month — вычисляемая колонка (date.strftime("%Y-%m")), не отдельный
+        # источник правды (задача 4H-geo-dedup: устранила дублирующую таблицу
+        # geo.parquet/build_direct_geo_monthly, которая несла тот же набор
+        # строк с month, взятым из имени месячного файла-чанка вместо date).
+        "date": "date", "month": "string",
         "campaign_id": "string", "campaign_name": "string",
         "location_of_presence_id": "string", "location_of_presence_name": "string",
         "device": "string",
@@ -1618,23 +1782,13 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "cost_normalized": "float", "vat_basis_applied": "bool",
         "clicks": "int", "conversions_all": "int",
     },
-    "geo": {
-        # Отдельная от direct_geo таблица: та же исходная выгрузка, но с явной
-        # колонкой month (см. build_direct_geo_monthly, задача 4X-direct-normalize).
-        "month": "string", "date": "date",
-        "campaign_id": "string", "campaign_name": "string",
-        "location_of_presence_id": "string", "location_of_presence_name": "string",
-        "device": "string",
-        "cost_raw": "int", "cost_rub": "float",
-        "cost_normalized": "float", "vat_basis_applied": "bool",
-        "clicks": "int", "impressions": "int", "conversions_all": "int",
-    },
     "campaign_strategies": {
         "campaign_id": "string", "campaign_name": "string", "strategy_type": "string",
         "optimize_for": "string",
     },
     "seo_queries": {
         "query": "string", "page": "string", "source": "string", "month": "string",
+        "device": "string",          # "unknown", если источник не даёт device-разрез
         "total_shows": "int", "total_clicks": "int", "avg_show_position": "float",
         "is_brand": "bool",
         "source_mode": "string",    # api | manual
@@ -1654,6 +1808,19 @@ SCHEMAS: dict[str, dict[str, str]] = {
     "crm": {
         "lead_date": "date", "source_norm": "string", "status_norm": "string",
         "amount_rub": "float", "is_new_client": "bool", "phone_hash": "string",
+    },
+    "ad_texts": {
+        "ad_id": "string", "campaign_id": "string", "ad_group_id": "string",
+        "type": "string", "state": "string", "status": "string",
+        "title": "string", "title2": "string", "text": "string",
+        "href": "string", "display_url_path": "string",
+    },
+    "goals": {
+        # created_at/updated_at: отсутствуют в реальной выгрузке goals_list.json
+        # (Management API) — колонки всегда null, см. build_goals.
+        "goal_id": "string", "name": "string", "type": "string",
+        "url_pattern": "string", "conditions_raw": "string",
+        "created_at": "timestamp", "updated_at": "timestamp",
     },
 }
 
@@ -1749,8 +1916,23 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
             # carry-forward не смог восстановить (см. resolve_traffic_source).
             flags["traffic_source_resolve"] = backfill_stats.pop("traffic_source_resolve", {})
             # Статистика склейки base+backfill (в т.ч. unmatched и недоступность
-            # is_robot) — фиксируется для аналитика, а не «молча».
+            # флага робота, is_robot_available) — фиксируется для аналитика,
+            # а не «молча».
             flags["metrika_backfill"] = backfill_stats
+
+    if "metrika_reports" in sources:
+        goals_df = build_goals(raw_dir / "metrika_reports")
+        if not goals_df.empty:
+            write_canonical_table(goals_df, "goals", canonical_dir / "goals.parquet")
+            built.append("goals")
+            # data-export-spec-v2.md §B заявляет дату создания/изменения цели —
+            # в реальной выгрузке счётчика этих полей нет вовсе (см. build_goals).
+            flags["goals_missing_fields"] = ["created_at", "updated_at"]
+            if "metrika_logs" in sources:
+                visit_goal_ids = collect_visit_goal_ids(raw_dir / "metrika_logs")
+                flags["goals_qa"] = goals_qa_caveat(
+                    goals_df["goal_id"].tolist(), visit_goal_ids
+                )
 
     direct_dir = raw_dir / "direct" if "direct" in sources else None
     direct_entry = sources.get("direct")
@@ -1791,11 +1973,6 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
             )
             built.append("direct_placements")
 
-        geo_monthly_df = build_direct_geo_monthly(direct_dir)
-        if not geo_monthly_df.empty:
-            write_canonical_table(geo_monthly_df, "geo", canonical_dir / "geo.parquet")
-            built.append("geo")
-
         cs_df = build_campaign_strategies(direct_dir)
         if not cs_df.empty:
             write_canonical_table(
@@ -1803,19 +1980,22 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
             )
             built.append("campaign_strategies")
 
-        # ad_texts: активные (State=="ACTIVE") -> canonical/ad_texts.json (для
-        # будущей LLM-проверки A20-A24); остальные состояния не удаляются —
-        # пишутся отдельно в canonical/ad_texts_archived.json. Ленивый импорт —
-        # direct_normalize импортирует build_canonical на верхнем уровне, прямой
-        # импорт здесь на верхнем уровне модуля дал бы циклический импорт.
-        from . import direct_normalize as _direct_normalize
-        active_ads, archived_ads = _direct_normalize.filter_ad_texts_by_state(direct_dir)
-        if (direct_dir / "ad_texts.json").exists():
-            with (canonical_dir / "ad_texts.json").open("w", encoding="utf-8") as fh:
-                json.dump({"ads": active_ads}, fh, ensure_ascii=False, indent=2)
-            with (canonical_dir / "ad_texts_archived.json").open("w", encoding="utf-8") as fh:
-                json.dump({"ads": archived_ads}, fh, ensure_ascii=False, indent=2)
-            flags["ad_texts"] = {"active_count": len(active_ads), "archived_count": len(archived_ads)}
+        ad_texts_active, ad_texts_archived = build_ad_texts(direct_dir)
+        if not ad_texts_active.empty:
+            write_canonical_table(
+                ad_texts_active, "ad_texts", canonical_dir / "ad_texts.parquet"
+            )
+            built.append("ad_texts")
+        if not ad_texts_archived.empty:
+            write_canonical_table(
+                ad_texts_archived, "ad_texts", canonical_dir / "ad_texts_archived.parquet"
+            )
+            built.append("ad_texts_archived")
+        if not ad_texts_active.empty or not ad_texts_archived.empty:
+            flags["ad_texts"] = {
+                "active_count": len(ad_texts_active),
+                "archived_count": len(ad_texts_archived),
+            }
 
     seo_frames: list[pd.DataFrame] = []
     if "gsc" in sources:
@@ -1827,14 +2007,22 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
     seo_frames = [f for f in seo_frames if not f.empty]
     if seo_frames:
         seo_df = pd.concat(seo_frames, ignore_index=True)
-        # Дедуп по натуральному ключу (query, page, source): одна запись на пару
-        # (запрос, страница) внутри каждого источника. Webmaster+GSC с одинаковым
-        # (query, page) — разные строки (разный source), не конфликт.
+        # Дедуп по натуральному ключу (query, page, source, device): одна запись
+        # на пару (запрос, страница) в конкретном device-разрезе внутри каждого
+        # источника. device включён в ключ (задача 4G-seo-queries-device) —
+        # иначе строки с разными device для одного (query, page, source) схлопнутся
+        # в одну и разбивка по устройствам молча потеряется. Webmaster+GSC с
+        # одинаковым (query, page) — разные строки (разный source), не конфликт.
         seo_df = seo_df.drop_duplicates(
-            subset=["query", "page", "source"], keep="first"
+            subset=["query", "page", "source", "device"], keep="first"
         ).reset_index(drop=True)
-        write_canonical_table(seo_df, "seo_queries", canonical_dir / "seo_queries.parquet")
-        built.append("seo_queries")
+        min_shows = int(
+            ((defaults or {}).get("transform") or {}).get("seo_queries_min_total_shows", 10)
+        )
+        seo_df = filter_seo_queries_min_shows(seo_df, min_shows)
+        if not seo_df.empty:
+            write_canonical_table(seo_df, "seo_queries", canonical_dir / "seo_queries.parquet")
+            built.append("seo_queries")
 
     if "crm" in sources:
         crm_df = build_crm(raw_dir / "crm")

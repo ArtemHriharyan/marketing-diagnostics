@@ -71,7 +71,7 @@ checks:
     legacy_id: null
     block: 0
     name: "Цель измеряет клик/открытие формы, а не успешную отправку"
-    requires: [visits]
+    requires: [visits, goals]
     optional: [site_crawl]
     outputs: [d02]
     type_default: "A+B"
@@ -82,7 +82,7 @@ checks:
     legacy_id: "0.3"
     block: 0
     name: "В отчёте смешаны бизнес-цели и микроконверсии"
-    requires: [visits]
+    requires: [visits, goals]
     optional: [client_answers]
     outputs: [d03]
     type_default: "A+B"

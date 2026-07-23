@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -242,7 +243,9 @@ def test_dynamics_called_once_per_phrase_with_full_range(paths):
         body = call[2]["json"]
         assert body["period"] == "PERIOD_WEEKLY"
         assert body["fromDate"] == "2026-01-01T00:00:00Z"
-        assert body["toDate"] == "2026-01-31T00:00:00Z"
+        # date_to окна (2026-01-31) — суббота; API требует toDate = воскресенье,
+        # округление вперёд даёт ближайшее воскресенье 2026-02-01.
+        assert body["toDate"] == "2026-02-01T00:00:00Z"
         assert body["folderId"] == "b1gfake000folder"
 
 
@@ -262,6 +265,13 @@ def test_requests_use_api_key_auth_and_v2_body_shape(paths):
     assert body["regions"] == ["213"]          # region ID -> строка (v2: repeated string)
     assert body["devices"] == ["DEVICE_ALL"]   # enum-имя, не голая строка "all"
     assert body["numPhrases"] == wordstat.TOP_REQUESTS_NUM_PHRASES
+
+
+# ── 7. _align_to_sunday: округление toDate вперёд до воскресенья ───────────
+def test_align_to_sunday_rounds_forward():
+    assert wordstat._align_to_sunday(date(2026, 1, 31)) == date(2026, 2, 1)  # сб -> вс
+    assert wordstat._align_to_sunday(date(2026, 1, 5)) == date(2026, 1, 11)  # пн -> вс (+6)
+    assert wordstat._align_to_sunday(date(2026, 1, 4)) == date(2026, 1, 4)   # уже вс
 
 
 # ── 6. Регрессия: без seeds / без folder_id — SourceUnavailable ────────────

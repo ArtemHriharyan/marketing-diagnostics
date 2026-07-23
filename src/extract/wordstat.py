@@ -56,6 +56,17 @@ https://searchapi.api.cloud.yandex.net):
        ("2026-01-01T00:00:00Z"); count — тоже JSON-строка. Ответ приводится к
        прежнему контракту (date -> "YYYY-MM-DD", count -> int) в _call_dynamics.
 
+       ``toDate`` ОБЯЗАН приходиться на воскресенье — иначе API отвечает 400
+       InvalidArgument ("the to field value should be Sunday", подтверждено
+       2026-07-22). date_to окна (primary_window/config.data_window) — конец
+       календарного месяца и на воскресенье, как правило, не попадает, поэтому
+       перед вызовом dynamics конец периода округляется ВВЕРХ до ближайшего
+       воскресенья (см. _align_to_sunday) — вперёд, а не назад, чтобы не
+       обрезать данные за последнюю неполную неделю запрошенного окна.
+       date_from/date_to самого окна (используются topRequests-циклом,
+       manifest и остальным пайплайном) не меняются — округление касается
+       только значения, отправляемого в тело запроса dynamics.
+
     ОПЕРАТОРЫ МАСОК: v2 API операторы Wordstat (!слово, +слово, [слово],
     сравнение нескольких фраз через |) НЕ поддерживает — подтверждено
     документацией и независимым источником при миграции (2026-07-22). Сейчас
@@ -81,6 +92,7 @@ from __future__ import annotations
 
 import re
 import time
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -200,6 +212,7 @@ def extract(
     raw_top_dir.mkdir(parents=True, exist_ok=True)
 
     (date_from, date_to), _compare = C.resolve_windows(paths.raw, config, defaults, today=today)
+    dynamics_date_to = _align_to_sunday(date_to)
 
     calls_made = {"count": 0}
     log(f"{SOURCE}: масок {len(seeds)}, регионы {regions or 'вся Россия'}, устройства {devices}")
@@ -226,7 +239,7 @@ def extract(
         purpose = sorted(entry["purpose"])
         dyn = _call_dynamics(
             session, headers, entry["phrase"], regions, devices, folder_id,
-            date_from, date_to, sleeper, calls_made,
+            date_from, dynamics_date_to, sleeper, calls_made,
         )
         for point in list(dyn.get("results") or []):
             weekly_rows.append({
@@ -253,6 +266,7 @@ def extract(
         paths, regions, devices, folder_id, date_from, date_to,
         rows=len(weekly_rows), core_rows=len(core_rows),
         calls_made=calls_made["count"], stopwords_empty=stopwords_empty,
+        dynamics_date_to=C.fmt(dynamics_date_to),
     )
     log(
         f"{SOURCE}: готово — {len(target_queries)} фраз, {len(weekly_rows)} недельных точек, "
@@ -434,6 +448,20 @@ def _post(session, headers, path, body, sleeper, calls_made) -> dict[str, Any]:
     return resp.json() or {}
 
 
+# ── Выравнивание периода dynamics под требования API ─────────────────────────
+def _align_to_sunday(d: date) -> date:
+    """Ближайшее воскресенье НЕ РАНЬШЕ ``d`` (округление вперёд).
+
+    GetDynamicsRequest (PERIOD_WEEKLY) требует ``toDate`` строго на
+    воскресенье (400 InvalidArgument иначе). Округляем вперёд, а не назад,
+    чтобы не потерять данные за последнюю неполную неделю окна — ``date_from``
+    самого окна не трогаем, расширяется только правая граница dynamics-запроса.
+    """
+    # date.weekday(): понедельник=0 … воскресенье=6.
+    days_until_sunday = (6 - d.weekday()) % 7
+    return d + timedelta(days=days_until_sunday)
+
+
 # ── Преобразование protobuf JSON (Timestamp/int64-строки) в контракт WS-1 ───
 def _rfc3339(d) -> str:
     """date -> RFC3339 UTC-строка для google.protobuf.Timestamp ("...T00:00:00Z")."""
@@ -486,6 +514,7 @@ def _dump_json(path: Path, obj: Any) -> None:
 def _record_manifest(
     paths, regions, devices, folder_id, date_from, date_to, *,
     rows: int, core_rows: int, calls_made: int, stopwords_empty: bool,
+    dynamics_date_to: str,
 ) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
@@ -503,5 +532,8 @@ def _record_manifest(
             "wordstat_stopwords_empty": stopwords_empty,
             "api_version_used": API_VERSION_USED,
             "migration_reason": MIGRATION_REASON,
+            # date_to окна не всегда воскресенье (см. _align_to_sunday) —
+            # фиксируем фактическую дату, отправленную в dynamics.toDate.
+            "wordstat_dynamics_date_to": dynamics_date_to,
         },
     )

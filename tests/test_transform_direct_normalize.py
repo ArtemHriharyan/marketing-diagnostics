@@ -5,10 +5,12 @@ build_direct_placements/build_direct_geo_monthly/write_ad_texts_archive
 удалены как орфанный/устаревший дублирующий код (никогда не вызывались
 реальным пайплайном, см. docs/implementation_status.md, задачи
 4X-direct-reconcile и 4X-direct-cleanup). Фильтрация текстов объявлений по
-State=="ACTIVE" реально подключена к build_canonical.build() через ленивый
-импорт; запись canonical/ad_texts.json + ad_texts_archived.json делает сам
-build() инлайн (не эта функция) — сквозная проверка того инлайн-кода тоже
-здесь, отдельно от юнит-тестов чистой функции.
+State=="ON" (допустимые значения Ad.State — ON/OFF/SUSPENDED/ARCHIVED,
+значения "ACTIVE" в API не существует) реально подключена к
+build_canonical.build() через ленивый импорт; запись canonical/ad_texts.json
++ ad_texts_archived.json делает сам build() инлайн (не эта функция) —
+сквозная проверка того инлайн-кода тоже здесь, отдельно от юнит-тестов
+чистой функции.
 """
 
 from __future__ import annotations
@@ -38,10 +40,10 @@ def _write_ad_texts(direct_dir: Path, ads: list[dict]) -> None:
 def test_filter_ad_texts_mixed_states(tmp_path):
     direct_dir = tmp_path / "direct"
     _write_ad_texts(direct_dir, [
-        {"Id": 1, "CampaignId": 1, "State": "ACTIVE", "TextAd": {"Title": "A"}},
+        {"Id": 1, "CampaignId": 1, "State": "ON", "TextAd": {"Title": "A"}},
         {"Id": 2, "CampaignId": 1, "State": "ARCHIVED", "TextAd": {"Title": "B"}},
         {"Id": 3, "CampaignId": 1, "State": "SUSPENDED", "TextAd": {"Title": "C"}},
-        {"Id": 4, "CampaignId": 1, "State": "active", "TextAd": {"Title": "D"}},  # регистр
+        {"Id": 4, "CampaignId": 1, "State": "on", "TextAd": {"Title": "D"}},  # регистр
     ])
 
     active, archived = dn.filter_ad_texts_by_state(direct_dir)
@@ -70,7 +72,7 @@ def test_filter_ad_texts_missing_state_goes_to_archived(tmp_path):
 # следующий тест сквозной — гоняет реальный build_canonical.build() и
 # проверяет то, что 4X-direct-cleanup сверил построчно (см.
 # docs/implementation_status.md): raw ad_texts.json не открывается на запись
-# и не удаляется, canonical/ad_texts.json содержит только ACTIVE, а
+# и не удаляется, canonical/ad_texts.json содержит только State=="ON", а
 # canonical/ad_texts_archived.json — всё остальное, включая записи без State.
 class _Paths:
     def __init__(self, root: Path):
@@ -89,7 +91,7 @@ def test_build_ad_texts_inline_logic_keeps_raw_intact_and_splits_correctly(tmp_p
     direct_dir.mkdir(parents=True, exist_ok=True)
 
     raw_ads = [
-        {"Id": 1, "CampaignId": 1, "State": "ACTIVE", "TextAd": {"Title": "A"}},
+        {"Id": 1, "CampaignId": 1, "State": "ON", "TextAd": {"Title": "A"}},
         {"Id": 2, "CampaignId": 1, "State": "ARCHIVED", "TextAd": {"Title": "B"}},
         {"Id": 3, "CampaignId": 1, "TextAd": {"Title": "C"}},  # без State -> архив
     ]
