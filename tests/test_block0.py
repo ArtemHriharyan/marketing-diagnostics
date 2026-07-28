@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -16,6 +17,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import yaml
 
 from src.compute import block0  # noqa: E402
@@ -63,6 +66,32 @@ def _write_costs(paths: _Paths, rows: list[dict]) -> None:
 def _write_client_answers(paths: _Paths, data: dict) -> None:
     paths.inputs.mkdir(parents=True, exist_ok=True)
     (paths.inputs / "client_answers.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
+
+
+def _write_dated_parquet(path: Path, rows: list[dict], date_field: str = "date") -> None:
+    """Записать rows с явным pyarrow date32 для date_field (нужно D07-D12: они
+
+    делают арифметику над датами; pandas.to_parquet с object-колонкой из
+    python date не гарантирует date32 на всех версиях pyarrow, а production
+    write_canonical_table (src/transform/build_canonical.py) всегда пишет
+    date-колонки как date32 — тест обязан воспроизводить тот же тип.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(rows)
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    if date_field in df.columns:
+        idx = table.schema.get_field_index(date_field)
+        date_array = pa.array(list(df[date_field]), type=pa.date32())
+        table = table.set_column(idx, pa.field(date_field, pa.date32()), date_array)
+    pq.write_table(table, path)
+
+
+def _write_costs_d(paths: _Paths, rows: list[dict]) -> None:
+    _write_dated_parquet(paths.canonical / "costs.parquet", rows)
+
+
+def _write_visits_d(paths: _Paths, rows: list[dict]) -> None:
+    _write_dated_parquet(paths.canonical / "visits.parquet", rows)
 
 
 def _base_visit(**overrides) -> dict:
@@ -367,6 +396,315 @@ def test_d06_no_mismatch_when_answer_matches_and_single_basis(tmp_path):
     rows = _read_metric(paths, "d06")
     assert rows[0]["answer_not_applied"] is False
     assert rows[0]["mixed_basis_across_sources"] is False
+
+
+# ── D07 — расходы неполные или задвоены ─────────────────────────────────────
+
+def test_d07_flags_missing_declared_cost_and_double_counted_budget(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, [
+        {"date": d, "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
+         "cost_raw": 1000.0, "cost_normalized": 1000.0, "cost_status": "net",
+         "clicks": 1, "impressions": 1}
+        for d in (date(2026, 1, 1), date(2026, 1, 15))
+    ] + [
+        {"date": d, "source_tag": "yandex_business", "campaign_id": None, "campaign_name": None,
+         "cost_raw": 500.0, "cost_normalized": 500.0, "cost_status": "net",
+         "clicks": 1, "impressions": 1}
+        for d in (date(2026, 1, 1), date(2026, 1, 15))
+    ])
+    _write_client_answers(paths, {
+        "finance": {
+            "hidden_costs_rub_month": [
+                {"name": "Фикс подрядчика", "rub_month": 20000.0, "source_tag": "agency_fee"},
+            ]
+        }
+    })
+
+    artifacts = block0.run(paths, DEFAULTS, {"D07"})
+    assert "d07" in artifacts
+    rows = _read_metric(paths, "d07")
+    declared = next(r for r in rows if r["finding"] == "declared_cost_check")
+    assert declared["missing_in_data"] is True
+    dup = next(r for r in rows if r["finding"] == "possible_double_counted_budget")
+    assert dup["both_present"] is True
+
+
+def test_d07_no_finding_when_declared_cost_present_and_no_double_count(tmp_path):
+    paths = _Paths(tmp_path)
+    # Календарный месяц целиком (31 день января): факт совпадает с заявленным Q02.
+    rows_in = [
+        {"date": date(2026, 1, d), "source_tag": "agency_fee", "campaign_id": None,
+         "campaign_name": None, "cost_raw": 100.0, "cost_normalized": 100.0,
+         "cost_status": "net", "clicks": None, "impressions": None}
+        for d in range(1, 32)
+    ] + [
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
+         "campaign_name": "c1", "cost_raw": 500.0, "cost_normalized": 500.0,
+         "cost_status": "net", "clicks": 1, "impressions": 1},
+    ]
+    _write_costs_d(paths, rows_in)
+    _write_client_answers(paths, {
+        "finance": {
+            "hidden_costs_rub_month": [
+                {"name": "Фикс подрядчика", "rub_month": 3100.0, "source_tag": "agency_fee"},
+            ]
+        }
+    })
+
+    block0.run(paths, DEFAULTS, {"D07"})
+    rows = _read_metric(paths, "d07")
+    declared = next(r for r in rows if r["finding"] == "declared_cost_check")
+    assert declared["missing_in_data"] is False
+    assert declared["amount_mismatch"] is False
+    dup = next(r for r in rows if r["finding"] == "possible_double_counted_budget")
+    assert dup["both_present"] is False
+
+
+# ── D08 — архивные/остановленные кампании исключены из истории ─────────────
+
+def test_d08_no_stopped_campaigns_detected_flag(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, [
+        {"date": d, "source_tag": "direct", "campaign_id": cid, "campaign_name": f"camp-{cid}",
+         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
+         "clicks": 1, "impressions": 1}
+        for d in (date(2026, 1, 1), date(2026, 1, 31)) for cid in ("1", "2")
+    ])
+
+    artifacts = block0.run(paths, DEFAULTS, {"D08"})
+    assert "d08" in artifacts
+    rows = _read_metric(paths, "d08")
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["total_campaigns"] == 2
+    assert summary["stopped_campaign_count"] == 0
+    assert summary["no_stopped_campaigns_detected"] is True
+
+
+def test_d08_detects_campaign_stopped_before_window_end(tmp_path):
+    paths = _Paths(tmp_path)
+    rows_in = [
+        {"date": d, "source_tag": "direct", "campaign_id": "1", "campaign_name": "still-running",
+         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
+         "clicks": 1, "impressions": 1}
+        for d in (date(2026, 1, 1), date(2026, 1, 31))
+    ] + [
+        {"date": d, "source_tag": "direct", "campaign_id": "2", "campaign_name": "stopped-early",
+         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
+         "clicks": 1, "impressions": 1}
+        for d in (date(2026, 1, 1), date(2026, 1, 5))
+    ]
+    _write_costs_d(paths, rows_in)
+
+    block0.run(paths, DEFAULTS, {"D08"})
+    rows = _read_metric(paths, "d08")
+    stopped_row = next(r for r in rows if r.get("campaign_id") == "2")
+    assert stopped_row["stopped_before_window_end"] is True
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["stopped_campaign_count"] == 1
+    assert summary["no_stopped_campaigns_detected"] is False
+
+
+def test_d08_confidence_capped_by_degradation_report(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, [
+        {"date": d, "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
+         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
+         "clicks": 1, "impressions": 1}
+        for d in (date(2026, 1, 1), date(2026, 1, 31))
+    ])
+    paths.metrics.mkdir(parents=True, exist_ok=True)
+    report = {"checks": [{"check_id": "D08", "confidence_cap": "LOW"}]}
+    (paths.metrics / "degradation_report.json").write_text(json.dumps(report), encoding="utf-8")
+
+    block0.run(paths, DEFAULTS, {"D08"})
+    rows = _read_metric(paths, "d08")
+    # Без потолка per-campaign строки были бы HIGH, summary — MED.
+    assert all(r["confidence"] == "LOW" for r in rows)
+
+
+# ── D09 — периоды/часовые пояса/даты не приведены к единому правилу ────────
+
+def test_d09_flags_incomplete_month_and_period_mismatch(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [
+        _base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1"),
+        _base_visit(date=date(2026, 2, 10), client_id="c2", visit_id="v2"),
+    ])
+    _write_costs_d(paths, [
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
+         "campaign_name": "c1", "cost_raw": 10.0, "cost_normalized": 10.0,
+         "cost_status": "net", "clicks": 1, "impressions": 1},
+    ])
+
+    artifacts = block0.run(paths, DEFAULTS, {"D09"})
+    assert "d09" in artifacts
+    rows = _read_metric(paths, "d09")
+    incomplete = next(r for r in rows if r["finding"] == "incomplete_last_month")
+    assert incomplete["is_incomplete"] is True
+    assert incomplete["last_month"] == "2026-02"
+    mismatch = next(r for r in rows if r["finding"] == "visits_costs_period_mismatch")
+    assert mismatch["mismatch"] is True
+
+
+def test_d09_no_finding_when_month_complete_and_periods_aligned(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [
+        _base_visit(date=d, client_id=f"c{d.day}", visit_id=f"v{d.day}")
+        for d in (date(2026, 1, 1), date(2026, 1, 31))
+    ])
+    _write_costs_d(paths, [
+        {"date": d, "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
+         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
+         "clicks": 1, "impressions": 1}
+        for d in (date(2026, 1, 1), date(2026, 1, 31))
+    ])
+
+    block0.run(paths, DEFAULTS, {"D09"})
+    rows = _read_metric(paths, "d09")
+    incomplete = next(r for r in rows if r["finding"] == "incomplete_last_month")
+    assert incomplete["is_incomplete"] is False
+    mismatch = next(r for r in rows if r["finding"] == "visits_costs_period_mismatch")
+    assert mismatch["mismatch"] is False
+
+
+# ── D10 — выгрузка неполная (пагинация/лимиты/фильтры/семплирование) ───────
+
+def test_d10_detects_missing_dates_gap(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [
+        _base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1"),
+        _base_visit(date=date(2026, 1, 5), client_id="c2", visit_id="v2"),
+    ])
+
+    artifacts = block0.run(paths, DEFAULTS, {"D10"})
+    assert "d10" in artifacts
+    rows = _read_metric(paths, "d10")
+    row = rows[0]
+    assert row["days_in_range"] == 5
+    assert row["days_with_visits"] == 2
+    assert row["missing_days_count"] == 3
+    assert row["has_gap"] is True
+    assert "2026-01-02" in row["missing_dates_sample"]
+
+
+def test_d10_no_gap_when_every_day_present(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [
+        _base_visit(date=date(2026, 1, d), client_id=f"c{d}", visit_id=f"v{d}")
+        for d in range(1, 4)
+    ])
+
+    block0.run(paths, DEFAULTS, {"D10"})
+    rows = _read_metric(paths, "d10")
+    assert rows[0]["has_gap"] is False
+    assert rows[0]["missing_days_count"] == 0
+
+
+# ── D11 — сотрудники/тесты/боты в данных ────────────────────────────────────
+
+def test_d11_flags_high_frequency_client_id(tmp_path):
+    paths = _Paths(tmp_path)
+    visits = [
+        _base_visit(date=date(2026, 1, 1), client_id="employee1", visit_id=f"v{i}")
+        for i in range(60)
+    ] + [
+        _base_visit(date=date(2026, 1, 1), client_id=f"customer{i}", visit_id=f"c{i}",
+                     utm_source_raw="yandex")
+        for i in range(10)
+    ]
+    _write_visits_d(paths, visits)
+
+    artifacts = block0.run(paths, DEFAULTS, {"D11"})
+    assert "d11" in artifacts
+    rows = _read_metric(paths, "d11")
+    flagged = next(r for r in rows if r.get("finding") == "high_frequency_client_id")
+    assert flagged["client_id"] == "employee1"
+    assert flagged["visit_count"] == 60
+    assert flagged["confidence"] == "LOW"
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["high_frequency_client_id_count"] == 1
+
+
+def test_d11_no_high_frequency_and_test_marker_detected(tmp_path):
+    paths = _Paths(tmp_path)
+    visits = [
+        _base_visit(date=date(2026, 1, 1), client_id=f"customer{i}", visit_id=f"v{i}",
+                     utm_source_raw="yandex")
+        for i in range(5)
+    ] + [
+        _base_visit(date=date(2026, 1, 1), client_id="tester1", visit_id="vtest",
+                     utm_source_raw="internal_test"),
+    ]
+    _write_visits_d(paths, visits)
+
+    block0.run(paths, DEFAULTS, {"D11"})
+    rows = _read_metric(paths, "d11")
+    assert not [r for r in rows if r.get("finding") == "high_frequency_client_id"]
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["high_frequency_client_id_count"] == 0
+    assert summary["test_marker_visit_count"] == 1
+
+
+# ── D12 — таблицы соединяются на неверном уровне детализации ───────────────
+
+def test_d12_detects_duplicate_costs_key(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [
+        _base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1"),
+    ])
+    _write_costs_d(paths, [
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
+         "campaign_name": "c1", "cost_raw": 10.0, "cost_normalized": 10.0,
+         "cost_status": "net", "clicks": 1, "impressions": 1},
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
+         "campaign_name": "c1", "cost_raw": 10.0, "cost_normalized": 10.0,
+         "cost_status": "net", "clicks": 1, "impressions": 1},
+    ])
+
+    artifacts = block0.run(paths, DEFAULTS, {"D12"})
+    assert "d12" in artifacts
+    rows = _read_metric(paths, "d12")
+    costs_row = next(r for r in rows if r["table"] == "costs")
+    assert costs_row["has_duplicate_keys"] is True
+    assert costs_row["duplicate_key_count"] == 1
+    visits_row = next(r for r in rows if r["table"] == "visits")
+    assert visits_row["has_duplicate_keys"] is False
+
+
+def test_d12_no_duplicates_when_keys_unique(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [
+        _base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1"),
+        _base_visit(date=date(2026, 1, 2), client_id="c2", visit_id="v2"),
+    ])
+    _write_costs_d(paths, [
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
+         "campaign_name": "c1", "cost_raw": 10.0, "cost_normalized": 10.0,
+         "cost_status": "net", "clicks": 1, "impressions": 1},
+        {"date": date(2026, 1, 2), "source_tag": "direct", "campaign_id": "1",
+         "campaign_name": "c1", "cost_raw": 10.0, "cost_normalized": 10.0,
+         "cost_status": "net", "clicks": 1, "impressions": 1},
+    ])
+
+    block0.run(paths, DEFAULTS, {"D12"})
+    rows = _read_metric(paths, "d12")
+    assert all(r["has_duplicate_keys"] is False for r in rows)
+
+
+def test_d12_confidence_capped_by_degradation_report(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [
+        _base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1"),
+    ])
+    paths.metrics.mkdir(parents=True, exist_ok=True)
+    report = {"checks": [{"check_id": "D12", "confidence_cap": "MED"}]}
+    (paths.metrics / "degradation_report.json").write_text(json.dumps(report), encoding="utf-8")
+
+    block0.run(paths, DEFAULTS, {"D12"})
+    rows = _read_metric(paths, "d12")
+    # visits-строка сама по себе была бы HIGH (точный подсчёт дублей) — не выше потолка.
+    assert all(r["confidence"] == "MED" for r in rows)
 
 
 # ── confidence_cap — compute капает вниз, никогда не поднимает ─────────────

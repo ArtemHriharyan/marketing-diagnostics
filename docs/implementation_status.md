@@ -755,3 +755,65 @@ tests/test_block0.py` — **17 passed**. Регрессия: `pytest
 tests/test_compute_common.py tests/test_degradation.py
 tests/test_methodology_goals_requires.py tests/test_smoke.py
 tests/test_config_schema.py` — **64 passed**, 0 failed.
+
+---
+
+**5C** DONE — 2026-07-28. Бизнес-логика D07–D12 в `src/compute/block0.py`,
+завершает блок 0 (D01–D06 не переписывались). Все шесть проверок работают
+строго в пределах `requires` из `config/methodology.yaml` (не менялся —
+вне `allowed_files`) — у compute нет доступа к сырому `manifest.json`
+Директа (`archived_campaigns_retrievable` и т.п.), только к
+`data/canonical/*.parquet`; там, где формула каталога требует источника,
+которого в canonical-слое нет (часовой пояс визита, статус кампании
+Директа), проверка сужена до того, что реально наблюдаемо, и это
+ограничение зафиксировано в самой находке, а не спрятано.
+
+D07 (расходы неполные/задвоены): два независимых сигнала из `costs.parquet`
++ `inputs/client_answers.yaml: finance.hidden_costs_rub_month` (Q02) — (1)
+`declared_cost_check` на каждую заявленную статью — `missing_in_data`, если
+у её `source_tag` нулевая сумма в `costs`, `amount_mismatch`, если фактическая
+сумма меньше половины ожидаемой (`rub_month × число_месяцев_окна`); (2)
+`possible_double_counted_budget` — `source_tag='direct'` и
+`'yandex_business'` одновременно ненулевые (каталог §4, правило 8). D08
+(архивные/остановленные кампании исключены из истории): группировка
+`costs` по `campaign_id` (`source_tag='direct'`) — кампания
+`stopped_before_window_end`, если последний день с расходом отстоит от
+максимальной даты окна больше чем на `_D08_STOPPED_CAMPAIGN_BUFFER_DAYS=14`
+дней; `no_stopped_campaigns_detected` (>=2 кампании и ни одна не
+остановилась раньше конца окна) — сигнал риска, не факт: compute не видит
+`campaigns.get`/`archived_campaigns_retrievable`, только то, что попало в
+`costs`. D09 (периоды/часовые пояса/даты): `incomplete_last_month` — последний
+календарный день `visits.date` раньше конца месяца; `visits_costs_period_mismatch`
+— расхождение месяца min/max между `visits` и `costs`; часовой пояс не
+проверяется — в canonical-слое нет tz-поля визита (протокол микрозадач п.5:
+не придумывать проверку без данных). D10 (выгрузка неполная): календарные
+дни без единого визита внутри `[MIN(date), MAX(date)]` — `missing_days_count`
++ ограниченный список (`_D10_MISSING_DATES_SAMPLE_LIMIT=20`, флаг
+`missing_dates_truncated`); без сверки с UI-агрегатом Метрики (вне
+canonical-слоя). D11 (сотрудники/тесты/боты): без `ym:s:isRobot` (недоступен
+постоянно, см. D11 в CLAUDE.md) — прокси из `client_id` (частота визитов
+>= `_D11_HIGH_FREQUENCY_VISITS_THRESHOLD=50` за окно) и `utm_source_raw`
+(тестовые токены `_D11_TEST_MARKER_TOKENS`); `confidence` всегда `"LOW"` по
+существу находки (не только из-за потолка) — гипотеза, не факт. D12 (join
+на неверном уровне детализации): независимая проверка уникальности ключа
+внутри самого блока 0 — `visits.visit_id` (защитно дублирует
+`dedupe_visits` из transform, не переиспользуя его внутренности, принцип 2)
+и составной `(date, source_tag, campaign_id)` в `costs`.
+
+D09/D12 читают `costs` как опциональный вход (`optional` в methodology.yaml)
+— доступность прокидывается из диспетчера параметром `has_costs`, не
+пересчитывается внутри самой функции проверки.
+
+Новые тесты `tests/test_block0.py` (14 шт.): по одному положительному и
+отрицательному сценарию на D07–D12, плюс два теста на капание confidence
+через `degradation_report.json` (D08 — per-campaign HIGH и summary MED оба
+капаются до LOW; D12 — HIGH-факт капается до MED), демонстрирующие
+заражение/ограничение зависимых метрик потолком проверки. Новый тестовый
+хелпер `_write_dated_parquet`/`_write_costs_d`/`_write_visits_d` — пишет
+колонку `date` как явный `pyarrow.date32()` (production `write_canonical_table`
+в build_canonical.py всегда пишет date-колонки так; существующий
+`_write_costs`/`_write_visits` этой гарантии не даёт, т.к. D01–D06 не делали
+арифметику над датами). `pytest tests/test_block0.py` — **31 passed** (17
+старых + 14 новых). Регрессия: `pytest tests/test_compute_common.py
+tests/test_degradation.py tests/test_methodology_goals_requires.py
+tests/test_smoke.py tests/test_config_schema.py` — **64 passed**, 0 failed.
