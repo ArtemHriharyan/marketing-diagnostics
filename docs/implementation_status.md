@@ -976,3 +976,71 @@ tests/test_block1.py` — **42 passed**. Регрессия: `pytest
 tests/test_compute_common.py tests/test_block0.py tests/test_block1.py
 tests/test_degradation.py tests/test_methodology_goals_requires.py
 tests/test_smoke.py tests/test_config_schema.py` — **137 passed**, 0 failed.
+
+---
+
+**5F** DONE — 2026-07-28. Бизнес-логика T01–T10 в `src/compute/block2.py`
+(блок 2 «трафик, каналы и атрибуция» — старое содержимое файла, заглушка под
+устаревшую нумерацию 2.1–2.5 legacy Блока 2, полностью заменено).
+
+**T02 — «наивная» vs «corrected lastsign»:** наивная модель —
+`last_traffic_source_naive`, пропущенная через ту же `classify_traffic_source`
+(импортирована из `transform.build_canonical`, не переопределена — одна
+таблица маппинга на весь пайплайн). Corrected — `source_group_resolved`,
+уже посчитанный transform-слоем обязательным carry-forward шагом
+(methodology v2 §5) до попадания canonical в compute; compute только
+сравнивает готовые колонки (confusion-матрица + naive/corrected дельта по
+ad/organic), ничего не восстанавливает повторно и не переопределяет
+source_final/source_group_resolved — прямой трафик не становится «рекламой»
+никаким условием внутри block2.py. Отсутствие колонки `source_group_resolved`
+(canonical собран до carry-forward) → явный `unavailable`, не суррогат.
+
+**T03/T10 — структурный разрыв (сырой referer/домен не в canonical):**
+`ym:s:referer` запрашивается экстрактором (`VISIT_FIELDS_BASE`,
+`src/extract/metrika_logs.py`), но не входит в `SCHEMAS["visits"]`
+(`build_canonical.py`) — тот же прецедент, что A07/A16/A25 в block1.py.
+T03 автоматически считает только частоту/долю разрывов сессии
+(internal/undefined → carry-forward), домен-источник — ручная проверка
+(`type_default: "A+B"` в methodology.yaml, поле артефакта
+`domain_level_detection_available: false` явно, не молчит). T10 — эвристика
+по client_id в группе `source_final='referral'`: повторяемость визитов
+(>= 5, `_T10_MIN_VISITS_FOR_SPAM_CANDIDATE`) + нулевая вовлечённость
+(ни одного form_open/form_submit/call_click/messenger_click) — оба сигнала
+прямо названы каталогом («поведение», «повторяемость визитов»); география не
+используется (в visits нет гео именно реферера, только гео пользователя —
+несвязанный сигнал не выдаётся за подтверждение спама).
+
+Остальные проверки — прямые агрегаты по canonical: T01 (доля UTM-разметки
+по visits, отдельно по source_group, плюс поиск нестандартизированных
+вариантов utm_source по регистронезависимому ключу), T04 (визит-уровневые
+ad-конверсии Метрики против `goal_conv_<id>` Директа из `direct_campaigns`
+— две разные модели атрибуции для одного канала, расхождение вне полосы
+[0.5, 2.0] помечается явно), T05 (brand/non-brand по `seo_queries.is_brand`
++ `is_brand_query()` на `direct_queries.query`, импортирована из
+`transform.build_canonical`), T06 (`inputs/client_answers.yaml`:
+`business.offline_lead_channels` + `directories.{yandex_maps,gis2,
+calltracking}`, дополнительно — счётчики `call_click_count`/
+`messenger_click_count` из visits как частичная видимость), T07 (честный
+подсчёт `client_id` как cookie, не клиента — `cookie_is_not_customer_proxy:
+true` всегда в артефакте, distinct client_id никогда не схлопывается),
+T08 (доля визитов/конверсий по `source_final`, доля расхода по campaign_id
+из costs — риск концентрации на канале/кампании), T09 (медианный
+бейзлайн по (source_final, date) при >= 7 дней истории и медиане >= 5
+визитов/день; всплеск/провал — эвристика x3/x0.33 от медианы; сопоставление
+даты аномалии с `client_answers.changes_log` в окне ±3 дня — автоматическая
+часть корреляции с «данными другой системы» из каталога, остальное — ручной
+разбор в analyze).
+
+Пороги-эвристики (каталог не даёт точных чисел) документированы у каждой
+константы в block2.py — тот же принцип, что A02–A26 в block1.py. Confidence:
+HIGH только для прямых визит-уровневых долей при выборке >= `min_sample_visits`
+(T01/T02/T03/T07/T08 summary-строки); все эвристические пороговые находки
+(T04–T06, T09, T10, сегментные разрезы T01/T02/T08) — MED по построению,
+`_cap` капает вниз через `degradation_report.json`, никогда не поднимает.
+
+Тесты `tests/test_block2.py` — по 1–2 сценария на каждую из T01–T10, плюс
+обязательные из промта: последовательность ad→direct (T02, наивная vs
+corrected), несколько cookie одного client (T07, честный подсчёт без
+дедупликации), аномальный источник (T09, спайк x6 от медианы), спам-реферал
+и нормальный реферал (T10, позитив/негатив), unavailable без
+`source_group_resolved` (T02). `pytest tests/test_block2.py` — **15 passed**.
