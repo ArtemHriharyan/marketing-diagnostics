@@ -694,3 +694,64 @@ passed, 13 failed; все 13 подтверждены предсуществую
 ×2, `test_extract_smoke.py` ×9 (gsc_manual/webmaster_manual/wordstat/metrika_logs),
 `test_metrika_logs_lookback.py` ×1, `test_transform_direct_normalize.py` ×1 — ни
 один из этих файлов этой задачей не затрагивался.
+
+---
+
+**5B** DONE — 2026-07-28. Бизнес-логика D01–D06 в `src/compute/block0.py`
+(D07–D12 вне скоупа). D01 (переотработка): по каждой из 4 групп ключевых целей
+(`form_open/form_submit/call_click/messenger_click`) — достижения/уникальные
+визиты с целью, `overtrigger` при отношении >= `goal_inflation_warning`. D02
+(цель = клик, а не отправка): классификация `goals.type` — `action/button/
+phone/email/messenger/social` (реальные значения выгрузки, см.
+4I-goals-canonical) помечены "слабыми" (клик/JS-событие, не доказывают
+отправку), `url/step` — "сильными"; `suspect_click_not_submit` — слабый тип +
+имя цели похоже на бизнес-отправку (эвристика по ключевым словам). D03
+(смешение целей): пересечения `goal_id` между группами `config.goals.*`
+(`form_open_goal_ids` и т.д. из client config.yaml через
+`orchestrator.load_client_config`) — находка `goal_group_overlap`; плюс
+`goal_mix_summary` (цели вне всех групп, `goals_qa` mismatch из canonical
+manifest). D04 (покрытие трекингом): по `device` — визиты с трафиком, но
+нулём достижений хотя бы одной ключевой цели (`no_tracked_conversions`). D05
+(UTM теряется): доля `source_group='ad'` визитов с `utm_source_raw` из набора
+"не задано" токенов (зеркалит `_UTM_UNDEFINED_TOKENS` transform, не
+импортируется — принцип 2, слой читает выход, не внутренности соседнего
+слоя); `utm_uncertain` из `data/canonical/manifest.json.flags` переносится в
+вывод (обязательное требование докстринга `build_canonical.py`). D06 (НДС-база):
+per-`source_tag` сверка уже посчитанного `costs.parquet.cost_status`
+(gross/net/vat_basis_unknown, см. `_apply_vat_to_rows`) с ответом клиента
+`inputs/client_answers.yaml: finance.vat_basis_by_source` —
+`answer_not_applied`, если объявленная база не совпала с фактической;
+`mixed_basis_across_sources`, если среди источников есть и gross, и net.
+
+**Разрыв D02/D03 vs runnable_ids (сознательное решение, задокументировано в
+докстринге block0.py):** `src/extract/metrika_reports.py::CANONICAL_TABLES`
+до сих пор не объявляет `goals` (известно с 4I-goals-canonical, не в
+allowed_files этой задачи) — `degradation.build_degradation_report` держит
+D02/D03 в `runnable=False` даже когда `goals.parquet` физически присутствует
+и непуст. Как явно указано в промте задачи, D02/D03 в `run()` НЕ гейтятся
+через `runnable_ids`: доступность проверяется напрямую (`visits` в
+`load_canonical`, `goals.parquet` непуст через `pq.ParquetFile(...).metadata.
+num_rows`). Если недоступны — явная запись `{"status": "unavailable",
+"reason": "goals metadata недоступна"}` в `d02.json`/`d03.json`, не
+молчаливый пропуск (проверено тестом на отсутствующий и на пустой
+`goals.parquet`). D01/D04/D05/D06 гейтятся штатно — `id in runnable_ids and
+<таблица> in load_canonical(paths)` (defensive: `runnable_ids` может
+считать таблицу доступной по raw-манифесту, даже если transform фактически
+не записал непустой parquet).
+
+Все вычисленные `confidence` перед записью капаются вниз через
+`degradation.min_confidence(confidence, confidence_cap)` — `confidence_cap`
+берётся из уже записанного `degradation_report.json.checks[].confidence_cap`
+(а не пересчитывается заново); `write_metric_artifact` остаётся страховкой
+(`ConfidenceCapViolation`), а не механизмом капа.
+
+Новые тесты `tests/test_block0.py` (17 шт.): по одному положительному и
+отрицательному сценарию на D01–D06, недоступность goals (отсутствует/пуст —
+явная запись, не пропуск), пропуск D01 вне `runnable_ids`, D02/D03
+выполняются при пустом `runnable_ids`, если `goals.parquet` присутствует
+(регрессия против разрыва extract-манифеста), confidence капается к потолку
+из `degradation_report.json` даже при большой выборке. `pytest
+tests/test_block0.py` — **17 passed**. Регрессия: `pytest
+tests/test_compute_common.py tests/test_degradation.py
+tests/test_methodology_goals_requires.py tests/test_smoke.py
+tests/test_config_schema.py` — **64 passed**, 0 failed.
