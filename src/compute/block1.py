@@ -1,7 +1,58 @@
 """Блок 1 — экономика и эффективность платной рекламы (каталог v2 §6, A01–A26).
 
-Задача 5D закрывает только A01–A11 (первая часть экономики рекламы).
-A12–A26 — вне скоупа этой задачи, не реализуются.
+Задача 5D реализовала A01–A11 (первая часть экономики рекламы). Задача 5E
+добавляет A12–A26 (гео, устройства, расписание, РСЯ, ретаргетинг, бренд,
+структура кампаний, CPC/CTR, запрос-объявление-посадочная, фид, лаг/
+сезонность) — см. докстринг каждой `_run_aXX` ниже, там же источник данных и
+структурные ограничения конкретной проверки.
+
+Три источника, заявленные каталогом/спецификацией для A12–A26, физически НЕ
+входят в canonical-слой (extract пишет их в data/raw/direct/, но
+build_canonical.py не строит из них ни одной таблицы — расширение схемы вне
+allowed_files обеих задач 5D/5E): `campaign_targeting.json` (гео/устройства/
+расписание/корректировки ставок как НАСТРОЙКИ — не факт. показатели),
+`keywords.parquet` (ключевые фразы с типом соответствия отдельно от search
+queries), `product_feed.parquet` (товарный фид). Прямое следствие:
+- A16 (ретаргетинг) пишет только unavailable — без campaign_targeting нет
+  способа даже определить, какие кампании ретаргетинговые, тот же принцип,
+  что у A07 (нет данных — проверка не придумывается).
+- A25 (товарный фид) пишет только unavailable по той же причине.
+- A18 (пересечение кампаний за один спрос) реализован только через
+  direct_queries (поисковые запросы) — пересечение по отдельным ключевым
+  фразам/аудиториям/гео не проверяется (keywords/campaign_targeting
+  недоступны); это сужение уже отражено в config/methodology.yaml
+  (`A18.requires == ["direct_queries"]`, не выдумано этой задачей).
+
+Четыре ДРУГИЕ таблицы (direct_geo, direct_placements, ad_texts, seo_queries)
+физически существуют в canonical (см. SCHEMAS build_canonical.py) и
+используются здесь как ДОПОЛНИТЕЛЬНЫЕ входы блока — тот же прецедент, что
+A02/A04–A08 читают canonical["direct_campaigns"] сверх голого
+`requires: [costs, visits]` реестра (методология не запрещает читать больше
+таблиц, чем в `requires`, — `requires` определяет только грубые
+runnable_ids/деградацию верхнего уровня, конкретный набор входов проверки —
+дело её реализации, с явной деградацией при отсутствии таблицы).
+
+`ad_texts.parquet` уже отфильтрован по State=ON на этапе transform (см.
+build_ad_texts/build.py) — A20–A24 читают ТОЛЬКО canonical["ad_texts"],
+никогда canonical["ad_texts_archived"] (архивные объявления не считаются
+текущей рекламой, повторная фильтрация здесь не нужна и не производится).
+
+`direct_placements.cost_normalized` — проверено по коду (build_direct_placements,
+build_canonical.py): контракт уже единый с direct_queries/campaigns/geo
+(cost_raw/cost_rub всегда, cost_normalized=null до Q01, vat_basis_applied=False)
+— терминологический gap, описанный в data-export-spec-v2.md как "открытый"
+(валютная семантика cost_normalized), на практике уже закрыт задачей
+4X-direct-placements-align/4X-direct-reconcile (см. docs/implementation_status.md).
+Поэтому A15 использует cost_normalized через тот же `_money()`, что и
+A09–A11, а не cost_raw с оговоркой — оговорка из промта была актуальна ДО
+этой сверки, не после.
+
+Целевой регион для A12 берётся из `config.client.geo` (единственное
+структурированное — точнее, полу-структурированное — поле; свободный текст,
+разделённый запятой/точкой с запятой/слэшем) сопоставлением подстрокой с
+`direct_geo.location_of_presence_name`. Отдельного списка "целевых регионов"
+в схеме клиентского конфига нет (вне allowed_files — `clients/_template/
+config.yaml` не в списке этой задачи), это единственный доступный сигнал.
 
 Проверки (config/methodology.yaml, catalog-proveryaemyh-marketingovyh-ugroz-v2.md §6):
     A01  кампания оптимизируется на неверную цель            [campaign_strategies, visits]
@@ -95,6 +146,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -104,6 +156,7 @@ from scipy import stats
 from . import common
 from ..pipeline import degradation as degradation_mod
 from ..pipeline import orchestrator as orchestrator_mod
+from ..transform.build_canonical import is_brand_query
 
 # ── Match type (AUDIT-match-type, docs/implementation_status.md, подтверждено
 # документацией Yandex Direct API v5): KEYWORD/SYNONYM/RELATED_KEYWORD — три
@@ -155,6 +208,80 @@ _A10_MIN_RECURRING_MONTHS = 2
 # вместо CPA по кампании.
 _A11_MIN_NET_CONVERSIONS_FOR_COMPARISON = 5
 _A11_CPA_OUTLIER_RATIO = 1.5
+
+# ── Пороги A12–A26 (задача 5E) — тот же принцип, что у A01–A11: каталог не
+# даёт точных чисел, эвристики повторно используют уже принятые в блоке
+# коэффициенты (5 конверсий на сравнение, 1.5x на "устойчиво хуже") там, где
+# смысл проверки идентичен по структуре (CPA/CPC/CTR outlier по новому срезу).
+
+# A12: минимум чистых конверсий у НЕцелевого региона, чтобы вообще сравнивать
+# его CPA с целевым (тот же порог материальности, что A05/A11).
+_A12_MIN_NET_CONVERSIONS_FOR_COMPARISON = 5
+_A12_CPA_OUTLIER_RATIO = 1.5
+
+# A13: тот же порог/коэффициент, применённый к CPA по дню недели вместо кампании.
+_A13_MIN_NET_CONVERSIONS_FOR_COMPARISON = 5
+_A13_CPA_OUTLIER_RATIO = 1.5
+_WEEKDAY_NAMES: tuple[str, ...] = (
+    "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье",
+)
+
+# A14: тот же порог/коэффициент, применённый к CPA по устройству.
+_A14_MIN_NET_CONVERSIONS_FOR_COMPARISON = 5
+_A14_CPA_OUTLIER_RATIO = 1.5
+
+# A15: минимум кликов по площадке, чтобы включить её в ранжирование (отсев
+# статистического шума единичных кликов); доля расхода блока площадок,
+# начиная с которой площадка считается "заметной" в структуре расхода.
+_A15_MIN_CLICKS_FOR_RANKING = 10
+_A15_NOTABLE_SPEND_SHARE = 0.05
+
+# A17: позиция органики в топ-N считается уже "видимой" пользователю —
+# гипотеза каннибализации возможна только при видимой органике.
+_A17_ORGANIC_TOP_POSITION = 3
+
+# A18: минимум суммарных кликов по запросу (across кампаний), чтобы
+# пересечение кампаний за один спрос считалось материальным, не шумом.
+_A18_MIN_CLICKS_FOR_OVERLAP = 10
+
+# A19: тот же принцип outlier-порога, что A05/A11, применён к CPC вместо CPA;
+# минимум кликов, чтобы CPC фразы считался статистически осмысленным.
+_A19_MIN_CLICKS_FOR_COMPARISON = 20
+_A19_CPC_OUTLIER_RATIO = 1.5
+
+# A20: минимум показов для сравнения CTR; CTR <= (медиана * этот коэффициент)
+# считается аномально низким относительно сопоставимых фраз.
+_A20_MIN_IMPRESSIONS_FOR_COMPARISON = 50
+_A20_CTR_LOW_RATIO = 0.5
+
+# A21: минимум кликов, чтобы CTR фразы вообще сравнивать; во сколько раз CTR
+# должен быть выше медианы, чтобы считаться "высоким".
+_A21_MIN_CLICKS_FOR_HIGH_CTR = 5
+_A21_HIGH_CTR_RATIO = 1.5
+
+# A22: минимум кликов по топ-запросу группы объявлений, чтобы вообще
+# проверять пересечение токенов запрос/объявление (иначе шум на единичных
+# кликах). Короткие частицы/предлоги — не несут смысловой нагрузки для
+# сравнения, отбрасываются при токенизации.
+_A22_MIN_CLICKS_FOR_MISMATCH_CHECK = 20
+_STOPWORDS_RU: frozenset[str] = frozenset({
+    "и", "в", "на", "с", "по", "для", "от", "до", "из", "у", "о", "за",
+    "как", "что", "это", "или", "не", "к", "а", "но",
+})
+
+# A24: эвристики-кандидаты на ручную проверку устаревшей цены/акции в тексте
+# объявления (regex по цифрам+валюте/проценту, ключевые слова акций) — НЕ
+# автоматический вердикт "устарело", только список для аналитика (тип A+B).
+_A24_PRICE_PATTERN = re.compile(r"\d[\d\s]{0,6}\s?(₽|руб|%)", re.IGNORECASE)
+_A24_PROMO_WORDS: tuple[str, ...] = (
+    "акция", "скидка", "распродажа", "только сегодня", "спецпредложение",
+)
+
+# A26: минимум месяцев/чистых конверсий, ниже которого оценка кампании
+# считается статистически преждевременной (каталог: "без учёта... малого
+# объёма выборки").
+_A26_MIN_MONTHS_FOR_JUDGMENT = 2
+_A26_MIN_NET_CONVERSIONS_FOR_JUDGMENT = 5
 
 
 # ── Общие хелперы (дублируют паттерн block0.py — блоки compute не делят
@@ -234,6 +361,42 @@ def _net_conversions_expr(con: Any, table: str, goal_ids: list[str]) -> str | No
             return None
         parts.append(f'COALESCE("{col}", 0)')
     return "(" + " + ".join(parts) + ")"
+
+
+def _client_geo_target_terms(config: dict[str, Any]) -> list[str]:
+    """config.client.geo (свободный текст) -> список нормализованных термов.
+
+    Единственное доступное структурированное-ли поле для целевого региона
+    (см. докстринг модуля) — разделители запятая/точка с запятой/слэш.
+    """
+    geo_raw = str(((config.get("client") or {}).get("geo")) or "")
+    parts = re.split(r"[,;/]", geo_raw)
+    return [p.strip().lower() for p in parts if p.strip()]
+
+
+def _is_target_region(location_name: str | None, terms: list[str]) -> bool:
+    """Регистронезависимое двустороннее вхождение подстроки (термин <-> имя)."""
+    name = (location_name or "").strip().lower()
+    if not name or not terms:
+        return False
+    return any(term in name or name in term for term in terms)
+
+
+def _tokenize(text: str | None) -> set[str]:
+    """Текст -> множество значимых токенов (для сравнения запрос vs объявление, A22)."""
+    tokens = re.findall(r"[а-яёa-z0-9]+", (text or "").lower())
+    return {t for t in tokens if t not in _STOPWORDS_RU and len(t) > 1}
+
+
+def _median(values: list[float]) -> float | None:
+    """Медиана отсортированного списка (не изменяет исходный список)."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
 
 
 def _two_proportion_p_value(count1: int, n1: int, count2: int, n2: int) -> float | None:
@@ -944,6 +1107,1005 @@ def _run_a11(
     common.write_metric_artifact(metrics_dir, "a11", rows, confidence_cap=confidence_cap)
 
 
+# ── A12 — реклама показывается в нерелевантной географии ────────────────────
+def _run_a12(
+    paths: Any, config: dict[str, Any], canonical: dict[str, Path],
+    confidence_cap: str, metrics_dir: Path,
+) -> None:
+    """Обязательная последовательность методологии v2 §4 (не одно условие
+
+    "регион != целевой"): (1) CPA нецелевого региона, (2) CPA целевого региона
+    за тот же период, (3) сравнение — находка только при кратном ухудшении.
+    Источник факт. гео — direct_geo.location_of_presence_name (реальные
+    показы/расход по региону), не campaign_targeting.json (настройки таргетинга
+    структурно недоступны, см. докстринг модуля). Целевой регион — из
+    config.client.geo (см. _client_geo_target_terms).
+    """
+    if "direct_geo" not in canonical or not _table_nonempty(canonical["direct_geo"]):
+        _write_unavailable(
+            metrics_dir, "A12", "direct_geo недоступна (гео-отчёт Директа не выгружен)"
+        )
+        return
+
+    terms = _client_geo_target_terms(config)
+    if not terms:
+        _write_unavailable(
+            metrics_dir, "A12",
+            "config.client.geo не заполнен — целевой регион неизвестен, находка "
+            "без сравнения с целевым CPA запрещена методологией (см. §4 A12)",
+        )
+        return
+
+    goal_ids = _macro_goal_ids(config)
+    con = common.open_duckdb(paths)
+    try:
+        expr = _net_conversions_expr(con, "direct_geo", goal_ids)
+        if expr is None:
+            con.close()
+            _write_unavailable(
+                metrics_dir, "A12",
+                "нет чистых конверсий по гео: macro_goals не настроены в "
+                "config.sources.direct или колонки goal_conv_<id> отсутствуют в direct_geo",
+            )
+            return
+        rows = con.execute(
+            "SELECT location_of_presence_name, "
+            "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
+            "COUNT(*) FILTER (WHERE cost_normalized IS NULL), "
+            f"SUM({expr}), SUM(clicks) "
+            "FROM direct_geo WHERE location_of_presence_name IS NOT NULL "
+            "GROUP BY location_of_presence_name"
+        ).fetchall()
+    finally:
+        con.close()
+
+    target_rows: list[tuple[str, float | None, int, int]] = []
+    nontarget_rows: list[tuple[str, float | None, int, int]] = []
+    for name, cost_sum, null_rows, net_conv, clicks in rows:
+        cost = _money(cost_sum, null_rows)
+        entry = (name, cost, int(net_conv or 0), int(clicks or 0))
+        (target_rows if _is_target_region(name, terms) else nontarget_rows).append(entry)
+
+    target_cost_valid = bool(target_rows) and all(c is not None for _, c, _, _ in target_rows)
+    target_cost = sum(c for _, c, _, _ in target_rows if c is not None) if target_cost_valid else None
+    target_conv = sum(v for _, _, v, _ in target_rows)
+    target_cpa = (
+        target_cost / target_conv if (target_cost_valid and target_conv > 0 and target_cost) else None
+    )
+
+    rows_out: list[dict[str, Any]] = [{
+        "check_id": "A12",
+        "finding": "summary",
+        "target_region_terms": terms,
+        "target_regions_matched": sorted({n for n, _, _, _ in target_rows}),
+        "target_region_cost_normalized_rub": round(target_cost, 2) if target_cost is not None else None,
+        "target_region_net_conversions": target_conv,
+        "target_region_cpa_rub": round(target_cpa, 2) if target_cpa is not None else None,
+        "confidence": _cap("MED", confidence_cap),
+    }]
+    for name, cost, net_conv, clicks in sorted(nontarget_rows, key=lambda r: r[0] or ""):
+        cpa = (
+            cost / net_conv
+            if (cost is not None and net_conv >= _A12_MIN_NET_CONVERSIONS_FOR_COMPARISON)
+            else None
+        )
+        ratio = (cpa / target_cpa) if (cpa is not None and target_cpa) else None
+        rows_out.append({
+            "check_id": "A12",
+            "finding": "region_detail",
+            "location_of_presence_name": name,
+            "cost_normalized_rub": round(cost, 2) if cost is not None else None,
+            "clicks": clicks,
+            "net_conversions": net_conv,
+            "cpa_rub": round(cpa, 2) if cpa is not None else None,
+            "target_region_cpa_rub": round(target_cpa, 2) if target_cpa is not None else None,
+            "cpa_to_target_ratio": round(ratio, 3) if ratio is not None else None,
+            "outlier_ratio_threshold": _A12_CPA_OUTLIER_RATIO,
+            "zero_conversion_region": bool(cost is not None and cost > 0 and net_conv == 0),
+            "off_target_geo_worse": bool(ratio is not None and ratio >= _A12_CPA_OUTLIER_RATIO),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "a12", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A13 — день недели/время показа даёт устойчиво слабую экономику ─────────
+def _run_a13(
+    paths: Any, config: dict[str, Any], canonical: dict[str, Path],
+    confidence_cap: str, metrics_dir: Path,
+) -> None:
+    """Час показа НЕ проверяется этим пайплайном ни для одного клиента:
+
+    CAMPAIGN_PERFORMANCE_REPORT Директа отдаётся только по дням (Date), без
+    измерения Hour (src/extract/direct.py, п.1) — структурное ограничение
+    источника, тот же принцип, что у A07. День недели — из
+    direct_campaigns.date (кампанийный агрегат Директа, не визит-уровень,
+    поэтому MED-потолок, как и остальная кампанийная экономика блока).
+    """
+    if "direct_campaigns" not in canonical or not _table_nonempty(canonical["direct_campaigns"]):
+        _write_unavailable(
+            metrics_dir, "A13",
+            "direct_campaigns недоступна (отчёт по кампаниям Директа не выгружен)",
+        )
+        return
+
+    goal_ids = _macro_goal_ids(config)
+    con = common.open_duckdb(paths)
+    try:
+        expr = _net_conversions_expr(con, "direct_campaigns", goal_ids)
+        if expr is None:
+            con.close()
+            _write_unavailable(
+                metrics_dir, "A13",
+                "нет чистых конверсий по дням: macro_goals не настроены в "
+                "config.sources.direct или колонки goal_conv_<id> отсутствуют в direct_campaigns",
+            )
+            return
+        rows = con.execute(
+            "SELECT date, "
+            "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
+            "COUNT(*) FILTER (WHERE cost_normalized IS NULL), "
+            f"SUM({expr}) "
+            "FROM direct_campaigns WHERE date IS NOT NULL GROUP BY date"
+        ).fetchall()
+    finally:
+        con.close()
+
+    weekday_cost: dict[int, float] = {i: 0.0 for i in range(7)}
+    weekday_cost_valid: dict[int, bool] = {i: True for i in range(7)}
+    weekday_conv: dict[int, int] = {i: 0 for i in range(7)}
+    weekday_seen: dict[int, bool] = {i: False for i in range(7)}
+    for day, cost_sum, null_rows, net_conv in rows:
+        wd = day.weekday()
+        weekday_seen[wd] = True
+        cost = _money(cost_sum, null_rows)
+        if cost is None:
+            weekday_cost_valid[wd] = False
+        else:
+            weekday_cost[wd] += cost
+        weekday_conv[wd] += int(net_conv or 0)
+
+    comparable_cpas = [
+        weekday_cost[i] / weekday_conv[i]
+        for i in range(7)
+        if weekday_seen[i] and weekday_cost_valid[i]
+        and weekday_conv[i] >= _A13_MIN_NET_CONVERSIONS_FOR_COMPARISON
+    ]
+    median_cpa = _median(comparable_cpas)
+
+    rows_out: list[dict[str, Any]] = [{
+        "check_id": "A13",
+        "finding": "hour_of_day_unavailable",
+        "reason": "CAMPAIGN_PERFORMANCE_REPORT Директа не содержит измерения Hour "
+                  "— структурное ограничение источника, не текущего прогона",
+        "confidence": "LOW",
+    }]
+    for i in range(7):
+        if not weekday_seen[i]:
+            continue
+        cost = weekday_cost[i] if weekday_cost_valid[i] else None
+        net_conv = weekday_conv[i]
+        cpa = (
+            cost / net_conv
+            if (cost is not None and net_conv >= _A13_MIN_NET_CONVERSIONS_FOR_COMPARISON)
+            else None
+        )
+        ratio = (cpa / median_cpa) if (cpa is not None and median_cpa) else None
+        rows_out.append({
+            "check_id": "A13",
+            "finding": "weekday_economics",
+            "weekday": _WEEKDAY_NAMES[i],
+            "weekday_index": i,
+            "cost_normalized_rub": round(cost, 2) if cost is not None else None,
+            "net_conversions": net_conv,
+            "cpa_rub": round(cpa, 2) if cpa is not None else None,
+            "median_weekday_cpa_rub": round(median_cpa, 2) if median_cpa is not None else None,
+            "cpa_to_median_ratio": round(ratio, 3) if ratio is not None else None,
+            "outlier_ratio_threshold": _A13_CPA_OUTLIER_RATIO,
+            "weekday_persistently_worse": bool(ratio is not None and ratio >= _A13_CPA_OUTLIER_RATIO),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "a13", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A14 — устройства различаются по CPA и конверсии ─────────────────────────
+def _run_a14(
+    paths: Any, config: dict[str, Any], defaults: dict[str, Any],
+    canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path,
+) -> None:
+    """Два независимых среза: cr_by_device — визит-уровень (source_group='ad'
+
+    визиты по device из visits.parquet), может быть HIGH при достаточной
+    выборке (тот же принцип-исключение, что paid_vs_site_gap в A01).
+    cpa_by_device — кампанийный агрегат (direct_campaigns.device + goal_conv),
+    поэтому не выше MED, как остальная кампанийная экономика блока.
+    """
+    min_sample = int(defaults.get("min_sample_visits", 500))
+    alpha = float(defaults.get("significance_alpha", 0.05))
+
+    con = common.open_duckdb(paths)
+    try:
+        device_rows = con.execute(
+            "SELECT device, COUNT(*), SUM(CASE WHEN form_submit THEN 1 ELSE 0 END) "
+            "FROM visits WHERE source_group = 'ad' AND device IS NOT NULL GROUP BY device"
+        ).fetchall()
+        total_ad_visits, total_ad_submit = con.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN form_submit THEN 1 ELSE 0 END) "
+            "FROM visits WHERE source_group = 'ad'"
+        ).fetchone()
+
+        cpa_rows = None
+        if "direct_campaigns" in canonical and _table_nonempty(canonical["direct_campaigns"]):
+            goal_ids = _macro_goal_ids(config)
+            expr = _net_conversions_expr(con, "direct_campaigns", goal_ids)
+            if expr is not None:
+                cpa_rows = con.execute(
+                    "SELECT device, "
+                    "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
+                    "COUNT(*) FILTER (WHERE cost_normalized IS NULL), "
+                    f"SUM({expr}), SUM(clicks) "
+                    "FROM direct_campaigns WHERE device IS NOT NULL GROUP BY device"
+                ).fetchall()
+    finally:
+        con.close()
+
+    total_ad_visits = int(total_ad_visits or 0)
+    total_ad_submit = int(total_ad_submit or 0)
+    overall_rate = (total_ad_submit / total_ad_visits) if total_ad_visits > 0 else None
+
+    rows_out: list[dict[str, Any]] = []
+    for device, n, submit in device_rows:
+        n = int(n or 0)
+        submit = int(submit or 0)
+        rate = (submit / n) if n > 0 else None
+        p_value = (
+            _two_proportion_p_value(submit, n, total_ad_submit, total_ad_visits)
+            if n > 0 and total_ad_visits > 0 else None
+        )
+        significant = p_value is not None and p_value < alpha and n >= min_sample
+        worse = bool(
+            significant and rate is not None and overall_rate is not None and rate < overall_rate
+        )
+        rows_out.append({
+            "check_id": "A14",
+            "finding": "cr_by_device",
+            "device": device,
+            "ad_visits": n,
+            "ad_form_submit_rate": round(rate, 4) if rate is not None else None,
+            "overall_ad_form_submit_rate": round(overall_rate, 4) if overall_rate is not None else None,
+            "p_value": round(p_value, 6) if p_value is not None else None,
+            "significance_alpha": alpha,
+            "device_cr_worse_than_overall": worse,
+            "confidence": _cap(_sample_confidence(n, min_sample) if n > 0 else "LOW", confidence_cap),
+        })
+
+    if cpa_rows is None:
+        rows_out.append({
+            "check_id": "A14",
+            "finding": "cpa_by_device_unavailable",
+            "reason": "нет чистых конверсий по устройствам: macro_goals не настроены "
+                      "в config.sources.direct, direct_campaigns недоступна, или "
+                      "колонки goal_conv_<id> отсутствуют",
+            "confidence": "LOW",
+        })
+    else:
+        by_device: dict[str, dict[str, Any]] = {
+            device: {"cost": _money(cost_sum, null_rows), "net_conv": int(net_conv or 0), "clicks": int(clicks or 0)}
+            for device, cost_sum, null_rows, net_conv, clicks in cpa_rows
+        }
+        comparable_cpas = [
+            v["cost"] / v["net_conv"] for v in by_device.values()
+            if v["cost"] is not None and v["net_conv"] >= _A14_MIN_NET_CONVERSIONS_FOR_COMPARISON
+        ]
+        median_cpa = _median(comparable_cpas)
+        for device, v in sorted(by_device.items()):
+            cpa = (
+                v["cost"] / v["net_conv"]
+                if (v["cost"] is not None and v["net_conv"] >= _A14_MIN_NET_CONVERSIONS_FOR_COMPARISON)
+                else None
+            )
+            ratio = (cpa / median_cpa) if (cpa is not None and median_cpa) else None
+            rows_out.append({
+                "check_id": "A14",
+                "finding": "cpa_by_device",
+                "device": device,
+                "cost_normalized_rub": round(v["cost"], 2) if v["cost"] is not None else None,
+                "net_conversions": v["net_conv"],
+                "clicks": v["clicks"],
+                "cpa_rub": round(cpa, 2) if cpa is not None else None,
+                "median_device_cpa_rub": round(median_cpa, 2) if median_cpa is not None else None,
+                "cpa_to_median_ratio": round(ratio, 3) if ratio is not None else None,
+                "outlier_ratio_threshold": _A14_CPA_OUTLIER_RATIO,
+                "device_cpa_persistently_worse": bool(
+                    ratio is not None and ratio >= _A14_CPA_OUTLIER_RATIO
+                ),
+                "confidence": _cap("MED", confidence_cap),
+            })
+
+    common.write_metric_artifact(metrics_dir, "a14", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A15 — площадки РСЯ/приложения дают мусорный трафик ──────────────────────
+def _run_a15(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    """direct_placements не несёт goal_conv_<id> (записана через
+
+    write_canonical_table, не _write_direct_table — см. build_canonical.build())
+    — "чистые цели" по площадке структурно недоступны, только conversions_all
+    (сырое "по любой цели", запрещено правилом 11 каталога как бизнес-
+    результат — поэтому не используется вовсе). Ранжирование — по расходу и
+    вовлечению (клики) с явной пометкой недоступности net-конверсий.
+    """
+    if "direct_placements" not in canonical or not _table_nonempty(canonical["direct_placements"]):
+        _write_unavailable(
+            metrics_dir, "A15", "direct_placements недоступна (отчёт по площадкам РСЯ не выгружен)"
+        )
+        return
+
+    con = common.open_duckdb(paths)
+    try:
+        rows = con.execute(
+            "SELECT placement, ad_network_type, "
+            "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
+            "COUNT(*) FILTER (WHERE cost_normalized IS NULL), SUM(clicks) "
+            "FROM direct_placements WHERE placement IS NOT NULL "
+            "GROUP BY placement, ad_network_type"
+        ).fetchall()
+        total_cost_sum, total_null_rows = con.execute(
+            "SELECT SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
+            "COUNT(*) FILTER (WHERE cost_normalized IS NULL) FROM direct_placements"
+        ).fetchone()
+    finally:
+        con.close()
+
+    total_cost = _money(total_cost_sum, total_null_rows)
+
+    rows_out: list[dict[str, Any]] = [{
+        "check_id": "A15",
+        "finding": "net_conversions_unavailable",
+        "reason": "direct_placements не содержит goal_conv_<id> (без динамических "
+                  "колонок целей) — ранжирование только по расходу/кликам",
+        "confidence": "LOW",
+    }]
+    for placement, ad_network_type, cost_sum, null_rows, clicks in sorted(
+        rows, key=lambda r: r[0] or ""
+    ):
+        clicks = int(clicks or 0)
+        if clicks < _A15_MIN_CLICKS_FOR_RANKING:
+            continue
+        cost = _money(cost_sum, null_rows)
+        cost_share = (cost / total_cost) if (cost is not None and total_cost) else None
+        rows_out.append({
+            "check_id": "A15",
+            "finding": "placement_ranking",
+            "placement": placement,
+            "ad_network_type": ad_network_type,
+            "cost_normalized_rub": round(cost, 2) if cost is not None else None,
+            "clicks": clicks,
+            "cost_share_of_placements_total": round(cost_share, 4) if cost_share is not None else None,
+            "notable_spend_share": bool(cost_share is not None and cost_share >= _A15_NOTABLE_SPEND_SHARE),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "a15", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A16 — ретаргетинг (данных нет структурно, см. докстринг модуля) ────────
+def _run_a16(metrics_dir: Path) -> None:
+    _write_unavailable(
+        metrics_dir, "A16",
+        "campaign_targeting.json (ретаргетинг-аудитории, частота, окно) не входит "
+        "в canonical-слой — extract пишет его в data/raw/direct/, но build_canonical.py "
+        "не строит из него ни одной таблицы; расширение схемы вне allowed_files "
+        "этой задачи, тот же принцип, что у A07",
+    )
+
+
+# ── A17 — брендовая реклама каннибализирует бесплатный спрос ───────────────
+def _run_a17(
+    paths: Any, config: dict[str, Any], canonical: dict[str, Path],
+    confidence_cap: str, metrics_dir: Path,
+) -> None:
+    """"Наличие рекламы конкурентов" не проверяется этим источником (нет
+
+    данных о чужой рекламе) — явная запись competitor_ads_not_checked.
+    Сопоставляется только платный брендовый расход (direct_queries,
+    классификация is_brand_query — той же функцией, что build_canonical
+    использует для seo_queries.is_brand) с органическими позициями бренда
+    (seo_queries.is_brand, взвешенная по показам средняя позиция).
+    """
+    brand_terms = config.get("brand_terms") or []
+    if not brand_terms:
+        _write_unavailable(
+            metrics_dir, "A17", "config.brand_terms не заполнен — классификация бренд/небренд невозможна"
+        )
+        return
+
+    goal_ids = _macro_goal_ids(config)
+    con = common.open_duckdb(paths)
+    try:
+        phrase_types_sql = ", ".join(f"'{t}'" for t in _PHRASE_MATCH_TYPES)
+        query_rows = con.execute(
+            "SELECT query, "
+            "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
+            "COUNT(*) FILTER (WHERE cost_normalized IS NULL), SUM(clicks) "
+            f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) GROUP BY query"
+        ).fetchall()
+
+        net_conv_by_query: dict[str, int] = {}
+        expr = _net_conversions_expr(con, "direct_queries", goal_ids)
+        if expr is not None:
+            conv_rows = con.execute(
+                f"SELECT query, SUM({expr}) FROM direct_queries "
+                f"WHERE match_type IN ({phrase_types_sql}) GROUP BY query"
+            ).fetchall()
+            net_conv_by_query = {q: int(v or 0) for q, v in conv_rows}
+
+        organic_rows = []
+        if "seo_queries" in canonical and _table_nonempty(canonical["seo_queries"]):
+            organic_rows = con.execute(
+                "SELECT query, "
+                "SUM(total_shows * avg_show_position) / NULLIF(SUM(total_shows), 0), "
+                "SUM(total_clicks), SUM(total_shows) "
+                "FROM seo_queries WHERE is_brand = true GROUP BY query"
+            ).fetchall()
+    finally:
+        con.close()
+
+    brand_paid = [
+        (q, _money(cost_sum, null_rows), int(clicks or 0), net_conv_by_query.get(q))
+        for q, cost_sum, null_rows, clicks in query_rows
+        if is_brand_query(q, brand_terms)
+    ]
+    organic_by_query = {
+        q: {"avg_position": pos, "clicks": int(clicks or 0), "shows": int(shows or 0)}
+        for q, pos, clicks, shows in organic_rows
+    }
+
+    rows_out: list[dict[str, Any]] = [{
+        "check_id": "A17",
+        "finding": "competitor_ads_not_checked",
+        "reason": "наличие рекламы конкурентов по бренду не проверяется доступными "
+                  "источниками (нет данных о чужой рекламе)",
+        "confidence": "LOW",
+    }]
+    if not organic_rows:
+        rows_out.append({
+            "check_id": "A17",
+            "finding": "organic_brand_data_unavailable",
+            "reason": "seo_queries недоступна или без брендовых запросов — сравнение "
+                      "с органикой невозможно, показан только платный брендовый расход",
+            "confidence": "LOW",
+        })
+    for q, cost, clicks, net_conv in sorted(brand_paid, key=lambda r: r[0] or ""):
+        organic = organic_by_query.get(q)
+        organic_top = bool(
+            organic and organic["avg_position"] is not None
+            and organic["avg_position"] <= _A17_ORGANIC_TOP_POSITION
+        )
+        rows_out.append({
+            "check_id": "A17",
+            "finding": "brand_query_paid_vs_organic",
+            "query": q,
+            "cost_normalized_rub": round(cost, 2) if cost is not None else None,
+            "clicks": clicks,
+            "net_conversions": net_conv,
+            "organic_avg_position": (
+                round(organic["avg_position"], 2) if organic and organic["avg_position"] is not None else None
+            ),
+            "organic_top_position_threshold": _A17_ORGANIC_TOP_POSITION,
+            "organic_already_visible": organic_top,
+            "possible_cannibalization": bool(cost is not None and cost > 0 and organic_top),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "a17", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A18 — кампании конкурируют друг с другом за одинаковый спрос ───────────
+def _run_a18(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    """Только пересечение по поисковому запросу (direct_queries) — по
+
+    ключевым фразам/аудиториям/гео не проверяется (keywords.parquet/
+    campaign_targeting.json структурно недоступны, см. докстринг модуля);
+    это ограничение уже отражено в config/methodology.yaml
+    (A18.requires == ["direct_queries"]).
+    """
+    con = common.open_duckdb(paths)
+    try:
+        rows = con.execute(
+            "SELECT query, campaign_id, "
+            "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
+            "COUNT(*) FILTER (WHERE cost_normalized IS NULL), SUM(clicks) "
+            "FROM direct_queries WHERE campaign_id IS NOT NULL "
+            "GROUP BY query, campaign_id"
+        ).fetchall()
+    finally:
+        con.close()
+
+    by_query: dict[str, list[tuple[str, float | None, int]]] = {}
+    for query, campaign_id, cost_sum, null_rows, clicks in rows:
+        by_query.setdefault(query, []).append((campaign_id, _money(cost_sum, null_rows), int(clicks or 0)))
+
+    rows_out: list[dict[str, Any]] = []
+    for query, campaigns in sorted(by_query.items()):
+        total_clicks = sum(c for _, _, c in campaigns)
+        if len(campaigns) < 2 or total_clicks < _A18_MIN_CLICKS_FOR_OVERLAP:
+            continue
+        rows_out.append({
+            "check_id": "A18",
+            "query": query,
+            "campaign_count": len(campaigns),
+            "total_clicks": total_clicks,
+            "campaigns": [
+                {
+                    "campaign_id": cid,
+                    "cost_normalized_rub": round(cost, 2) if cost is not None else None,
+                    "clicks": clicks,
+                }
+                for cid, cost, clicks in sorted(campaigns, key=lambda r: r[0] or "")
+            ],
+            "competing_campaigns": True,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "a18", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A19 — CPC аномально высок относительно близких запросов ────────────────
+def _run_a19(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    con = common.open_duckdb(paths)
+    try:
+        phrase_types_sql = ", ".join(f"'{t}'" for t in _PHRASE_MATCH_TYPES)
+        rows = con.execute(
+            "SELECT query, match_type, "
+            "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
+            "COUNT(*) FILTER (WHERE cost_normalized IS NULL), SUM(clicks) "
+            f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) "
+            "GROUP BY query, match_type"
+        ).fetchall()
+    finally:
+        con.close()
+
+    entries: list[tuple[str, str, float | None, int]] = []
+    comparable_cpcs: list[float] = []
+    for query, match_type, cost_sum, null_rows, clicks in rows:
+        cost = _money(cost_sum, null_rows)
+        clicks = int(clicks or 0)
+        entries.append((query, match_type, cost, clicks))
+        if cost is not None and clicks >= _A19_MIN_CLICKS_FOR_COMPARISON:
+            comparable_cpcs.append(cost / clicks)
+    median_cpc = _median(comparable_cpcs)
+
+    rows_out: list[dict[str, Any]] = []
+    for query, match_type, cost, clicks in sorted(entries, key=lambda r: (r[0] or "", r[1] or "")):
+        cpc = (
+            cost / clicks if (cost is not None and clicks >= _A19_MIN_CLICKS_FOR_COMPARISON) else None
+        )
+        ratio = (cpc / median_cpc) if (cpc is not None and median_cpc) else None
+        rows_out.append({
+            "check_id": "A19",
+            "query": query,
+            "match_type": match_type,
+            "cost_normalized_rub": round(cost, 2) if cost is not None else None,
+            "clicks": clicks,
+            "cpc_rub": round(cpc, 2) if cpc is not None else None,
+            "median_cpc_rub": round(median_cpc, 2) if median_cpc is not None else None,
+            "cpc_to_median_ratio": round(ratio, 3) if ratio is not None else None,
+            "outlier_ratio_threshold": _A19_CPC_OUTLIER_RATIO,
+            "cpc_anomalously_high": bool(ratio is not None and ratio >= _A19_CPC_OUTLIER_RATIO),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "a19", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A20 — низкий CTR у релевантных показов ──────────────────────────────────
+def _run_a20(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    con = common.open_duckdb(paths)
+    try:
+        phrase_types_sql = ", ".join(f"'{t}'" for t in _PHRASE_MATCH_TYPES)
+        rows = con.execute(
+            "SELECT query, match_type, SUM(clicks), SUM(impressions) "
+            f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) "
+            "GROUP BY query, match_type"
+        ).fetchall()
+    finally:
+        con.close()
+
+    entries: list[tuple[str, str, int, int, float | None]] = []
+    comparable_ctrs: list[float] = []
+    for query, match_type, clicks, impressions in rows:
+        clicks = int(clicks or 0)
+        impressions = int(impressions or 0)
+        ctr = (clicks / impressions) if impressions > 0 else None
+        entries.append((query, match_type, clicks, impressions, ctr))
+        if impressions >= _A20_MIN_IMPRESSIONS_FOR_COMPARISON and ctr is not None:
+            comparable_ctrs.append(ctr)
+    median_ctr = _median(comparable_ctrs)
+
+    rows_out: list[dict[str, Any]] = []
+    for query, match_type, clicks, impressions, ctr in sorted(
+        entries, key=lambda r: (r[0] or "", r[1] or "")
+    ):
+        eligible = impressions >= _A20_MIN_IMPRESSIONS_FOR_COMPARISON and ctr is not None
+        ratio = (ctr / median_ctr) if (eligible and median_ctr) else None
+        rows_out.append({
+            "check_id": "A20",
+            "query": query,
+            "match_type": match_type,
+            "clicks": clicks,
+            "impressions": impressions,
+            "ctr": round(ctr, 4) if ctr is not None else None,
+            "median_ctr": round(median_ctr, 4) if median_ctr is not None else None,
+            "ctr_to_median_ratio": round(ratio, 3) if ratio is not None else None,
+            "low_ctr_ratio_threshold": _A20_CTR_LOW_RATIO,
+            "min_impressions_for_comparison": _A20_MIN_IMPRESSIONS_FOR_COMPARISON,
+            "anomalously_low_ctr": bool(eligible and ratio is not None and ratio <= _A20_CTR_LOW_RATIO),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "a20", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A21 — высокий CTR сочетается с низкой конверсией ────────────────────────
+def _run_a21(
+    paths: Any, config: dict[str, Any], canonical: dict[str, Path],
+    confidence_cap: str, metrics_dir: Path,
+) -> None:
+    goal_ids = _macro_goal_ids(config)
+    con = common.open_duckdb(paths)
+    try:
+        expr = _net_conversions_expr(con, "direct_queries", goal_ids)
+        if expr is None:
+            con.close()
+            _write_unavailable(
+                metrics_dir, "A21",
+                "нет чистых конверсий по запросам: macro_goals не настроены в "
+                "config.sources.direct или колонки goal_conv_<id> отсутствуют в direct_queries",
+            )
+            return
+        phrase_types_sql = ", ".join(f"'{t}'" for t in _PHRASE_MATCH_TYPES)
+        rows = con.execute(
+            "SELECT query, match_type, SUM(clicks), SUM(impressions), "
+            f"SUM({expr}) "
+            f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) "
+            "GROUP BY query, match_type"
+        ).fetchall()
+        total_visits, total_submit = con.execute(
+            "SELECT COUNT(*), SUM(CASE WHEN form_submit THEN 1 ELSE 0 END) FROM visits"
+        ).fetchone()
+    finally:
+        con.close()
+
+    total_visits = int(total_visits or 0)
+    site_rate = (total_submit or 0) / total_visits if total_visits > 0 else None
+
+    entries: list[tuple[str, str, int, int, float | None, int]] = []
+    comparable_ctrs: list[float] = []
+    for query, match_type, clicks, impressions, net_conv in rows:
+        clicks = int(clicks or 0)
+        impressions = int(impressions or 0)
+        net_conv = int(net_conv or 0)
+        ctr = (clicks / impressions) if impressions > 0 else None
+        entries.append((query, match_type, clicks, impressions, ctr, net_conv))
+        if clicks >= _A21_MIN_CLICKS_FOR_HIGH_CTR and ctr is not None:
+            comparable_ctrs.append(ctr)
+    median_ctr = _median(comparable_ctrs)
+
+    rows_out: list[dict[str, Any]] = []
+    for query, match_type, clicks, impressions, ctr, net_conv in sorted(
+        entries, key=lambda r: (r[0] or "", r[1] or "")
+    ):
+        eligible = clicks >= _A21_MIN_CLICKS_FOR_HIGH_CTR and ctr is not None
+        ratio = (ctr / median_ctr) if (eligible and median_ctr) else None
+        high_ctr = bool(eligible and ratio is not None and ratio >= _A21_HIGH_CTR_RATIO)
+        rows_out.append({
+            "check_id": "A21",
+            "query": query,
+            "match_type": match_type,
+            "clicks": clicks,
+            "impressions": impressions,
+            "ctr": round(ctr, 4) if ctr is not None else None,
+            "median_ctr": round(median_ctr, 4) if median_ctr is not None else None,
+            "ctr_to_median_ratio": round(ratio, 3) if ratio is not None else None,
+            "high_ctr_ratio_threshold": _A21_HIGH_CTR_RATIO,
+            "net_conversions": net_conv,
+            "high_ctr": high_ctr,
+            "high_ctr_low_conversion": bool(high_ctr and net_conv == 0),
+            "site_form_submit_rate_context": round(site_rate, 4) if site_rate is not None else None,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "a21", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A22 — запрос, объявление и посадочная не соответствуют друг другу ──────
+def _run_a22(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    """Только запрос vs текст объявления (ad_texts, ТОЛЬКО active — см.
+
+    докстринг модуля). Соответствие запрос->посадочная — в A23 (не
+    дублируется здесь, один источник правды на одну цифру, тот же принцип,
+    что paid_vs_site_gap/C06 в methodology-v2 §6). Поведение на странице
+    после клика не проверяется: канонического join визита на конкретный
+    запрос нет (ym:s:lastSignDirectClickOrder отсутствует в SCHEMAS["visits"],
+    см. докстринг модуля про A02–A08). Эвристика (пересечение токенов
+    запрос/объявление) — LOW по построению, требует ручного подтверждения
+    (каталог: тип A+B).
+    """
+    if "ad_texts" not in canonical or not _table_nonempty(canonical["ad_texts"]):
+        _write_unavailable(
+            metrics_dir, "A22", "ad_texts недоступна (нет активных объявлений State=ON)"
+        )
+        return
+    if "direct_queries" not in canonical or not _table_nonempty(canonical["direct_queries"]):
+        _write_unavailable(metrics_dir, "A22", "direct_queries недоступна")
+        return
+
+    con = common.open_duckdb(paths)
+    try:
+        ad_rows = con.execute(
+            "SELECT campaign_id, ad_group_id, title, title2, text "
+            "FROM ad_texts WHERE ad_group_id IS NOT NULL"
+        ).fetchall()
+        phrase_types_sql = ", ".join(f"'{t}'" for t in _PHRASE_MATCH_TYPES)
+        query_rows = con.execute(
+            "SELECT campaign_id, ad_group_id, query, SUM(clicks) "
+            f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) "
+            "AND ad_group_id IS NOT NULL GROUP BY campaign_id, ad_group_id, query"
+        ).fetchall()
+    finally:
+        con.close()
+
+    ads_by_group: dict[tuple[str, str], list[set[str]]] = {}
+    for campaign_id, ad_group_id, title, title2, text in ad_rows:
+        ads_by_group.setdefault((campaign_id, ad_group_id), []).append(
+            _tokenize(" ".join(filter(None, [title, title2, text])))
+        )
+
+    top_query_by_group: dict[tuple[str, str], tuple[str, int]] = {}
+    for campaign_id, ad_group_id, query, clicks in query_rows:
+        key = (campaign_id, ad_group_id)
+        clicks = int(clicks or 0)
+        current = top_query_by_group.get(key)
+        if current is None or clicks > current[1]:
+            top_query_by_group[key] = (query, clicks)
+
+    rows_out: list[dict[str, Any]] = []
+    for key, (query, clicks) in sorted(top_query_by_group.items(), key=lambda kv: (kv[0][0] or "", kv[0][1] or "")):
+        ad_token_sets = ads_by_group.get(key)
+        if ad_token_sets is None or clicks < _A22_MIN_CLICKS_FOR_MISMATCH_CHECK:
+            continue
+        campaign_id, ad_group_id = key
+        query_tokens = _tokenize(query)
+        best_overlap = max((len(query_tokens & ad_tokens) for ad_tokens in ad_token_sets), default=0)
+        rows_out.append({
+            "check_id": "A22",
+            "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
+            "top_query": query,
+            "top_query_clicks": clicks,
+            "ads_in_group": len(ad_token_sets),
+            "shared_keyword_tokens": best_overlap,
+            "query_ad_keyword_mismatch": bool(query_tokens) and best_overlap == 0,
+            "confidence": _cap("LOW", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "a22", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A23 — конкретный спрос ведётся на слишком общую страницу ───────────────
+def _run_a23(
+    paths: Any, defaults: dict[str, Any], canonical: dict[str, Path],
+    confidence_cap: str, metrics_dir: Path,
+) -> None:
+    """Без конфигурации "общих/тематических" страниц (её нет в config.yaml,
+
+    вне allowed_files этой задачи) — эвристика по глубине entry_page (число
+    непустых сегментов пути): depth<=1 — "общая" (главная/категория),
+    depth>=2 — "тематическая" (конкретная страница). Визит-уровень
+    (source_group='ad'), поэтому может быть HIGH при достаточной выборке —
+    тот же принцип-исключение, что paid_vs_site_gap в A01.
+    """
+    min_sample = int(defaults.get("min_sample_visits", 500))
+    alpha = float(defaults.get("significance_alpha", 0.05))
+
+    con = common.open_duckdb(paths)
+    try:
+        rows = con.execute(
+            "SELECT entry_page, COUNT(*), SUM(CASE WHEN form_submit THEN 1 ELSE 0 END) "
+            "FROM visits WHERE source_group = 'ad' AND entry_page IS NOT NULL GROUP BY entry_page"
+        ).fetchall()
+    finally:
+        con.close()
+
+    general_n = general_submit = specific_n = specific_submit = 0
+    for entry_page, n, submit in rows:
+        depth = len([seg for seg in (entry_page or "").split("/") if seg])
+        n = int(n or 0)
+        submit = int(submit or 0)
+        if depth <= 1:
+            general_n += n
+            general_submit += submit
+        else:
+            specific_n += n
+            specific_submit += submit
+
+    general_rate = (general_submit / general_n) if general_n > 0 else None
+    specific_rate = (specific_submit / specific_n) if specific_n > 0 else None
+    p_value = (
+        _two_proportion_p_value(general_submit, general_n, specific_submit, specific_n)
+        if general_n > 0 and specific_n > 0 else None
+    )
+    significant = (
+        p_value is not None and p_value < alpha
+        and general_n >= min_sample and specific_n >= min_sample
+    )
+    generic_underperforms = bool(
+        significant and general_rate is not None and specific_rate is not None
+        and general_rate < specific_rate
+    )
+
+    rows_out = [{
+        "check_id": "A23",
+        "general_landing_ad_visits": general_n,
+        "general_landing_form_submit_rate": round(general_rate, 4) if general_rate is not None else None,
+        "specific_landing_ad_visits": specific_n,
+        "specific_landing_form_submit_rate": round(specific_rate, 4) if specific_rate is not None else None,
+        "p_value": round(p_value, 6) if p_value is not None else None,
+        "significance_alpha": alpha,
+        "min_sample_visits": min_sample,
+        "generic_landing_underperforms": generic_underperforms,
+        "confidence": _cap(
+            "HIGH" if (general_n >= min_sample and specific_n >= min_sample) else "MED",
+            confidence_cap,
+        ),
+    }]
+    common.write_metric_artifact(metrics_dir, "a23", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A24 — устаревшая цена/акция/наличие в объявлении ────────────────────────
+def _run_a24(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    """Тип каталога A+B: компьютер не подтверждает актуальность цены/акции —
+
+    site_pages не хранит цену/наличие товара (см. SCHEMAS["site_pages"]).
+    Функция только отбирает КАНДИДАТОВ на ручную проверку (regex по цифра+
+    валюта/процент, ключевые слова акций) — не автоматический вердикт.
+    """
+    if "ad_texts" not in canonical or not _table_nonempty(canonical["ad_texts"]):
+        _write_unavailable(
+            metrics_dir, "A24", "ad_texts недоступна (нет активных объявлений State=ON)"
+        )
+        return
+
+    con = common.open_duckdb(paths)
+    try:
+        ad_rows = con.execute(
+            "SELECT ad_id, campaign_id, ad_group_id, title, title2, text, href FROM ad_texts"
+        ).fetchall()
+    finally:
+        con.close()
+
+    has_site_crawl = "site_pages" in canonical and _table_nonempty(canonical["site_pages"])
+
+    rows_out: list[dict[str, Any]] = [{
+        "check_id": "A24",
+        "finding": "manual_verification_required",
+        "reason": "автоматическая сверка цены/наличия с сайтом невозможна: site_pages "
+                  "не хранит цену/наличие товара — только ручная проверка (тип A+B)",
+        "site_crawl_available_for_manual_check": has_site_crawl,
+        "confidence": "LOW",
+    }]
+    for ad_id, campaign_id, ad_group_id, title, title2, text, href in ad_rows:
+        full_text = " ".join(filter(None, [title, title2, text]))
+        has_price = bool(_A24_PRICE_PATTERN.search(full_text))
+        has_promo_word = any(w in full_text.lower() for w in _A24_PROMO_WORDS)
+        if not has_price and not has_promo_word:
+            continue
+        rows_out.append({
+            "check_id": "A24",
+            "finding": "manual_check_candidate",
+            "ad_id": ad_id,
+            "campaign_id": campaign_id,
+            "ad_group_id": ad_group_id,
+            "href": href,
+            "has_price_pattern": has_price,
+            "has_promo_word": has_promo_word,
+            "confidence": "LOW",
+        })
+
+    common.write_metric_artifact(metrics_dir, "a24", rows_out, confidence_cap=confidence_cap)
+
+
+# ── A25 — товарный фид (данных нет структурно, см. докстринг модуля) ───────
+def _run_a25(metrics_dir: Path) -> None:
+    _write_unavailable(
+        metrics_dir, "A25",
+        "product_feed.parquet не входит в canonical-слой — extract пишет его в "
+        "data/raw/direct/ (если фид используется), но build_canonical.py не строит "
+        "из него ни одной таблицы; расширение схемы вне allowed_files этой задачи, "
+        "тот же принцип, что у A07/A16",
+    )
+
+
+# ── A26 — кампании оценены без учёта лага, сезонности или малого объёма ────
+def _run_a26(
+    paths: Any, config: dict[str, Any], canonical: dict[str, Path],
+    confidence_cap: str, metrics_dir: Path,
+) -> None:
+    """Сезонность (Wordstat) НЕ проверяется этим источником — нет канонической
+
+    таблицы wordstat (extract пишет данные только в raw, join сюда не введён —
+    optional=["wordstat"] в реестре относится к грубой доступности источника
+    для степени деградации, не к физическому join в этой функции). Лаг до
+    цели на визит-уровне не проверяется — тот же join-пробел, что у A02–A08
+    (ym:s:lastSignDirectClickOrder отсутствует в SCHEMAS["visits"]). Проверяется
+    только объём выборки (месяцы + чистые конверсии) по direct_campaigns.
+    """
+    if "direct_campaigns" not in canonical or not _table_nonempty(canonical["direct_campaigns"]):
+        _write_unavailable(
+            metrics_dir, "A26",
+            "direct_campaigns недоступна (отчёт по кампаниям Директа не выгружен)",
+        )
+        return
+
+    goal_ids = _macro_goal_ids(config)
+    con = common.open_duckdb(paths)
+    try:
+        expr = _net_conversions_expr(con, "direct_campaigns", goal_ids)
+        if expr is None:
+            con.close()
+            _write_unavailable(
+                metrics_dir, "A26",
+                "нет чистых конверсий по кампаниям: macro_goals не настроены в "
+                "config.sources.direct или колонки goal_conv_<id> отсутствуют в direct_campaigns",
+            )
+            return
+        rows = con.execute(
+            "SELECT campaign_id, MAX(campaign_name), strftime(date, '%Y-%m'), "
+            f"SUM({expr}) "
+            "FROM direct_campaigns WHERE campaign_id IS NOT NULL "
+            "GROUP BY campaign_id, strftime(date, '%Y-%m')"
+        ).fetchall()
+    finally:
+        con.close()
+
+    by_campaign: dict[str, dict[str, Any]] = {}
+    for campaign_id, campaign_name, month, net_conv in rows:
+        info = by_campaign.setdefault(campaign_id, {"name": campaign_name, "months": {}})
+        info["months"][month] = int(net_conv or 0)
+
+    rows_out: list[dict[str, Any]] = [{
+        "check_id": "A26",
+        "finding": "wordstat_seasonality_unavailable",
+        "reason": "нет канонической таблицы wordstat (сезонный спрос) — join с "
+                  "кампанийной экономикой здесь не реализован",
+        "confidence": "LOW",
+    }]
+    for campaign_id, info in sorted(by_campaign.items()):
+        months = info["months"]
+        total_conv = sum(months.values())
+        months_tracked = len(months)
+        insufficient = (
+            months_tracked < _A26_MIN_MONTHS_FOR_JUDGMENT
+            or total_conv < _A26_MIN_NET_CONVERSIONS_FOR_JUDGMENT
+        )
+        rows_out.append({
+            "check_id": "A26",
+            "finding": "campaign_sample_check",
+            "campaign_id": campaign_id,
+            "campaign_name": info["name"],
+            "months_tracked": months_tracked,
+            "min_months_threshold": _A26_MIN_MONTHS_FOR_JUDGMENT,
+            "total_net_conversions": total_conv,
+            "min_net_conversions_threshold": _A26_MIN_NET_CONVERSIONS_FOR_JUDGMENT,
+            "insufficient_sample_for_judgment": insufficient,
+            "confidence": _cap("LOW" if insufficient else "MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "a26", rows_out, confidence_cap=confidence_cap)
+
+
 # ── Диспетчер блока ──────────────────────────────────────────────────────────
 def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[str]:
     """Выполнить A01–A11 из числа доступных; вернуть имена записанных артефактов."""
@@ -998,5 +2160,65 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
     if "A11" in runnable_ids and "direct_queries" in canonical and "visits" in canonical:
         _run_a11(paths, config, canonical, caps.get("A11", "HIGH"), metrics_dir)
         artifacts.append("a11")
+
+    if "A12" in runnable_ids and "costs" in canonical and "visits" in canonical:
+        _run_a12(paths, config, canonical, caps.get("A12", "HIGH"), metrics_dir)
+        artifacts.append("a12")
+
+    if "A13" in runnable_ids and "costs" in canonical and "visits" in canonical:
+        _run_a13(paths, config, canonical, caps.get("A13", "HIGH"), metrics_dir)
+        artifacts.append("a13")
+
+    if "A14" in runnable_ids and "costs" in canonical and "visits" in canonical:
+        _run_a14(paths, config, defaults, canonical, caps.get("A14", "HIGH"), metrics_dir)
+        artifacts.append("a14")
+
+    if "A15" in runnable_ids and "costs" in canonical and "visits" in canonical:
+        _run_a15(paths, canonical, caps.get("A15", "HIGH"), metrics_dir)
+        artifacts.append("a15")
+
+    if "A16" in runnable_ids and "costs" in canonical and "visits" in canonical:
+        _run_a16(metrics_dir)
+        artifacts.append("a16")
+
+    if "A17" in runnable_ids and "direct_queries" in canonical:
+        _run_a17(paths, config, canonical, caps.get("A17", "HIGH"), metrics_dir)
+        artifacts.append("a17")
+
+    if "A18" in runnable_ids and "direct_queries" in canonical:
+        _run_a18(paths, canonical, caps.get("A18", "HIGH"), metrics_dir)
+        artifacts.append("a18")
+
+    if "A19" in runnable_ids and "costs" in canonical and "direct_queries" in canonical:
+        _run_a19(paths, canonical, caps.get("A19", "HIGH"), metrics_dir)
+        artifacts.append("a19")
+
+    if "A20" in runnable_ids and "direct_queries" in canonical:
+        _run_a20(paths, canonical, caps.get("A20", "HIGH"), metrics_dir)
+        artifacts.append("a20")
+
+    if "A21" in runnable_ids and "direct_queries" in canonical and "visits" in canonical:
+        _run_a21(paths, config, canonical, caps.get("A21", "HIGH"), metrics_dir)
+        artifacts.append("a21")
+
+    if "A22" in runnable_ids and "direct_queries" in canonical and "visits" in canonical:
+        _run_a22(paths, canonical, caps.get("A22", "HIGH"), metrics_dir)
+        artifacts.append("a22")
+
+    if "A23" in runnable_ids and "visits" in canonical:
+        _run_a23(paths, defaults, canonical, caps.get("A23", "HIGH"), metrics_dir)
+        artifacts.append("a23")
+
+    if "A24" in runnable_ids and "direct_queries" in canonical:
+        _run_a24(paths, canonical, caps.get("A24", "HIGH"), metrics_dir)
+        artifacts.append("a24")
+
+    if "A25" in runnable_ids and "costs" in canonical:
+        _run_a25(metrics_dir)
+        artifacts.append("a25")
+
+    if "A26" in runnable_ids and "costs" in canonical and "visits" in canonical:
+        _run_a26(paths, config, canonical, caps.get("A26", "HIGH"), metrics_dir)
+        artifacts.append("a26")
 
     return artifacts

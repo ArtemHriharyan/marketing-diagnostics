@@ -899,3 +899,80 @@ A02/A05/A11 — минимум 5 чистых конверсий, чтобы с�
 passed**. Регрессия: `pytest tests/test_compute_common.py tests/test_block0.py
 tests/test_degradation.py tests/test_methodology_goals_requires.py
 tests/test_smoke.py tests/test_config_schema.py` — **95 passed**, 0 failed.
+
+---
+
+**5E** DONE — 2026-07-28. Бизнес-логика A12–A26 в `src/compute/block1.py`
+(вторая часть блока 1 «экономика и эффективность платной рекламы» — гео,
+устройства, расписание, РСЯ, ретаргетинг, бренд, структура кампаний, CPC/CTR,
+запрос-объявление-посадочная, товарный фид, лаг/сезонность). A01–A11
+(задача 5D) не переписывались.
+
+**Три структурных разрыва canonical-слоя, подтверждённые построчным чтением
+`src/extract/direct.py` и `src/transform/build_canonical.py` перед
+реализацией (тот же принцип, что A07 в 5D — не придумывать проверку без
+данных):** `campaign_targeting.json` (гео/устройства/расписание/корректировки
+ставок как НАСТРОЙКИ), `keywords.parquet`, `product_feed.parquet` — extract
+пишет все три в `data/raw/direct/`, но `build_canonical.py` не строит из них
+ни одной канонической таблицы; расширение схемы вне `allowed_files` задач
+5D/5E. Следствие: **A16** (ретаргетинг) и **A25** (товарный фид) пишут только
+`unavailable`, всегда — без campaign_targeting/product_feed нет способа даже
+определить, какие кампании ретаргетинговые, или прочитать сам фид. **A18**
+(пересечение кампаний за один спрос) реализован только через `direct_queries`
+(поисковые запросы) — по ключевым фразам/аудиториям/гео не проверяется; это
+сужение уже отражено в `config/methodology.yaml` (`A18.requires ==
+["direct_queries"]`), не введено этой задачей.
+
+**Гап `direct_placements.cost_normalized`, названный в промте задачи как
+требующий проверки перед использованием — проверен построчным чтением
+`build_direct_placements` (build_canonical.py): уже закрыт** (задачи
+4X-direct-placements-align/4X-direct-reconcile, см. записи выше) — контракт
+`cost_raw`(int, микрорубли)/`cost_rub`(float, всегда)/`cost_normalized`(null
+до Q01)/`vat_basis_applied`(False) идентичен `direct_queries`/`campaigns`/
+`geo`. A15 использует `cost_normalized` через тот же `_money()`, что A09–A11
+— НЕ `cost_raw` с оговоркой, оговорка из промта была актуальна до этой сверки.
+
+Четыре таблицы, реально присутствующие в canonical (`direct_geo`,
+`direct_placements`, `ad_texts`, `seo_queries`), используются как
+дополнительные входы сверх голого `requires` реестра — тот же прецедент, что
+A02/A04–A08 (задача 5D) читают `direct_campaigns` сверх `requires: [costs,
+visits]`; `requires` определяет только грубые `runnable_ids` верхнего уровня,
+не исчерпывающий список входов проверки. `ad_texts_archived.parquet` **не
+читается ни в одной функции блока** (прямое требование промта) — A20–A24
+работают только с `canonical["ad_texts"]` (уже отфильтрован по State=ON в
+transform, повторная фильтрация не производится); тест
+`test_a22_query_ad_keyword_mismatch_and_no_archived_file_needed` явно
+проверяет отсутствие archived-файла на диске.
+
+Целевой регион для A12 — эвристика: `config.client.geo` (единственное
+доступное, полу-структурированное поле, свободный текст) сопоставляется
+подстрокой с `direct_geo.location_of_presence_name`; без `client.geo` A12
+пишет `unavailable` (методология v2 §4 запрещает находку без сравнения с
+целевым CPA). Час показа (A13) структурно недоступен ни для одного клиента
+(`CAMPAIGN_PERFORMANCE_REPORT` — только по дням) — явная запись
+`hour_of_day_unavailable` рядом с рабочим разрезом по дню недели (день недели
+— из `direct_campaigns.date`, кампанийный агрегат, MED-потолок). A14
+(устройства) и A23 (общая посадочная vs тематическая) — визит-уровневые
+сравнения (source_group='ad' по `visits.parquet`), поэтому могут быть HIGH
+при достаточной выборке — то же исключение, что `paid_vs_site_gap` в A01.
+A22 (запрос vs текст объявления) и A24 (устаревшая цена/акция) — эвристики
+(пересечение токенов; regex по цене/акции) на LOW по построению, требуют
+ручного подтверждения (каталог: тип A+B) — не автоматический вердикт.
+
+Уверенность и деньги — те же правила, что в 5D: `cost_normalized` — 
+единственный денежный источник (null при неполной НДС-базе группы, не
+`cost_raw`); «чистые конверсии» — только `goal_conv_<id>` по
+`config.sources.direct.macro_goals`, никогда `conversions_all`; `_cap`
+капает вниз, никогда не поднимает.
+
+Новые тесты `tests/test_block1.py` (21 шт., итого файл — 42): минимум один
+сценарий на каждую из A12–A26, плюс отдельно — капание confidence через
+`degradation_report.json` (A12), неполные targeting-поля (пустой
+`location_of_presence_name` в direct_geo исключается, не роняет проверку,
+A12), unavailable без `macro_goals`/без нужной canonical-таблицы (A02-стиль:
+A13/A14/A17/A21/A22/A26), всегда-`unavailable` структурные проверки (A16,
+A25), ad_texts без ad_texts_archived.parquet на диске (A22). `pytest
+tests/test_block1.py` — **42 passed**. Регрессия: `pytest
+tests/test_compute_common.py tests/test_block0.py tests/test_block1.py
+tests/test_degradation.py tests/test_methodology_goals_requires.py
+tests/test_smoke.py tests/test_config_schema.py` — **137 passed**, 0 failed.

@@ -45,7 +45,12 @@ DEFAULTS = {
 MACRO_GOAL_ID = "999"
 
 
-def _write_config(paths: _Paths, macro_goals: list[dict] | None = None) -> None:
+def _write_config(
+    paths: _Paths,
+    macro_goals: list[dict] | None = None,
+    client_geo: str | None = None,
+    brand_terms: list[str] | None = None,
+) -> None:
     paths.root.mkdir(parents=True, exist_ok=True)
     config = {
         "sources": {
@@ -54,6 +59,10 @@ def _write_config(paths: _Paths, macro_goals: list[dict] | None = None) -> None:
             },
         },
     }
+    if client_geo is not None:
+        config["client"] = {"geo": client_geo}
+    if brand_terms is not None:
+        config["brand_terms"] = brand_terms
     paths.config_file.write_text(yaml.safe_dump(config), encoding="utf-8")
 
 
@@ -89,6 +98,26 @@ def _write_direct_campaigns(paths: _Paths, rows: list[dict]) -> None:
 
 def _write_direct_queries(paths: _Paths, rows: list[dict]) -> None:
     _write_dated_parquet(paths.canonical / "direct_queries.parquet", rows)
+
+
+def _write_direct_geo(paths: _Paths, rows: list[dict]) -> None:
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(paths.canonical / "direct_geo.parquet")
+
+
+def _write_direct_placements(paths: _Paths, rows: list[dict]) -> None:
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(paths.canonical / "direct_placements.parquet")
+
+
+def _write_ad_texts(paths: _Paths, rows: list[dict]) -> None:
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(paths.canonical / "ad_texts.parquet")
+
+
+def _write_seo_queries(paths: _Paths, rows: list[dict]) -> None:
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(paths.canonical / "seo_queries.parquet")
 
 
 def _base_visit(**overrides) -> dict:
@@ -582,3 +611,510 @@ def test_confidence_is_capped_to_degradation_report_ceiling(tmp_path):
     rows = _read_metric(paths, "a01")
     gap_row = next(r for r in rows if r["finding"] == "paid_vs_site_gap")
     assert gap_row["confidence"] == "LOW"
+
+
+# ═════════════════════════ A12–A26 (задача 5E) ═════════════════════════════
+
+def _direct_geo_row(**overrides) -> dict:
+    row = {
+        "date": date(2026, 1, 1), "month": "2026-01",
+        "campaign_id": "1", "campaign_name": "c1",
+        "location_of_presence_id": "1", "location_of_presence_name": "Москва",
+        "device": "desktop", "cost_raw": 1_000_000, "cost_rub": 1.0,
+        "cost_normalized": 1.0, "vat_basis_applied": True,
+        "clicks": 10, "impressions": 100, "conversions_all": 0,
+        f"goal_conv_{MACRO_GOAL_ID}": 0,
+    }
+    row.update(overrides)
+    return row
+
+
+def _direct_campaign_row(**overrides) -> dict:
+    row = {
+        "date": date(2026, 1, 5), "campaign_id": "1", "campaign_name": "c1",
+        "device": "desktop", "cost_raw": 1_000_000, "cost_rub": 1.0,
+        "cost_normalized": 1.0, "vat_basis_applied": True,
+        "clicks": 10, "impressions": 100, "conversions_all": 0,
+        f"goal_conv_{MACRO_GOAL_ID}": 0,
+    }
+    row.update(overrides)
+    return row
+
+
+def _direct_placement_row(**overrides) -> dict:
+    row = {
+        "placement": "site.ru", "ad_network_type": "YANDEX_SEARCH_PARTNER",
+        "campaign_id": "1", "cost_raw": 1_000_000, "cost_rub": 1.0,
+        "cost_normalized": 1.0, "vat_basis_applied": True,
+        "clicks": 10, "conversions_all": 0,
+    }
+    row.update(overrides)
+    return row
+
+
+def _write_min_costs(paths: _Paths) -> None:
+    """Минимальная строка costs.parquet — только чтобы удовлетворить грубый
+
+    gate диспетчера (requires: costs), сами данные проверкой не читаются.
+    """
+    _write_costs(paths, [
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
+         "campaign_name": "c1", "cost_raw": 100.0, "cost_normalized": 100.0,
+         "cost_status": "net", "clicks": 10, "impressions": 100},
+    ])
+
+
+def _write_min_visits(paths: _Paths) -> None:
+    """Минимальная строка visits.parquet — только чтобы удовлетворить грубый
+
+    gate диспетчера (requires: visits) там, где сама проверка visits не читает.
+    """
+    _write_visits(paths, [_base_visit()])
+
+
+def _ad_text_row(**overrides) -> dict:
+    row = {
+        "ad_id": "1", "campaign_id": "1", "ad_group_id": "1", "type": "TEXT_AD",
+        "state": "ON", "status": "ACCEPTED", "title": "Заголовок", "title2": None,
+        "text": "Описание объявления", "href": "https://example.com/",
+        "display_url_path": "",
+    }
+    row.update(overrides)
+    return row
+
+
+# ── A12 — гео (обязательная последовательность: CPA нецелевого vs целевого) ─
+
+def test_a12_off_target_region_flagged_and_incomplete_rows_excluded(tmp_path):
+    """Заодно покрывает "неполные targeting fields": строка с пустым
+
+    location_of_presence_name не должна попадать ни в summary, ни в детали,
+    не должна ронять проверку.
+    """
+    paths = _Paths(tmp_path)
+    _write_config(
+        paths, macro_goals=[{"id": MACRO_GOAL_ID, "name": "Заявка"}], client_geo="Москва",
+    )
+    _write_min_costs(paths)
+    _write_min_visits(paths)
+    _write_direct_geo(paths, [
+        _direct_geo_row(location_of_presence_name=None, cost_normalized=500.0, clicks=50,
+                         **{f"goal_conv_{MACRO_GOAL_ID}": 3}),
+        _direct_geo_row(location_of_presence_name="Москва", cost_normalized=1000.0, clicks=100,
+                         **{f"goal_conv_{MACRO_GOAL_ID}": 20}),
+        _direct_geo_row(location_of_presence_name="Владивосток", cost_normalized=900.0, clicks=90,
+                         **{f"goal_conv_{MACRO_GOAL_ID}": 6}),
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A12"})
+    assert "a12" in artifacts
+    rows = _read_metric(paths, "a12")
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["target_regions_matched"] == ["Москва"]
+    assert summary["target_region_net_conversions"] == 20
+    vladivostok = next(r for r in rows if r.get("location_of_presence_name") == "Владивосток")
+    assert vladivostok["off_target_geo_worse"] is True
+
+
+def test_a12_unavailable_without_target_region(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths, macro_goals=[{"id": MACRO_GOAL_ID, "name": "Заявка"}])
+    _write_min_costs(paths)
+    _write_min_visits(paths)
+    _write_direct_geo(paths, [_direct_geo_row()])
+
+    block1.run(paths, DEFAULTS, {"A12"})
+    rows = _read_metric(paths, "a12")
+    assert rows[0]["status"] == "unavailable"
+
+
+def test_a12_confidence_capped_by_degradation_report(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(
+        paths, macro_goals=[{"id": MACRO_GOAL_ID, "name": "Заявка"}], client_geo="Москва",
+    )
+    _write_min_costs(paths)
+    _write_min_visits(paths)
+    _write_direct_geo(paths, [
+        _direct_geo_row(location_of_presence_name="Москва", cost_normalized=1000.0, clicks=100,
+                         **{f"goal_conv_{MACRO_GOAL_ID}": 20}),
+    ])
+    _write_degradation(paths, [{"check_id": "A12", "confidence_cap": "LOW"}])
+
+    block1.run(paths, DEFAULTS, {"A12"})
+    rows = _read_metric(paths, "a12")
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["confidence"] == "LOW"
+
+
+# ── A13 — день недели/час показа ────────────────────────────────────────────
+
+def test_a13_weekday_outlier_flagged_and_hour_unavailable(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths, macro_goals=[{"id": MACRO_GOAL_ID, "name": "Заявка"}])
+    _write_min_costs(paths)
+    _write_min_visits(paths)
+    rows_in = []
+    for day in (5, 12, 19, 26):
+        rows_in.append(_direct_campaign_row(
+            date=date(2026, 1, day), cost_normalized=100.0,
+            **{f"goal_conv_{MACRO_GOAL_ID}": 10},
+        ))
+    for day in (7, 14, 21, 28):
+        rows_in.append(_direct_campaign_row(
+            date=date(2026, 1, day), cost_normalized=100.0,
+            **{f"goal_conv_{MACRO_GOAL_ID}": 2},
+        ))
+    _write_direct_campaigns(paths, rows_in)
+
+    artifacts = block1.run(paths, DEFAULTS, {"A13"})
+    assert "a13" in artifacts
+    rows = _read_metric(paths, "a13")
+    hour_row = next(r for r in rows if r["finding"] == "hour_of_day_unavailable")
+    assert hour_row["confidence"] == "LOW"
+    weekday_rows = [r for r in rows if r["finding"] == "weekday_economics"]
+    worse = next(r for r in weekday_rows if r["weekday_persistently_worse"])
+    better = next(r for r in weekday_rows if not r["weekday_persistently_worse"])
+    assert worse["cpa_rub"] > better["cpa_rub"]
+
+
+def test_a13_unavailable_without_direct_campaigns(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    _write_min_costs(paths)
+    _write_min_visits(paths)
+
+    block1.run(paths, DEFAULTS, {"A13"})
+    rows = _read_metric(paths, "a13")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── A14 — устройства ─────────────────────────────────────────────────────────
+
+def test_a14_device_cr_and_cpa(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths, macro_goals=[{"id": MACRO_GOAL_ID, "name": "Заявка"}])
+    _write_min_costs(paths)
+    visits = (
+        [_base_visit(source_group="ad", device="desktop", form_submit=True) for _ in range(200)]
+        + [_base_visit(source_group="ad", device="desktop", form_submit=False) for _ in range(300)]
+        + [_base_visit(source_group="ad", device="mobile", form_submit=True) for _ in range(50)]
+        + [_base_visit(source_group="ad", device="mobile", form_submit=False) for _ in range(450)]
+    )
+    _write_visits(paths, visits)
+    _write_direct_campaigns(paths, [
+        _direct_campaign_row(campaign_id="1", device="desktop", cost_normalized=1000.0,
+                              **{f"goal_conv_{MACRO_GOAL_ID}": 20}),
+        _direct_campaign_row(campaign_id="2", device="mobile", cost_normalized=1000.0,
+                              **{f"goal_conv_{MACRO_GOAL_ID}": 5}),
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A14"})
+    assert "a14" in artifacts
+    rows = _read_metric(paths, "a14")
+    cr_rows = [r for r in rows if r["finding"] == "cr_by_device"]
+    desktop_cr = next(r for r in cr_rows if r["device"] == "desktop")
+    mobile_cr = next(r for r in cr_rows if r["device"] == "mobile")
+    assert desktop_cr["device_cr_worse_than_overall"] is False
+    assert mobile_cr["device_cr_worse_than_overall"] is True
+    cpa_rows = [r for r in rows if r["finding"] == "cpa_by_device"]
+    mobile_cpa = next(r for r in cpa_rows if r["device"] == "mobile")
+    assert mobile_cpa["device_cpa_persistently_worse"] is True
+
+
+def test_a14_cpa_by_device_unavailable_without_macro_goals(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths, macro_goals=[])
+    _write_min_costs(paths)
+    _write_visits(paths, [_base_visit(source_group="ad")])
+
+    block1.run(paths, DEFAULTS, {"A14"})
+    rows = _read_metric(paths, "a14")
+    assert any(r["finding"] == "cpa_by_device_unavailable" for r in rows)
+
+
+# ── A15 — площадки РСЯ ───────────────────────────────────────────────────────
+
+def test_a15_placement_ranking_and_net_conversions_unavailable_marker(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    _write_min_costs(paths)
+    _write_min_visits(paths)
+    _write_direct_placements(paths, [
+        _direct_placement_row(placement="big-spender.ru", cost_normalized=900.0, clicks=200),
+        _direct_placement_row(placement="tiny.ru", cost_normalized=5.0, clicks=2),
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A15"})
+    assert "a15" in artifacts
+    rows = _read_metric(paths, "a15")
+    marker = next(r for r in rows if r["finding"] == "net_conversions_unavailable")
+    assert marker["confidence"] == "LOW"
+    ranked = [r for r in rows if r["finding"] == "placement_ranking"]
+    assert all(r["placement"] != "tiny.ru" for r in ranked)
+    big = next(r for r in ranked if r["placement"] == "big-spender.ru")
+    assert big["notable_spend_share"] is True
+
+
+# ── A16 — ретаргетинг: всегда unavailable (см. докстринг модуля) ───────────
+
+def test_a16_always_unavailable(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    _write_costs(paths, [
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
+         "campaign_name": "c1", "cost_raw": 100.0, "cost_normalized": 100.0,
+         "cost_status": "net", "clicks": 10, "impressions": 100},
+    ])
+    _write_visits(paths, [_base_visit()])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A16"})
+    assert "a16" in artifacts
+    rows = _read_metric(paths, "a16")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── A17 — брендовая каннибализация ──────────────────────────────────────────
+
+def test_a17_brand_cannibalization_flagged(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(
+        paths, macro_goals=[{"id": MACRO_GOAL_ID, "name": "Заявка"}],
+        brand_terms=["покажи бренд"],
+    )
+    _write_direct_queries(paths, [
+        _direct_query_row(query="покажи бренд аренда", match_type="KEYWORD",
+                           cost_normalized=500.0, clicks=50,
+                           **{f"goal_conv_{MACRO_GOAL_ID}": 10}),
+    ])
+    _write_seo_queries(paths, [
+        {"query": "покажи бренд аренда", "page": "/", "source": "gsc", "month": "2026-01",
+         "device": "unknown", "total_shows": 1000, "total_clicks": 400,
+         "avg_show_position": 1.5, "is_brand": True, "source_mode": "api",
+         "completeness": "verified", "ctr": None, "demand": None},
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A17"})
+    assert "a17" in artifacts
+    rows = _read_metric(paths, "a17")
+    detail = next(r for r in rows if r["finding"] == "brand_query_paid_vs_organic")
+    assert detail["organic_already_visible"] is True
+    assert detail["possible_cannibalization"] is True
+    assert any(r["finding"] == "competitor_ads_not_checked" for r in rows)
+
+
+def test_a17_unavailable_without_brand_terms(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths, macro_goals=[{"id": MACRO_GOAL_ID, "name": "Заявка"}])
+    _write_direct_queries(paths, [_direct_query_row()])
+
+    block1.run(paths, DEFAULTS, {"A17"})
+    rows = _read_metric(paths, "a17")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── A18 — кампании конкурируют за одинаковый спрос ──────────────────────────
+
+def test_a18_competing_campaigns_flagged(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    _write_direct_queries(paths, [
+        _direct_query_row(query="аренда авто", campaign_id="1", clicks=20, cost_normalized=200.0),
+        _direct_query_row(query="аренда авто", campaign_id="2", clicks=15, cost_normalized=150.0),
+        _direct_query_row(query="уникальный запрос", campaign_id="1", clicks=5, cost_normalized=50.0),
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A18"})
+    assert "a18" in artifacts
+    rows = _read_metric(paths, "a18")
+    competing = next(r for r in rows if r["query"] == "аренда авто")
+    assert competing["campaign_count"] == 2
+    assert all(r["query"] != "уникальный запрос" for r in rows)
+
+
+# ── A19 — CPC аномально высок ────────────────────────────────────────────────
+
+def test_a19_cpc_outlier_flagged(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    _write_min_costs(paths)
+    _write_direct_queries(paths, [
+        _direct_query_row(query="q1", match_type="KEYWORD", cost_normalized=500.0, clicks=25),
+        _direct_query_row(query="q2", match_type="KEYWORD", cost_normalized=100.0, clicks=25),
+        _direct_query_row(query="q3", match_type="SYNONYM", cost_normalized=3000.0, clicks=30),
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A19"})
+    assert "a19" in artifacts
+    rows = _read_metric(paths, "a19")
+    q3 = next(r for r in rows if r["query"] == "q3")
+    q2 = next(r for r in rows if r["query"] == "q2")
+    assert q3["cpc_anomalously_high"] is True
+    assert q2["cpc_anomalously_high"] is False
+
+
+# ── A20 — низкий CTR у релевантных показов ──────────────────────────────────
+
+def test_a20_low_ctr_flagged(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    _write_direct_queries(paths, [
+        _direct_query_row(query="q1", match_type="KEYWORD", clicks=50, impressions=500),
+        _direct_query_row(query="q2", match_type="KEYWORD", clicks=45, impressions=500),
+        _direct_query_row(query="q3", match_type="SYNONYM", clicks=5, impressions=500),
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A20"})
+    assert "a20" in artifacts
+    rows = _read_metric(paths, "a20")
+    q3 = next(r for r in rows if r["query"] == "q3")
+    q1 = next(r for r in rows if r["query"] == "q1")
+    assert q3["anomalously_low_ctr"] is True
+    assert q1["anomalously_low_ctr"] is False
+
+
+# ── A21 — высокий CTR + низкая конверсия ────────────────────────────────────
+
+def test_a21_high_ctr_low_conversion_flagged(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths, macro_goals=[{"id": MACRO_GOAL_ID, "name": "Заявка"}])
+    _write_visits(paths, [_base_visit(form_submit=True) for _ in range(10)]
+                  + [_base_visit() for _ in range(90)])
+    _write_direct_queries(paths, [
+        _direct_query_row(query="q1", match_type="KEYWORD", clicks=10, impressions=1000,
+                           **{f"goal_conv_{MACRO_GOAL_ID}": 0}),
+        _direct_query_row(query="q2", match_type="KEYWORD", clicks=90, impressions=1000,
+                           **{f"goal_conv_{MACRO_GOAL_ID}": 5}),
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A21"})
+    assert "a21" in artifacts
+    rows = _read_metric(paths, "a21")
+    q2 = next(r for r in rows if r["query"] == "q2")
+    q1 = next(r for r in rows if r["query"] == "q1")
+    assert q2["high_ctr"] is True
+    assert q2["high_ctr_low_conversion"] is False
+    assert q1["high_ctr"] is False
+
+
+# ── A22 — запрос vs текст объявления (ad_texts БЕЗ archived-файла) ──────────
+
+def test_a22_query_ad_keyword_mismatch_and_no_archived_file_needed(tmp_path):
+    """Явно проверяет требование задачи: A20–A24 не читают
+
+    ad_texts_archived.parquet — файл вообще отсутствует, проверка не падает.
+    """
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    _write_min_visits(paths)
+    _write_ad_texts(paths, [
+        _ad_text_row(campaign_id="1", ad_group_id="1", title="Прокат велосипедов",
+                     text="Аренда велосипедов в городе"),
+    ])
+    _write_direct_queries(paths, [
+        _direct_query_row(campaign_id="1", ad_group_id="1", query="ремонт холодильников",
+                           match_type="KEYWORD", clicks=50),
+    ])
+    assert not (paths.canonical / "ad_texts_archived.parquet").exists()
+
+    artifacts = block1.run(paths, DEFAULTS, {"A22"})
+    assert "a22" in artifacts
+    rows = _read_metric(paths, "a22")
+    assert rows[0]["top_query"] == "ремонт холодильников"
+    assert rows[0]["query_ad_keyword_mismatch"] is True
+
+
+def test_a22_unavailable_without_ad_texts(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    _write_min_visits(paths)
+    _write_direct_queries(paths, [_direct_query_row()])
+
+    block1.run(paths, DEFAULTS, {"A22"})
+    rows = _read_metric(paths, "a22")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── A23 — конкретный спрос ведён на слишком общую страницу ─────────────────
+
+def test_a23_generic_landing_underperforms(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    visits = (
+        [_base_visit(source_group="ad", entry_page="/", form_submit=True) for _ in range(30)]
+        + [_base_visit(source_group="ad", entry_page="/", form_submit=False) for _ in range(570)]
+        + [_base_visit(source_group="ad", entry_page="/uslugi/remont-holodilnikov", form_submit=True)
+           for _ in range(150)]
+        + [_base_visit(source_group="ad", entry_page="/uslugi/remont-holodilnikov", form_submit=False)
+           for _ in range(450)]
+    )
+    _write_visits(paths, visits)
+
+    artifacts = block1.run(paths, DEFAULTS, {"A23"})
+    assert "a23" in artifacts
+    rows = _read_metric(paths, "a23")
+    assert rows[0]["generic_landing_underperforms"] is True
+    assert rows[0]["confidence"] == "HIGH"
+
+
+# ── A24 — устаревшая цена/акция (только кандидаты для ручной проверки) ─────
+
+def test_a24_manual_check_candidates_detected(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    _write_direct_queries(paths, [_direct_query_row()])
+    _write_ad_texts(paths, [
+        _ad_text_row(ad_id="1", title="Скидка 20%", text="Только сегодня"),
+        _ad_text_row(ad_id="2", title="Надёжный сервис", text="Работаем без выходных"),
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A24"})
+    assert "a24" in artifacts
+    rows = _read_metric(paths, "a24")
+    candidates = [r for r in rows if r["finding"] == "manual_check_candidate"]
+    assert len(candidates) == 1
+    assert candidates[0]["ad_id"] == "1"
+    assert candidates[0]["has_price_pattern"] or candidates[0]["has_promo_word"]
+
+
+# ── A25 — товарный фид: всегда unavailable (продукт-фид нет в canonical) ───
+
+def test_a25_always_unavailable(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    _write_costs(paths, [
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
+         "campaign_name": "c1", "cost_raw": 100.0, "cost_normalized": 100.0,
+         "cost_status": "net", "clicks": 10, "impressions": 100},
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A25"})
+    assert "a25" in artifacts
+    rows = _read_metric(paths, "a25")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── A26 — оценка без учёта лага/сезонности/малого объёма ────────────────────
+
+def test_a26_insufficient_sample_flagged(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths, macro_goals=[{"id": MACRO_GOAL_ID, "name": "Заявка"}])
+    _write_min_costs(paths)
+    _write_min_visits(paths)
+    _write_direct_campaigns(paths, [
+        _direct_campaign_row(campaign_id="new", date=date(2026, 1, 5), cost_normalized=100.0,
+                              **{f"goal_conv_{MACRO_GOAL_ID}": 1}),
+        _direct_campaign_row(campaign_id="established", date=date(2026, 1, 5), cost_normalized=100.0,
+                              **{f"goal_conv_{MACRO_GOAL_ID}": 10}),
+        _direct_campaign_row(campaign_id="established", date=date(2026, 2, 5), cost_normalized=100.0,
+                              **{f"goal_conv_{MACRO_GOAL_ID}": 10}),
+    ])
+
+    artifacts = block1.run(paths, DEFAULTS, {"A26"})
+    assert "a26" in artifacts
+    rows = _read_metric(paths, "a26")
+    new_campaign = next(r for r in rows if r.get("campaign_id") == "new")
+    established = next(r for r in rows if r.get("campaign_id") == "established")
+    assert new_campaign["insufficient_sample_for_judgment"] is True
+    assert established["insufficient_sample_for_judgment"] is False
+    assert any(r["finding"] == "wordstat_seasonality_unavailable" for r in rows)
