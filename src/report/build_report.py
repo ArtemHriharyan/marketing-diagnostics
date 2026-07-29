@@ -16,6 +16,14 @@
 Задача 7A: детерминированный рендерер-скелет. Раздел приложений-сносок и
 повестка созвона с клиентом сюда намеренно не входят (следующая задача).
 
+Задача 7B: страница «Вердикт» (первая страница отчёта) — три главных
+разрыва (топ утверждённых находок по тому же приоритету, что и раздел
+находок) + вердикт по блоку 0 (доверие к данным, из degradation.skipped,
+без пересчёта) + агрегат «SEO MED-cap» из уже посчитанного
+metrics_summary["seo_confidence_cap"] (см. src/compute/common.py,
+_seo_confidence_cap_summary — report только форматирует готовую долю,
+не считает её заново).
+
 Приоритет находок: явного поля ``priority`` карточка находки (schemas.Finding)
 не несёт. Каталог угроз v2 даёт статичные баллы «Критичность/Реальность» на
 уровне check_id, но они не входят в машинный реестр config/methodology.yaml и
@@ -45,6 +53,10 @@ GLOSSARY_FILENAME = "report_glossary.yaml"
 # проверить» и глоссарий занимают ориентировочно 2 страницы фиксированного
 # объёма; на находки (~1 страница на находку) остаётся оставшийся бюджет.
 MAX_REPORT_FINDINGS = 8
+
+# Три главных разрыва на первой странице (вердикт) — top-N той же
+# отсортированной последовательности, что и весь раздел находок.
+MAX_VERDICT_GAPS = 3
 
 _CONFIDENCE_RANK: dict[str, int] = {
     "HIGH": 0,
@@ -173,6 +185,72 @@ def _build_header(config: dict[str, Any]) -> list[str]:
     return lines
 
 
+# ── Страница 1: вердикт (задача 7B) ──────────────────────────────────────
+def _format_gap_line(rank: int, finding: dict[str, Any], currency_round: int) -> str:
+    check_id, name = finding.get("check_id", ""), finding.get("name", "")
+    money_line = _format_money(finding, currency_round) or format_rub(None)
+    return f"{rank}. **{check_id} — {name}** — {money_line}"
+
+
+def _build_top_gaps(findings: list[dict[str, Any]], currency_round: int) -> list[str]:
+    lines = ["### Три главных разрыва", ""]
+    if not findings:
+        lines.append("Утверждённых находок нет — главные разрывы не определены.")
+        lines.append("")
+        return lines
+    for rank, finding in enumerate(findings[:MAX_VERDICT_GAPS], start=1):
+        lines.append(_format_gap_line(rank, finding, currency_round))
+    lines.append("")
+    return lines
+
+
+def _build_data_verdict(degradation: dict[str, Any]) -> list[str]:
+    lines = ["### Вердикт по данным (блок 0)", ""]
+    block0_skipped = [
+        item for item in (degradation.get("skipped") or []) if item.get("block") == 0
+    ]
+    if not block0_skipped:
+        lines.append(
+            "Блок 0 (доверие к данным) пройден без ограничений при текущих источниках."
+        )
+    else:
+        lines.append("Ограничения доверия к данным (перенесены как есть):")
+        for item in block0_skipped:
+            lines.append(f"- **{item.get('id', '?')}**: {item.get('reason', '')}")
+    lines.append("")
+    return lines
+
+
+def _build_seo_med_cap(metrics_summary: dict[str, Any]) -> list[str]:
+    lines = ["### SEO — потолок уверенности MED", ""]
+    seo_cap = metrics_summary.get("seo_confidence_cap") or {}
+    runnable_count = seo_cap.get("runnable_count")
+    med_cap_count = seo_cap.get("med_cap_count")
+    med_cap_share = seo_cap.get("med_cap_share")
+    if not runnable_count:
+        lines.append("Нет выполнимых проверок блока SEO (S) при текущих источниках.")
+    else:
+        lines.append(
+            f"{med_cap_count} из {runnable_count} выполнимых проверок блока SEO (S) "
+            f"с потолком уверенности MED ({format_percent(med_cap_share or 0.0)})."
+        )
+    lines.append("")
+    return lines
+
+
+def _build_verdict_section(
+    findings: list[dict[str, Any]],
+    degradation: dict[str, Any],
+    metrics_summary: dict[str, Any],
+    currency_round: int,
+) -> str:
+    lines = ["## Вердикт", ""]
+    lines.extend(_build_top_gaps(findings, currency_round))
+    lines.extend(_build_data_verdict(degradation))
+    lines.extend(_build_seo_med_cap(metrics_summary))
+    return "\n".join(lines)
+
+
 def _build_summary_section(
     findings: list[dict[str, Any]],
     degradation: dict[str, Any],
@@ -291,6 +369,7 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> str:
 
     lines: list[str] = []
     lines.extend(_build_header(config))
+    lines.append(_build_verdict_section(findings, degradation, metrics_summary, currency_round))
     lines.append(_build_summary_section(findings, degradation, metrics_summary))
     lines.append(_build_findings_section(findings, currency_round))
     lines.append(_build_skipped_section(degradation.get("skipped") or []))

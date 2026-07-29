@@ -84,11 +84,13 @@ def _write_degradation(paths: _Paths, skipped: list[dict] | None = None) -> None
     )
 
 
-def _write_metrics_summary(paths: _Paths) -> None:
+def _write_metrics_summary(paths: _Paths, seo_confidence_cap: dict | None = None) -> None:
     paths.metrics.mkdir(parents=True, exist_ok=True)
+    summary = {"counts": {"total": 100, "runnable": 80, "skipped": 20}}
+    if seo_confidence_cap is not None:
+        summary["seo_confidence_cap"] = seo_confidence_cap
     (paths.metrics / "metrics_summary.json").write_text(
-        json.dumps({"counts": {"total": 100, "runnable": 80, "skipped": 20}}, ensure_ascii=False),
-        encoding="utf-8",
+        json.dumps(summary, ensure_ascii=False), encoding="utf-8",
     )
 
 
@@ -236,3 +238,100 @@ def test_glossary_loaded_from_real_config_has_15_to_20_terms():
     glossary = build_report.load_glossary()
     assert 15 <= len(glossary) <= 20
     assert all("term" in entry and "definition" in entry for entry in glossary)
+
+
+# ── 7. Вердикт (задача 7B): три главных разрыва ─────────────────────────
+
+def test_verdict_lists_top_gaps_in_priority_order(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-1.yaml", check_id="A01", confidence="MED", money_amount_rub=1000.0)
+    _write_finding(paths, "F-2.yaml", check_id="A02", confidence="HIGH", money_amount_rub=100.0)
+    _write_finding(paths, "F-3.yaml", check_id="A03", confidence="MED", money_amount_rub=50000.0)
+    _write_finding(paths, "F-4.yaml", check_id="A04", confidence="LOW", money_amount_rub=999999.0)
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "## Вердикт" in text
+    assert "### Три главных разрыва" in text
+    gaps_section = text.split("### Три главных разрыва")[1].split("###")[0]
+    assert "1. **A02" in gaps_section
+    assert "2. **A03" in gaps_section
+    assert "3. **A01" in gaps_section
+    assert "A04" not in gaps_section  # LOW-находка вне топ-3, не выдумываем лишний разрыв
+
+
+def test_verdict_no_approved_findings_says_gaps_not_defined(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "Утверждённых находок нет — главные разрывы не определены." in text
+
+
+# ── 8. Вердикт по данным (блок 0) ────────────────────────────────────────
+
+def test_verdict_data_block0_lists_skipped_verbatim(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml")
+    _write_degradation(paths, skipped=[
+        {"id": "D02", "block": 0, "reason": "нет источника: goals"},
+        {"id": "A01", "block": 1, "reason": "нет источника: campaign_strategies"},
+    ])
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    verdict_section = text[text.index("## Вердикт"):text.index("## Резюме")]
+    assert "**D02**: нет источника: goals" in verdict_section
+    assert "A01" not in verdict_section  # блок 1, к вердикту по данным не относится
+
+
+def test_verdict_data_block0_clean_when_no_skipped(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml")
+    _write_degradation(paths, skipped=[])
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert (
+        "Блок 0 (доверие к данным) пройден без ограничений при текущих источниках." in text
+    )
+
+
+# ── 9. SEO MED-cap агрегат из metrics_summary ────────────────────────────
+
+def test_verdict_seo_med_cap_rendered_from_metrics_summary(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml")
+    _write_degradation(paths)
+    _write_metrics_summary(
+        paths,
+        seo_confidence_cap={"runnable_count": 20, "med_cap_count": 15, "med_cap_share": 0.75},
+    )
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "### SEO — потолок уверенности MED" in text
+    assert "15 из 20 выполнимых проверок блока SEO (S) с потолком уверенности MED (75.0%)." in text
+
+
+def test_verdict_seo_med_cap_absent_when_no_seo_data(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml")
+    _write_degradation(paths)
+    _write_metrics_summary(paths)  # без seo_confidence_cap — не выдумываем цифру
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "Нет выполнимых проверок блока SEO (S) при текущих источниках." in text
