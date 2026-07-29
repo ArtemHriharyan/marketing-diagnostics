@@ -526,3 +526,226 @@ def test_split_findings_for_report_moves_low_and_overflow_to_appendix():
     assert len(shown) == build_report.MAX_REPORT_FINDINGS
     assert all(f["confidence"] != "LOW" for f in shown)
     assert [f["check_id"] for f in appendix] == ["A99", "L01"]
+
+
+# ── 16. Задача 7D: приложения-таблицы (CSV) ──────────────────────────────
+
+def test_appendix_tables_written_with_findings_and_skipped_rows(tmp_path):
+    import csv
+
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml", check_id="A01", confidence="MED")
+    _write_finding(
+        paths, "F-A-02.yaml", check_id="A02", confidence="LOW",
+        recommended_action="Проверить гипотезу вручную", assignee="Иван",
+    )
+    _write_degradation(paths, skipped=[
+        {"id": "D02", "block": 0, "reason": "нет источника: goals"},
+        {"id": "S07", "block": 4, "reason": "нет источника: спрос Wordstat"},
+    ])
+    _write_metrics_summary(paths)
+
+    build_report.build(paths, CONFIG, DEFAULTS)
+
+    tables_dir = paths.report / build_report.APPENDIX_TABLES_DIRNAME
+
+    with (tables_dir / build_report.FINDINGS_APPENDIX_CSV).open(encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["check_id"] for r in rows] == ["A02"]
+    assert rows[0]["assignee"] == "Иван"
+
+    with (tables_dir / build_report.SKIPPED_CHECKS_CSV).open(encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["id"] for r in rows] == ["D02", "S07"]
+
+    with (tables_dir / build_report.SEO_CORE_CSV).open(encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert [r["id"] for r in rows] == ["S07"]
+
+
+def test_appendix_tables_written_empty_with_header_when_no_rows(tmp_path):
+    import csv
+
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml")
+    _write_degradation(paths, skipped=[])
+    _write_metrics_summary(paths)
+
+    build_report.build(paths, CONFIG, DEFAULTS)
+
+    tables_dir = paths.report / build_report.APPENDIX_TABLES_DIRNAME
+    for filename in (
+        build_report.FINDINGS_APPENDIX_CSV,
+        build_report.SKIPPED_CHECKS_CSV,
+        build_report.SEO_CORE_CSV,
+    ):
+        with (tables_dir / filename).open(encoding="utf-8") as fh:
+            rows = list(csv.reader(fh))
+        assert len(rows) == 1  # только заголовок
+
+
+# ── 17. Задача 7D: сноски [n] на конкретные таблицы ──────────────────────
+
+def test_footnotes_section_lists_all_three_tables(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml", check_id="A01", confidence="LOW")
+    _write_degradation(paths, skipped=[{"id": "S07", "block": 4, "reason": "нет Wordstat"}])
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "## Сноски" in text
+    assert f"appendix_tables/{build_report.FINDINGS_APPENDIX_CSV}" in text
+    assert f"appendix_tables/{build_report.SKIPPED_CHECKS_CSV}" in text
+    assert f"appendix_tables/{build_report.SEO_CORE_CSV}" in text
+
+
+def test_footnote_markers_attached_to_section_headers(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml", check_id="A01", confidence="LOW")
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "Дополнительные находки (уровень LOW и сверх лимита раздела) [1]" in text
+    assert "Что не удалось проверить и почему [2]" in text
+    assert "SEO-ядро — не посчитано [3]" in text
+
+
+# ── 18. Задача 7D: повестка звонка oral_review_agenda.md ─────────────────
+
+def test_oral_review_agenda_written_with_top_findings_and_questions(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(
+        paths, "F-1.yaml", check_id="A01", confidence="HIGH", money_amount_rub=1000.0,
+        llm_notes=["Клиент подтверждал этот бюджет на прошлом звонке?"],
+    )
+    _write_finding(paths, "F-2.yaml", check_id="A02", confidence="MED", money_amount_rub=500.0)
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    build_report.build(paths, CONFIG, DEFAULTS)
+
+    agenda_path = paths.report / build_report.ORAL_REVIEW_AGENDA_FILENAME
+    text = agenda_path.read_text(encoding="utf-8")
+
+    assert f"{build_report.ORAL_REVIEW_MINUTES_TOTAL} мин" in text
+    assert "## Вступление" in text
+    assert "## Главные находки" in text
+    assert "1. **A01" in text
+    assert "Вопрос: Клиент подтверждал этот бюджет на прошлом звонке?" in text
+    assert "## Вопросы и дальнейшие шаги" in text
+
+
+def test_oral_review_agenda_no_questions_when_llm_notes_absent(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml")
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    build_report.build(paths, CONFIG, DEFAULTS)
+
+    text = (paths.report / build_report.ORAL_REVIEW_AGENDA_FILENAME).read_text(encoding="utf-8")
+    assert "Вопрос:" not in text
+    assert "Открытых вопросов к находкам нет" in text
+
+
+def test_oral_review_agenda_limits_to_top_5_findings(tmp_path):
+    paths = _Paths(tmp_path)
+    for i in range(build_report.MAX_ORAL_REVIEW_FINDINGS + 2):
+        _write_finding(
+            paths, f"F-A-{i:02d}.yaml", check_id="A04", confidence="MED",
+            money_amount_rub=float(100 - i),
+        )
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    build_report.build(paths, CONFIG, DEFAULTS)
+
+    text = (paths.report / build_report.ORAL_REVIEW_AGENDA_FILENAME).read_text(encoding="utf-8")
+    findings_section = text.split("## Главные находки")[1].split("## Вопросы")[0]
+    assert findings_section.count("**A04 —") == build_report.MAX_ORAL_REVIEW_FINDINGS
+
+
+def test_oral_review_agenda_no_approved_findings(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    build_report.build(paths, CONFIG, DEFAULTS)
+
+    text = (paths.report / build_report.ORAL_REVIEW_AGENDA_FILENAME).read_text(encoding="utf-8")
+    assert "Утверждённых находок нет — раздел находок не сформирован." in text
+
+
+# ── 19. Задача 7D: смоук-тест полного отчёта ──────────────────────────────
+
+def test_full_report_smoke_all_artifacts_present_and_consistent(tmp_path):
+    """Сквозной прогон build() с разнородным набором находок: markdown-отчёт,
+    3 CSV приложения и повестка звонка — все пишутся согласованно за один вызов.
+    """
+    import csv
+
+    paths = _Paths(tmp_path)
+    # HIGH/MED в пределах лимита раздела -> в основной секции.
+    for i in range(3):
+        _write_finding(
+            paths, f"F-main-{i:02d}.yaml",
+            check_id="A04", confidence="MED", money_amount_rub=float(1000 - i),
+            recommended_action=f"Действие №{i}",
+            llm_notes=[f"Вопрос по находке {i}"] if i == 0 else None,
+        )
+    # LOW -> уходит в приложение.
+    _write_finding(
+        paths, "F-low.yaml", check_id="C05", confidence="LOW",
+        recommended_action="Проверить гипотезу вручную",
+    )
+    # Переполнение лимита раздела -> тоже в приложение.
+    for i in range(build_report.MAX_REPORT_FINDINGS):
+        _write_finding(
+            paths, f"F-overflow-{i:02d}.yaml",
+            check_id="T02", confidence="MED", money_amount_rub=1.0,
+        )
+    _write_degradation(paths, skipped=[
+        {"id": "D02", "block": 0, "reason": "нет источника: goals"},
+        {"id": "S07", "block": 4, "reason": "нет источника: спрос Wordstat"},
+    ])
+    _write_metrics_summary(
+        paths, seo_confidence_cap={"runnable_count": 10, "med_cap_count": 5, "med_cap_share": 0.5},
+    )
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+
+    # 1. Основной markdown-отчёт.
+    report_text = Path(out_path).read_text(encoding="utf-8")
+    assert "## Вердикт" in report_text
+    assert "## План действий" in report_text
+    assert "## Ключевые находки" in report_text
+    assert "## Приложение" in report_text
+    assert "## Сноски" in report_text
+    assert "## Глоссарий" in report_text
+
+    # 2. Приложения-таблицы существуют и согласованы с markdown-приложением.
+    tables_dir = paths.report / build_report.APPENDIX_TABLES_DIRNAME
+    with (tables_dir / build_report.FINDINGS_APPENDIX_CSV).open(encoding="utf-8") as fh:
+        appendix_rows = list(csv.DictReader(fh))
+    appendix_section = report_text.split("## Приложение")[1].split("## Сноски")[0]
+    assert len(appendix_rows) == appendix_section.count("**C05 —") + appendix_section.count("**T02 —")
+
+    with (tables_dir / build_report.SKIPPED_CHECKS_CSV).open(encoding="utf-8") as fh:
+        skipped_rows = list(csv.DictReader(fh))
+    assert [r["id"] for r in skipped_rows] == ["D02", "S07"]
+
+    with (tables_dir / build_report.SEO_CORE_CSV).open(encoding="utf-8") as fh:
+        seo_rows = list(csv.DictReader(fh))
+    assert [r["id"] for r in seo_rows] == ["S07"]
+
+    # 3. Повестка звонка существует, содержит топ-находки и вопрос из llm_notes.
+    agenda_text = (paths.report / build_report.ORAL_REVIEW_AGENDA_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    assert "## Главные находки" in agenda_text
+    assert "Вопрос по находке 0" in agenda_text

@@ -55,10 +55,36 @@ _seo_confidence_cap_summary — report только форматирует го�
       ``degradation.skipped``, что и в «Что не удалось проверить», но
       отфильтрованные по блоку 4 (S, каталог v2 §9) для быстрой навигации
       клиента к SEO-разрывам без прочтения всего списка.
+
+Задача 7D: финальная сборка — приложения-таблицы (CSV), сноски на них из
+основного текста и повестка звонка с клиентом. Решения, не заданные явно
+источниками истины (задокументировано, не угадано молча):
+    * ``llm_notes`` (вопросы к находке, которые нужно поднять на звонке) не
+      существует ни в ``schemas.Finding``, ни в каталоге v2, ни в
+      methodology-v2.md — ни один источник истины его не описывает. Заведён
+      по тому же прецеденту, что и ``assignee`` (задача 7C, см. ``_assignee``):
+      необязательный ключ карточки YAML вне формальной схемы находки, который
+      report только читает через ``.get()`` (``_llm_notes``) и никогда не
+      придумывает — нет ключа или он пуст → на звонке по этой находке
+      открытых вопросов нет.
+    * Сноски ``[1]``/``[2]``/``[3]`` — фиксированные номера у трёх машиночитаемых
+      таблиц приложения (``_build_appendix_tables``): дополнительные находки,
+      непройденные проверки реестра, непосчитанное SEO-ядро (подмножество
+      второй). Схема статична (не автонумеруется по мере появления сносок в
+      тексте), т.к. ровно эти три таблицы пишутся при каждой сборке отчёта.
+    * Повестка звонка (``oral_review_agenda.md``) — бюджет 60 минут разложен
+      явно на вступление/находки/вопросы (``ORAL_REVIEW_MINUTES_*``), лимит
+      находок (``MAX_ORAL_REVIEW_FINDINGS = 5``) выведен из бюджета минут, а
+      не назван отдельной константой без обоснования. Находки берутся из
+      той же отсортированной по приоритету последовательности, что и «Три
+      главных разрыва»/план действий (``_priority_key``) — топ-5, а не топ-3
+      вердикта, т.к. под звонок отведено больше времени, чем под страницу
+      вердикта.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -89,6 +115,22 @@ MAX_VERDICT_GAPS = 3
 # той же отсортированной последовательности находок с непустой рекомендацией.
 MAX_ACTION_PLAN_2W = 7
 MAX_ACTION_PLAN_2M = 5
+
+# Задача 7D: приложения-таблицы (CSV) + сноски на них ────────────────────
+APPENDIX_TABLES_DIRNAME = "appendix_tables"
+FINDINGS_APPENDIX_CSV = "findings_appendix.csv"
+SKIPPED_CHECKS_CSV = "skipped_checks.csv"
+SEO_CORE_CSV = "seo_core_gaps.csv"
+
+# Повестка звонка с клиентом — бюджет 60 минут (см. докстринг модуля).
+ORAL_REVIEW_AGENDA_FILENAME = "oral_review_agenda.md"
+ORAL_REVIEW_MINUTES_TOTAL = 60
+ORAL_REVIEW_MINUTES_INTRO = 5
+ORAL_REVIEW_MINUTES_WRAP = 5
+ORAL_REVIEW_MINUTES_PER_FINDING = 10
+MAX_ORAL_REVIEW_FINDINGS = (
+    ORAL_REVIEW_MINUTES_TOTAL - ORAL_REVIEW_MINUTES_INTRO - ORAL_REVIEW_MINUTES_WRAP
+) // ORAL_REVIEW_MINUTES_PER_FINDING
 
 _CONFIDENCE_RANK: dict[str, int] = {
     "HIGH": 0,
@@ -185,6 +227,20 @@ def _assignee(finding: dict[str, Any]) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else "уточнить"
 
 
+def _llm_notes(finding: dict[str, Any]) -> list[str]:
+    """Вопросы к находке для звонка с клиентом (задача 7D) — необязательный
+    ключ ``llm_notes`` карточки YAML вне ``schemas.Finding`` (тот же приём,
+    что ``assignee``, см. докстринг модуля): нет ключа/пусто -> вопросов нет,
+    не выдумываются.
+    """
+    value = finding.get("llm_notes")
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
 def _format_money(finding: dict[str, Any], currency_round: int) -> str | None:
     category = finding.get("money_category")
     not_assessable = bool(finding.get("money_not_assessable"))
@@ -216,7 +272,7 @@ def _build_header(config: dict[str, Any]) -> list[str]:
         lines.append("")
 
     lines.append(
-        "_Черновой рендер: без повестки созвона с клиентом (не входит в эту задачу)._"
+        f"_Повестка звонка с клиентом — отдельным файлом: `{ORAL_REVIEW_AGENDA_FILENAME}`._"
     )
     lines.append("")
     return lines
@@ -439,7 +495,7 @@ def _build_findings_section(
 
 
 def _build_skipped_section(skipped: list[dict[str, Any]]) -> str:
-    lines = ["## Что не удалось проверить и почему", ""]
+    lines = ["## Что не удалось проверить и почему [2]", ""]
     if not skipped:
         lines.append("Все проверки реестра выполнены при текущих источниках.")
     else:
@@ -465,7 +521,7 @@ def _format_appendix_finding_line(finding: dict[str, Any], currency_round: int) 
 
 def _build_appendix_findings(appendix_findings: list[dict[str, Any]], currency_round: int) -> list[str]:
     lines = [
-        "### Дополнительные находки (уровень LOW и сверх лимита раздела)", "",
+        "### Дополнительные находки (уровень LOW и сверх лимита раздела) [1]", "",
     ]
     if not appendix_findings:
         lines.append("Дополнительных находок нет.")
@@ -477,7 +533,7 @@ def _build_appendix_findings(appendix_findings: list[dict[str, Any]], currency_r
 
 
 def _build_appendix_seo_core(degradation: dict[str, Any]) -> list[str]:
-    lines = ["### SEO-ядро — не посчитано", ""]
+    lines = ["### SEO-ядро — не посчитано [3]", ""]
     seo_skipped = [
         item for item in (degradation.get("skipped") or []) if item.get("block") == _BLOCK_ORDER["S"]
     ]
@@ -509,6 +565,131 @@ def _build_glossary_section(glossary: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+# ── Приложения-таблицы (CSV) + сноски (задача 7D) ─────────────────────────
+def _write_csv(path: Path, header: tuple[str, ...], rows: list[tuple[Any, ...]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def _build_appendix_tables(
+    report_dir: Path,
+    appendix_findings: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+    currency_round: int,
+) -> None:
+    """Машиночитаемые CSV-таблицы приложения — на них ссылаются сноски
+    [1]/[2]/[3] основного текста (см. докстринг модуля). Пишутся всегда,
+    даже пустыми (только заголовок), т.к. сноски на них ссылаются безусловно.
+    """
+    tables_dir = report_dir / APPENDIX_TABLES_DIRNAME
+
+    _write_csv(
+        tables_dir / FINDINGS_APPENDIX_CSV,
+        ("check_id", "name", "confidence", "money_category", "money_amount_rub", "assignee", "recommended_action"),
+        [
+            (
+                f.get("check_id", ""),
+                f.get("name", ""),
+                f.get("confidence", ""),
+                f.get("money_category") or "",
+                f.get("money_amount_rub") if isinstance(f.get("money_amount_rub"), (int, float)) else "",
+                _assignee(f),
+                f.get("recommended_action", "") or "",
+            )
+            for f in appendix_findings
+        ],
+    )
+
+    _write_csv(
+        tables_dir / SKIPPED_CHECKS_CSV,
+        ("id", "block", "reason"),
+        [(item.get("id", ""), item.get("block", ""), item.get("reason", "")) for item in skipped],
+    )
+
+    seo_skipped = [item for item in skipped if item.get("block") == _BLOCK_ORDER["S"]]
+    _write_csv(
+        tables_dir / SEO_CORE_CSV,
+        ("id", "reason"),
+        [(item.get("id", ""), item.get("reason", "")) for item in seo_skipped],
+    )
+
+
+def _build_footnotes_section() -> str:
+    lines = ["## Сноски", ""]
+    lines.append(
+        f"[1]: `{APPENDIX_TABLES_DIRNAME}/{FINDINGS_APPENDIX_CSV}` — полный список "
+        "дополнительных находок (уровень LOW и сверх лимита раздела) в машиночитаемом виде."
+    )
+    lines.append(
+        f"[2]: `{APPENDIX_TABLES_DIRNAME}/{SKIPPED_CHECKS_CSV}` — полный список "
+        "непройденных проверок реестра («Что не удалось проверить и почему»)."
+    )
+    lines.append(
+        f"[3]: `{APPENDIX_TABLES_DIRNAME}/{SEO_CORE_CSV}` — непосчитанные проверки "
+        "SEO-ядра (блок S, каталог v2 §9), подмножество сноски [2]."
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ── Повестка звонка с клиентом (задача 7D) ────────────────────────────────
+def _format_oral_review_finding(rank: int, finding: dict[str, Any], currency_round: int) -> str:
+    check_id, name = finding.get("check_id", ""), finding.get("name", "")
+    money_line = _format_money(finding, currency_round) or format_rub(None)
+    lines = [
+        f"{rank}. **{check_id} — {name}** ({ORAL_REVIEW_MINUTES_PER_FINDING} мин) — {money_line}"
+    ]
+    for question in _llm_notes(finding):
+        lines.append(f"   - Вопрос: {question}")
+    return "\n".join(lines)
+
+
+def build_oral_review_agenda(
+    findings: list[dict[str, Any]], config: dict[str, Any], currency_round: int
+) -> str:
+    """Повестка звонка с клиентом на ``ORAL_REVIEW_MINUTES_TOTAL`` минут: топ-
+    ``MAX_ORAL_REVIEW_FINDINGS`` находок по тому же приоритету, что и «Три
+    главных разрыва»/план действий (``_priority_key``), с вопросами из
+    ``llm_notes`` там, где они проставлены (см. ``_llm_notes`` — необязательное
+    поле, не выдумывается при отсутствии).
+    """
+    client = config.get("client") or {}
+    name = client.get("name") or "клиент"
+
+    lines = [f"# Повестка созвона — {name} ({ORAL_REVIEW_MINUTES_TOTAL} мин)", ""]
+
+    lines.append(f"## Вступление ({ORAL_REVIEW_MINUTES_INTRO} мин)")
+    lines.append("")
+    lines.append("Контекст диагностики, формат звонка, что клиент получит на выходе.")
+    lines.append("")
+
+    top = findings[:MAX_ORAL_REVIEW_FINDINGS]
+    lines.append(f"## Главные находки ({len(top) * ORAL_REVIEW_MINUTES_PER_FINDING} мин)")
+    lines.append("")
+    if not top:
+        lines.append("Утверждённых находок нет — раздел находок не сформирован.")
+    else:
+        for rank, finding in enumerate(top, start=1):
+            lines.append(_format_oral_review_finding(rank, finding, currency_round))
+    lines.append("")
+
+    lines.append(f"## Вопросы и дальнейшие шаги ({ORAL_REVIEW_MINUTES_WRAP} мин)")
+    lines.append("")
+    all_questions = [q for f in top for q in _llm_notes(f)]
+    if all_questions:
+        lines.append("Свод открытых вопросов к находкам (см. также построчно выше):")
+        for question in all_questions:
+            lines.append(f"- {question}")
+    else:
+        lines.append("Открытых вопросов к находкам нет — переходим сразу к следующим шагам.")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 # ── Точка входа слоя ─────────────────────────────────────────────────────
 def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> str:
     """Собрать отчёт в report/diagnostic_report.md; вернуть путь к файлу."""
@@ -534,10 +715,21 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> str:
     )
     lines.append(_build_skipped_section(degradation.get("skipped") or []))
     lines.append(_build_appendix_section(appendix_findings, degradation, currency_round))
+    lines.append(_build_footnotes_section())
     lines.append(_build_glossary_section(glossary))
 
     report_dir = Path(paths.report)
     report_dir.mkdir(parents=True, exist_ok=True)
     out_path = report_dir / REPORT_FILENAME
     out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+    _build_appendix_tables(
+        report_dir, appendix_findings, degradation.get("skipped") or [], currency_round
+    )
+
+    agenda_text = build_oral_review_agenda(findings, config, currency_round)
+    (report_dir / ORAL_REVIEW_AGENDA_FILENAME).write_text(
+        agenda_text.rstrip() + "\n", encoding="utf-8"
+    )
+
     return str(out_path)
