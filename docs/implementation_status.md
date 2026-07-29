@@ -1160,3 +1160,57 @@ C15/C25 fallback, C17/C23 manual-only, C19/C22 always-unavailable, C21
 browser-сегментация). `pytest tests/test_block3.py` — **38 passed**
 (venv `marketing-diagnostics/.venv` — системный Python без `scipy`/`duckdb`
 не годится для этого модуля).
+
+---
+
+**5I** DONE — 2026-07-29. `src/compute/money_frame.py` — денежная рамка
+(каталог v2 правило 15; methodology-v2 §8), собирает уже посчитанные числа
+из `data/metrics/{aXX,cXX}.json` (block1/block3), новой бизнес-математики не
+вводит. Подключение: `money_frame` добавлен последним элементом
+`common.BLOCK_MODULE_NAMES`, поэтому в `dispatch_blocks` выполняется уже
+после block1(A)/block3(C) и читает их готовые артефакты с диска.
+
+Четыре денежные категории (`MONEY_CATEGORIES`) не смешиваются — подытог
+считается отдельно на каждую (`kind="category_total"`), общего грандтотала
+по всем четырём нет. "Главные величины" — декларативные `_FLAT_RULES`
+(A04/A06/A09/A10/A17: берут уже посчитанное поле со строки с explicit
+проблемным флагом) и `_BENCHMARK_RULES` (A05/A11/A12/A13/A14/A19:
+`excess = cost - volume*benchmark` по уже посчитанным в самой A-проверке
+cost/volume/median-полям); A18 — отдельный обработчик вложенного списка
+`campaigns[]`. Сценарии (`equivalent_additional_conversions`) реализованы
+только для C06 (флагманская находка, легаси 1.1): разрыв доходимости формы
+сегмента относительно сайта в целом × объём сегмента = "недополученные
+конверсии", переводится в ₽ через сквозной CPA A04 (`_blended_cpa_from_a04`
+— сумма cost_normalized_rub/сумма net_conversions по всем кампаниям); без
+A04 сценарий всё равно пишется, но `amount_rub=None` с явным допущением
+"сквозной CPA недоступен". Остальные 24 C-проверки в ₽ не переводятся — нет
+уже посчитанного разрыва, который можно перевести без новой формулы вне
+источников истины (протокол микрозадач CLAUDE.md, п.5). Каждый сценарий
+несёт `scenario=True` + `scenario_label="сценарий, не прогноз"`. confidence
+каждой находки = `min(confidence строки, confidence_cap проверки из
+degradation_report)` — assumptions отдельного потолка не имеют, наследуют
+потолок находки; per-row `assert_confidence_within_cap` перед записью.
+
+SEO: `_seo_ready()` проверяет `data/metrics/s??.json` — на момент задачи
+S-блок (`src/compute/block4.py`) не реализован, файлов нет ни для одного
+клиента, поэтому money_frame всегда добавляет `kind="caveat"` строку
+`"SEO не учтён: источник не готов"` (ровно эта строка, не перефразирована) —
+рамка не выглядит молча полной. Отдельно пишется `findings_registry.csv`
+skeleton (`_CARD_FIELDS` — колонки единой карточки каталога v2 §12):
+деньги/уверенность/сегмент/источник/денежная категория заполнены из уже
+посчитанного, нарративные колонки (Статус/Доказательство/Рекомендуемое
+действие/Как измерить/Что нельзя заключить) оставлены пустыми для слоя
+analyze. LLM-приоритизация не реализована (вне скоупа задачи).
+
+Тесты `tests/test_money_frame.py` — плоские величины (A04/A10), CPA-excess
+(A05), вложенный A18, раздельные подытоги категорий (без грандтотала),
+сценарий C06 с A04 и без (amount_rub=None), LOW-сегмент C06 не становится
+сценарием, SEO-оговорка (отсутствует/есть непустой s01.json/только
+unavailable-статус), confidence≤cap, findings_registry skeleton (заголовок,
+пустые нарративные колонки, маркер сценария, "в ₽ не оценить"), пустой
+прогон без падения, подключение к `common.BLOCK_MODULE_NAMES` и к
+`dispatch_blocks` по умолчанию. `pytest tests/test_money_frame.py` —
+**19 passed**. Регрессия: `pytest tests/test_compute_common.py
+tests/test_block1.py tests/test_block3.py tests/test_money_frame.py` —
+**120 passed**, 0 failed (venv `marketing-diagnostics/.venv` — системный
+Python без `scipy`/`duckdb` не годится для этого модуля).

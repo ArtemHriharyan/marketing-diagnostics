@@ -228,6 +228,7 @@ def write_metric_artifact(
 # ── Dispatch блоков по runnable ─────────────────────────────────────────────
 BLOCK_MODULE_NAMES: tuple[str, ...] = (
     "block0", "block1", "block2", "block3", "block4", "block5", "block6",
+    "money_frame",
 )
 
 
