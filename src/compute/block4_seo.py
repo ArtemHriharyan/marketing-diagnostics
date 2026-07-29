@@ -1,4 +1,5 @@
-"""Блок 4 — SEO и органический спрос (каталог v2 §9, задача 5bA: S01–S10).
+"""Блок 4 — SEO и органический спрос (каталог v2 §9, задачи 5bA: S01–S10,
+5bB: S11–S20 — технический SEO и производительность).
 
 Проверки (config/methodology.yaml, catalog-proveryaemyh-marketingovyh-ugroz-v2.md §9):
     S01  брендовый и небрендовый органический трафик смешаны   [seo_queries]
@@ -11,25 +12,40 @@
     S08  страница не соответствует намерению запроса             [seo_queries, visits] (+site_crawl)
     S09  несколько страниц конкурируют по одному кластеру        [seo_queries]
     S10  по запросу ранжируется не та страница                   [seo_queries] (+visits)
+    S11  важные страницы закрыты robots/noindex                  [seo_queries] (+site_crawl)
+    S12  canonical указывает на неверную страницу                [seo_queries] (+site_crawl)
+    S13  sitemap неполный/устаревший/с ошибочными URL            [seo_queries] (+site_crawl)
+    S14  органический трафик ведёт на 404/удалённые страницы     [seo_queries] (+site_crawl)
+    S15  цепочки и массовые редиректы размывают сигнал           [site_crawl] (+seo_queries)
+    S16  индекс раздут дублями/параметрами/тонкими страницами    [seo_queries] (+site_crawl)
+    S17  title/description/H1 отсутствуют/дублируются/не по спросу [seo_queries] (+site_crawl)
+    S18  важные страницы имеют мало внутренних ссылок/сироты     [site_crawl]
+    S19  архитектура требует слишком много кликов до коммерции   [site_crawl] (+visits)
+    S20  мобильная производительность и CWV ухудшают конверсию   [seo_queries, crux] (+visits)
 
 Контракт:
-    Читает   — data/canonical/{seo_queries,visits,site_pages}.parquet,
-               data/metrics/degradation_report.json (confidence_cap на проверку).
+    Читает   — data/canonical/{seo_queries,visits,site_pages,site_link_graph}.parquet,
+               data/raw/crux/crux.json (НАПРЯМУЮ, не через canonical — у CrUX
+               нет канонической таблицы, тот же приём, что C01/C02 в block3.py),
+               inputs/manual_cwv.yaml (S20, тот же приём, что C01 при отсутствии
+               полевых данных CrUX), data/metrics/degradation_report.json
+               (confidence_cap на проверку).
                config клиента НЕ читается: is_brand уже посчитан в transform
                (build_canonical.is_brand_query, config.brand_terms применены
                там), здесь используется готовая колонка seo_queries.is_brand.
-    Пишет    — data/metrics/{s01..s10}.csv/.json. БЕЗ LLM.
+    Пишет    — data/metrics/{s01..s20}.csv/.json. БЕЗ LLM.
 
-S11–S27 не реализуются этой задачей (см. промт 5bA) — не путать с
-config/methodology.yaml, где они уже зарегистрированы для будущих задач.
+S21–S27 не реализуются этой задачей (задача 5bB реализует S11–S20) — не
+путать с config/methodology.yaml, где они уже зарегистрированы для будущих
+задач.
 
-── S11–S27 не реализуются (см. промт задачи 5bA) ────────────────────────────
+── S21–S27 не реализуются (задача 5bB реализует только S11–S20) ────────────
 requires/optional этих ID уже есть в methodology.yaml (регистр общий на весь
-блок 4), но диспетчер run() ниже гейтит только S01-S10 — S11-S27 остаются
+блок 4), но диспетчер run() ниже гейтит только S01-S20 — S21-S27 остаются
 "not_implemented" до отдельной задачи, тот же прецедент, что C01-C12 (5G) vs
-C13-C25 (5H) в block3.py.
+C13-C25 (5H) в block3.py и S01-S10 (5bA) vs S11-S20 (5bB) здесь же.
 
-── Структурные разрывы (НЕ устраняются здесь — вне allowed_files) ───────────
+── Структурные разрывы задачи 5bA (S01-S10, НЕ устраняются здесь — вне allowed_files) ───────────
 
 1. wordstat: src/extract/wordstat.py объявляет CANONICAL_TABLES=["wordstat"],
    но build_canonical.py НЕ строит data/canonical/wordstat.parquet ("схема не
@@ -93,10 +109,62 @@ C13-C25 (5H) в block3.py.
 не выбрасывает частично неполные строки, если их ещё можно использовать
 где-то ещё» — см. CLAUDE.md принцип 4, «управляемая деградация»). Для
 S01-S07 (не требуют device по промту этой задачи) device-разрез не строится.
+
+── Структурные разрывы задачи 5bB (S11-S20, НЕ устраняются здесь — вне allowed_files) ──
+
+5. **Частичное покрытие краулера:** site_crawl.py обходит ограниченный
+   список URL (`top_n_each_source` по умолчанию 20 на источник — топ по
+   расходу/трафику из C/D/E, см. data-export-spec-v2.md §G1, ред. 2:
+   "частичное покрытие по построению — НЕ повод для произвольно короткого
+   списка"). Каждая проверка S11-S19, читающая site_pages, несёт в summary
+   `crawl_coverage_caveat` и `crawled_url_count`, чтобы находки не читались
+   как утверждение о сайте целиком — только об обойдённых URL.
+
+6. **S11 — "требует недоступного рендеринга" реализован частично:** каталог
+   (источник истины a, catalog-proveryaemyh-marketingovyh-ugroz-v2.md)
+   описывает S11 как robots/noindex ИЛИ недоступный рендеринг. data-export-
+   spec-v2.md §G1 (источник истины b, контракт полей) явно относит
+   `js_content_diff` (сырой HTML vs отрендеренный) только к S27 ("Сырой HTML
+   vs отрендеренный... — S27"), не к S11 — а S27 вне скоупа задачи 5bB.
+   Расхождение между (a) и (b) (CLAUDE.md, протокол микрозадач п.5) разрешено
+   в пользу (b): здесь реализован только компонент robots/noindex;
+   `js_rendering_component_implemented: false` явно помечает каждую строку и
+   summary S11.
+
+7. **CrUX (S20)** — тот же структурный разрыв, что задокументирован в
+   block3.py (докстринг, разрыв 1): `crux.py: CANONICAL_TABLES = []` ->
+   requires=[crux] никогда не станет "runnable" через автоматическую
+   деградацию. Блок читает `data/raw/crux/crux.json` напрямую, минуя
+   canonical/degradation (тот же приём, что C01/C02); тесты конструируют
+   `runnable_ids` явным множеством (тот же прецедент, что test_block1/2/3.py).
+   CrUX-запрос не фильтрует по formFactor (тот же прецедент, что C01) — при
+   наличии полевых данных p75 агрегирован по всем устройствам, не только
+   мобильным, несмотря на формулировку S20 "мобильная производительность";
+   единственный источник действительно device-specific CWV —
+   `inputs/manual_cwv.yaml` (`meta.device`). При пустом CrUX
+   (`cwv_field_data_available` ложно или файл отсутствует) — единственный
+   путь дальше, с обязательным MED-потолком (задача 5bB, промт: "CrUX empty
+   -> только manual lab data с MED cap").
+
+8. **S18/S19 (`site_link_graph`)** — тот же структурный разрыв класса,
+   что 1/2 в докстринге block3.py: `site_crawl.py` пишет `link_graph.parquet`
+   только "если BFS даёт рёбра" (докстринг extract-модуля) — при отсутствии
+   рёбер (BFS не выполнялся или не нашёл внутренних ссылок) обе проверки
+   пишут unavailable с явной причиной, а не имитируют глубину/входящие ссылки
+   по косвенным данным.
+
+9. **S19** ("слишком много кликов до коммерческой страницы") — `site_pages`/
+   `site_link_graph` не хранят признак "коммерческая страница" (тот же класс
+   ограничения, что разрыв 4 выше про S08, — "нет поля в канонической схеме,
+   не выдумываем"). Реализовано по всем URL графа глубже порога
+   `_S19_DEEP_THRESHOLD`; `commercial_classification_available: false` в
+   summary — приоритизация среди них по коммерческой значимости остаётся за
+   аналитиком.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -173,6 +241,49 @@ _S09_MIN_SHOWS_FOR_COMPETITION = 20
 # начиная с которого альтернативная страница считается "явно лучше".
 _S10_MIN_ORGANIC_VISITS_FOR_COMPARISON = 20
 _S10_ENGAGEMENT_GAP_PP = 0.05
+
+# S11: минимум суммарных показов страницы, чтобы считать её "востребованной"
+# при отсутствии in_sitemap=true (иначе шум на единичных показах) — тот же
+# принцип материальности, что _MIN_SHOWS_FOR_OPPORTUNITY выше.
+_S11_MIN_SHOWS_FOR_IMPORTANT = 20
+
+# S12: минимум суммарных показов страницы, у которой canonical указывает на
+# другой URL, чтобы расхождение считалось материальным, а не единичным крауле.
+_S12_MIN_SHOWS_FOR_CHECK = 20
+
+# S13: тот же порог материальности для "страница с трафиком отсутствует в
+# sitemap".
+_S13_MIN_SHOWS_FOR_CHECK = 20
+
+# S14: с какого HTTP-статуса посадочная считается недоступной (тот же порог и
+# обоснование, что _C04_BAD_STATUS_MIN в block3.py — независимая константа,
+# блоки compute не делят пороги через common.py).
+_S14_BAD_STATUS_MIN = 400
+
+# S15: один хоп (напр. http->https, без-www->www) — норма, не "лишний";
+# цепочкой ("цепочки и массовые редиректы", множественное число) считается от
+# двух хопов — тот же принцип и число, что _C05_MIN_CHAIN_HOPS_FOR_FINDING в
+# block3.py.
+_S15_MIN_CHAIN_HOPS_FOR_FINDING = 2
+
+# S17: минимум показов, чтобы отсутствие/дубль метаданных считался материальным.
+_S17_MIN_SHOWS_FOR_CHECK = 20
+
+# S18: минимум входящих внутренних ссылок, ниже которого страница считается
+# "слабо связанной"; 0 входящих — отдельный флаг "страница-сирота".
+_S18_LOW_INLINK_THRESHOLD = 2
+
+# S19: глубина от главной (BFS-хопы, depth_from_home), начиная с которой
+# архитектура считается "требующей слишком много кликов" — эвристика (каталог
+# не даёт числа, тот же принцип, что и остальные пороги-эвристики модуля).
+_S19_DEEP_THRESHOLD = 4
+
+# S20: во сколько раз органическая вовлечённость мобильного сегмента должна
+# быть ниже вовлечённости десктопа, чтобы разрыв считался материальным (тот
+# же коэффициент, что _S05_DECLINE_CLICK_RATIO — просело минимум на 30%);
+# минимум визитов в каждом сравниваемом сегменте.
+_S20_MOBILE_ENGAGEMENT_GAP_RATIO = 0.7
+_S20_MIN_VISITS_FOR_DEVICE_COMPARISON = 30
 
 
 # ── Общие хелперы (дублируют паттерн block0/1/2/3.py — блоки compute не
@@ -345,6 +456,200 @@ def _load_site_titles(canonical: dict[str, Path], paths: Any) -> dict[str, dict[
         if path in out:
             continue
         out[path] = {"title": title, "h1": h1}
+    return out
+
+
+# ── site_pages (полная схема) — для S11-S17 (задача 5bB) ────────────────────
+_CRAWL_COVERAGE_CAVEAT = (
+    "site_pages содержит ограниченный список URL (site_crawl.py: "
+    "top_n_each_source по умолчанию 20 на источник) — «частичное покрытие по "
+    "построению» (data-export-spec-v2.md §G1, ред. 2), НЕ признак короткого "
+    "списка по ошибке. Находки этой проверки относятся только к обойдённым "
+    "URL и не экстраполируются на сайт целиком."
+)
+
+
+def _load_site_pages_full(canonical: dict[str, Path], paths: Any) -> dict[str, dict[str, Any]]:
+    """{нормализованный_путь: {...}} из site_pages — полная схема (в отличие
+
+    от _load_site_titles выше, который берёт только title/h1). Первая строка
+    на путь побеждает при коллизии (тот же принцип, что _load_site_titles и
+    block3._load_site_pages).
+    """
+    if "site_pages" not in canonical or not _table_nonempty(canonical["site_pages"]):
+        return {}
+    con = common.open_duckdb(paths)
+    try:
+        rows = con.execute(
+            "SELECT url, http_status, redirect_chain, final_url, canonical_url, "
+            "robots_directive, in_sitemap, title, description, h1 FROM site_pages"
+        ).fetchall()
+    finally:
+        con.close()
+
+    out: dict[str, dict[str, Any]] = {}
+    for (url, http_status, redirect_chain, final_url, canonical_url,
+         robots_directive, in_sitemap, title, description, h1) in rows:
+        path = _url_path(url)
+        if path in out:
+            continue
+        chain_len = 0
+        if redirect_chain:
+            try:
+                chain_len = len(json.loads(redirect_chain))
+            except (TypeError, ValueError):
+                chain_len = 0
+        out[path] = {
+            "url": url,
+            "http_status": http_status,
+            "redirect_hops": chain_len,
+            "final_url": final_url,
+            "canonical_url": canonical_url,
+            "canonical_path": _url_path(canonical_url) if canonical_url else None,
+            "robots_directive": robots_directive,
+            "in_sitemap": bool(in_sitemap) if in_sitemap is not None else None,
+            "title": title,
+            "description": description,
+            "h1": h1,
+        }
+    return out
+
+
+def _robots_blocks_indexing(directive: str | None) -> bool:
+    """True, если директива содержит noindex или disallow (регистронезависимо)."""
+    if not directive:
+        return False
+    lowered = directive.lower()
+    return "noindex" in lowered or "disallow" in lowered
+
+
+def _seo_shows_clicks_by_path(con: Any) -> dict[str, tuple[int, int]]:
+    """{нормализованный_путь: (total_shows, total_clicks)} по seo_queries."""
+    rows = con.execute(
+        "SELECT page, SUM(total_shows), SUM(total_clicks) FROM seo_queries GROUP BY page"
+    ).fetchall()
+    out: dict[str, tuple[int, int]] = {}
+    for page, shows, clicks in rows:
+        path = _url_path(page)
+        prev_shows, prev_clicks = out.get(path, (0, 0))
+        out[path] = (prev_shows + int(shows or 0), prev_clicks + int(clicks or 0))
+    return out
+
+
+# ── site_link_graph — для S18/S19 (задача 5bB) ──────────────────────────────
+def _load_link_graph(canonical: dict[str, Path], paths: Any) -> list[tuple[str, str, int | None]]:
+    """[(from_path, to_path, depth_from_home), ...] из site_link_graph."""
+    if "site_link_graph" not in canonical or not _table_nonempty(canonical["site_link_graph"]):
+        return []
+    con = common.open_duckdb(paths)
+    try:
+        rows = con.execute(
+            "SELECT from_url, to_url, depth_from_home FROM site_link_graph"
+        ).fetchall()
+    finally:
+        con.close()
+    return [
+        (_url_path(f), _url_path(t), int(d) if d is not None else None)
+        for f, t, d in rows
+    ]
+
+
+def _inbound_link_counts(edges: list[tuple[str, str, int | None]]) -> dict[str, int]:
+    """{to_path: число различных страниц, ссылающихся на него} (уникальные from_path)."""
+    sources_by_target: dict[str, set[str]] = {}
+    for from_path, to_path, _ in edges:
+        sources_by_target.setdefault(to_path, set()).add(from_path)
+    return {target: len(sources) for target, sources in sources_by_target.items()}
+
+
+def _min_depth_by_page(edges: list[tuple[str, str, int | None]]) -> dict[str, int]:
+    """{to_path: минимальная depth_from_home среди всех входящих рёбер}."""
+    out: dict[str, int] = {}
+    for _, to_path, depth in edges:
+        if depth is None:
+            continue
+        if to_path not in out or depth < out[to_path]:
+            out[to_path] = depth
+    return out
+
+
+# ── CrUX (S20) — читаем data/raw/crux/crux.json НАПРЯМУЮ (нет canonical),
+# тот же приём, что C01/C02 в block3.py (см. докстринг модуля, разрыв 7) ────
+_CWV_THRESHOLDS_MS: dict[str, tuple[float, float]] = {
+    "largest_contentful_paint": (2500, 4000),
+    "interaction_to_next_paint": (200, 500),
+    "first_contentful_paint": (1800, 3000),
+}
+_CWV_CLS_THRESHOLDS: tuple[float, float] = (0.1, 0.25)
+
+
+def _rate_cwv_metric(name: str, value: float | None) -> str | None:
+    """good | needs_improvement | poor по официальным порогам CWV (web.dev/vitals)."""
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if name == "cumulative_layout_shift":
+        good, needs = _CWV_CLS_THRESHOLDS
+    else:
+        bounds = _CWV_THRESHOLDS_MS.get(name)
+        if bounds is None:
+            return None
+        good, needs = bounds
+    if value <= good:
+        return "good"
+    if value <= needs:
+        return "needs_improvement"
+    return "poor"
+
+
+def _read_crux_raw(paths: Any) -> dict[str, Any] | None:
+    path = Path(paths.raw) / "crux" / "crux.json"
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _yaml_populated(doc: dict[str, Any] | None, meta_keys: tuple[str, ...]) -> bool:
+    """Хотя бы один meta.<key> непуст -> аналитик реально заполнял файл (не шаблон)."""
+    if not doc:
+        return False
+    meta = doc.get("meta") or {}
+    for key in meta_keys:
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value:
+            return True
+    return False
+
+
+def _organic_visit_context_by_device(con: Any) -> dict[str, dict[str, Any]]:
+    """{device: {visits, engaged_visits, engagement_rate}} по органическому
+
+    сегменту (тот же принцип вовлечённости, что _organic_visits_by_page — 4
+    группы целей).
+    """
+    rows = con.execute(
+        "SELECT device, COUNT(*), "
+        "COUNT(*) FILTER (WHERE form_open OR form_submit OR call_click OR messenger_click) "
+        "FROM visits WHERE source_group = 'organic' GROUP BY device"
+    ).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for device, total, engaged in rows:
+        total = int(total or 0)
+        engaged = int(engaged or 0)
+        out[device] = {
+            "visits": total,
+            "engaged_visits": engaged,
+            "engagement_rate": round(engaged / total, 4) if total else None,
+        }
     return out
 
 
@@ -1008,6 +1313,668 @@ def _run_s10(paths: Any, has_visits: bool, confidence_cap: str, metrics_dir: Pat
     common.write_metric_artifact(metrics_dir, "s10", rows, confidence_cap=confidence_cap)
 
 
+# ── S11 — важные страницы закрыты robots.txt/noindex ────────────────────────
+def _run_s11(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    """robots/noindex-компонент S11 (см. докстринг модуля, разрыв 6 — компонент
+
+    "недоступный рендеринг" не реализуется здесь).
+    """
+    site_pages = _load_site_pages_full(canonical, paths)
+    if not site_pages:
+        _write_unavailable(
+            metrics_dir, "S11",
+            "site_pages недоступна (site_crawl не выполнен) — директивы "
+            "robots и статус sitemap проверить нечем",
+        )
+        return
+
+    con = common.open_duckdb(paths)
+    try:
+        shows_by_path = _seo_shows_clicks_by_path(con)
+    finally:
+        con.close()
+
+    rows: list[dict[str, Any]] = []
+    candidate_count = 0
+    for path, info in sorted(site_pages.items()):
+        if not _robots_blocks_indexing(info["robots_directive"]):
+            continue
+        shows, clicks = shows_by_path.get(path, (0, 0))
+        important = bool(info["in_sitemap"]) or shows >= _S11_MIN_SHOWS_FOR_IMPORTANT
+        if not important:
+            continue
+        candidate_count += 1
+        rows.append({
+            "check_id": "S11",
+            "finding": "robots_blocks_important_page",
+            "page": info["url"] or path,
+            "robots_directive": info["robots_directive"],
+            "in_sitemap": info["in_sitemap"],
+            "total_shows": shows,
+            "total_clicks": clicks,
+            "min_shows_threshold": _S11_MIN_SHOWS_FOR_IMPORTANT,
+            "js_rendering_component_implemented": False,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    rows.insert(0, {
+        "check_id": "S11",
+        "finding": "summary",
+        "candidate_count": candidate_count,
+        "crawled_url_count": len(site_pages),
+        "min_shows_threshold": _S11_MIN_SHOWS_FOR_IMPORTANT,
+        "js_rendering_component_implemented": False,
+        "crawl_coverage_caveat": _CRAWL_COVERAGE_CAVEAT,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s11", rows, confidence_cap=confidence_cap)
+
+
+# ── S12 — canonical указывает на неверную страницу ──────────────────────────
+def _run_s12(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    site_pages = _load_site_pages_full(canonical, paths)
+    if not site_pages:
+        _write_unavailable(
+            metrics_dir, "S12",
+            "site_pages недоступна (site_crawl не выполнен) — canonical "
+            "страниц проверить нечем",
+        )
+        return
+
+    con = common.open_duckdb(paths)
+    try:
+        shows_by_path = _seo_shows_clicks_by_path(con)
+    finally:
+        con.close()
+
+    rows: list[dict[str, Any]] = []
+    candidate_count = 0
+    for path, info in sorted(site_pages.items()):
+        canonical_path = info["canonical_path"]
+        if not canonical_path or canonical_path == path:
+            continue
+        shows, clicks = shows_by_path.get(path, (0, 0))
+        if shows < _S12_MIN_SHOWS_FOR_CHECK:
+            continue
+        candidate_count += 1
+        rows.append({
+            "check_id": "S12",
+            "finding": "canonical_points_elsewhere",
+            "page": info["url"] or path,
+            "canonical_url": info["canonical_url"],
+            "total_shows": shows,
+            "total_clicks": clicks,
+            "min_shows_threshold": _S12_MIN_SHOWS_FOR_CHECK,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    rows.insert(0, {
+        "check_id": "S12",
+        "finding": "summary",
+        "candidate_count": candidate_count,
+        "crawled_url_count": len(site_pages),
+        "min_shows_threshold": _S12_MIN_SHOWS_FOR_CHECK,
+        "crawl_coverage_caveat": _CRAWL_COVERAGE_CAVEAT,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s12", rows, confidence_cap=confidence_cap)
+
+
+# ── S13 — sitemap неполный/устаревший/с ошибочными URL ──────────────────────
+def _run_s13(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    site_pages = _load_site_pages_full(canonical, paths)
+    if not site_pages:
+        _write_unavailable(
+            metrics_dir, "S13",
+            "site_pages недоступна (site_crawl не выполнен) — статус "
+            "sitemap проверить нечем",
+        )
+        return
+
+    con = common.open_duckdb(paths)
+    try:
+        shows_by_path = _seo_shows_clicks_by_path(con)
+    finally:
+        con.close()
+
+    missing_from_sitemap: list[dict[str, Any]] = []
+    broken_in_sitemap: list[dict[str, Any]] = []
+    for path, info in sorted(site_pages.items()):
+        shows, clicks = shows_by_path.get(path, (0, 0))
+        if info["in_sitemap"] is False and shows >= _S13_MIN_SHOWS_FOR_CHECK:
+            missing_from_sitemap.append({
+                "check_id": "S13",
+                "finding": "traffic_page_missing_from_sitemap",
+                "page": info["url"] or path,
+                "total_shows": shows,
+                "total_clicks": clicks,
+                "min_shows_threshold": _S13_MIN_SHOWS_FOR_CHECK,
+                "confidence": _cap("MED", confidence_cap),
+            })
+        if (info["in_sitemap"] and info["http_status"] is not None
+                and info["http_status"] >= _S14_BAD_STATUS_MIN):
+            broken_in_sitemap.append({
+                "check_id": "S13",
+                "finding": "sitemap_contains_broken_url",
+                "page": info["url"] or path,
+                "http_status": info["http_status"],
+                "bad_status_threshold": _S14_BAD_STATUS_MIN,
+                "confidence": _cap("MED", confidence_cap),
+            })
+
+    rows: list[dict[str, Any]] = [{
+        "check_id": "S13",
+        "finding": "summary",
+        "traffic_pages_missing_from_sitemap": len(missing_from_sitemap),
+        "sitemap_broken_urls": len(broken_in_sitemap),
+        "crawled_url_count": len(site_pages),
+        "min_shows_threshold": _S13_MIN_SHOWS_FOR_CHECK,
+        "crawl_coverage_caveat": _CRAWL_COVERAGE_CAVEAT,
+        "confidence": _cap("MED", confidence_cap),
+    }]
+    rows.extend(missing_from_sitemap)
+    rows.extend(broken_in_sitemap)
+
+    common.write_metric_artifact(metrics_dir, "s13", rows, confidence_cap=confidence_cap)
+
+
+# ── S14 — органический трафик ведёт на 404/soft 404/удалённые страницы ─────
+def _run_s14(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    site_pages = _load_site_pages_full(canonical, paths)
+    if not site_pages:
+        _write_unavailable(
+            metrics_dir, "S14",
+            "site_pages недоступна (site_crawl не выполнен) — HTTP-статусы "
+            "органических посадочных проверить нечем",
+        )
+        return
+
+    con = common.open_duckdb(paths)
+    try:
+        shows_by_path = _seo_shows_clicks_by_path(con)
+    finally:
+        con.close()
+
+    rows: list[dict[str, Any]] = []
+    broken_count = 0
+    for path, (shows, clicks) in sorted(shows_by_path.items()):
+        if shows <= 0 and clicks <= 0:
+            continue
+        info = site_pages.get(path)
+        if info is None or info["http_status"] is None or info["http_status"] < _S14_BAD_STATUS_MIN:
+            continue
+        broken_count += 1
+        rows.append({
+            "check_id": "S14",
+            "finding": "organic_traffic_to_broken_page",
+            "page": info["url"] or path,
+            "http_status": info["http_status"],
+            "total_shows": shows,
+            "total_clicks": clicks,
+            "bad_status_threshold": _S14_BAD_STATUS_MIN,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    rows.insert(0, {
+        "check_id": "S14",
+        "finding": "summary",
+        "broken_page_count": broken_count,
+        "crawled_url_count": len(site_pages),
+        "bad_status_threshold": _S14_BAD_STATUS_MIN,
+        "crawl_coverage_caveat": _CRAWL_COVERAGE_CAVEAT,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s14", rows, confidence_cap=confidence_cap)
+
+
+# ── S15 — цепочки и массовые редиректы размывают сигнал ─────────────────────
+def _run_s15(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    site_pages = _load_site_pages_full(canonical, paths)
+    if not site_pages:
+        _write_unavailable(
+            metrics_dir, "S15",
+            "site_pages недоступна (site_crawl не выполнен) — цепочки "
+            "редиректов проверить нечем",
+        )
+        return
+
+    has_seo = "seo_queries" in canonical and _table_nonempty(canonical["seo_queries"])
+    shows_by_path: dict[str, tuple[int, int]] = {}
+    if has_seo:
+        con = common.open_duckdb(paths)
+        try:
+            shows_by_path = _seo_shows_clicks_by_path(con)
+        finally:
+            con.close()
+
+    rows: list[dict[str, Any]] = []
+    excessive_count = 0
+    for path, info in sorted(site_pages.items()):
+        hops = info["redirect_hops"]
+        if hops < 1:
+            continue
+        excessive = hops >= _S15_MIN_CHAIN_HOPS_FOR_FINDING
+        if excessive:
+            excessive_count += 1
+        shows, clicks = shows_by_path.get(path, (0, 0))
+        rows.append({
+            "check_id": "S15",
+            "finding": "redirect_chain",
+            "page": info["url"] or path,
+            "final_url": info["final_url"],
+            "redirect_hops": hops,
+            "min_hops_for_finding": _S15_MIN_CHAIN_HOPS_FOR_FINDING,
+            "excessive_redirect_chain": excessive,
+            "total_shows": shows if has_seo else None,
+            "total_clicks": clicks if has_seo else None,
+            "seo_queries_available": has_seo,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    rows.insert(0, {
+        "check_id": "S15",
+        "finding": "summary",
+        "excessive_redirect_chain_count": excessive_count,
+        "crawled_url_count": len(site_pages),
+        "min_hops_for_finding": _S15_MIN_CHAIN_HOPS_FOR_FINDING,
+        "seo_queries_available": has_seo,
+        "crawl_coverage_caveat": _CRAWL_COVERAGE_CAVEAT,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s15", rows, confidence_cap=confidence_cap)
+
+
+# ── S16 — индекс раздут дублями/параметрами/тонкими страницами ─────────────
+def _run_s16(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    site_pages = _load_site_pages_full(canonical, paths)
+    if not site_pages:
+        _write_unavailable(
+            metrics_dir, "S16",
+            "site_pages недоступна (site_crawl не выполнен) — сравнить "
+            "известные/индексируемые/полезные URL нечем",
+        )
+        return
+
+    con = common.open_duckdb(paths)
+    try:
+        shows_by_path = _seo_shows_clicks_by_path(con)
+    finally:
+        con.close()
+
+    duplicate_targets: dict[str, set[str]] = {}
+    for path, info in site_pages.items():
+        target = info["canonical_path"] or path
+        if target == path:
+            continue
+        duplicate_targets.setdefault(target, set()).add(path)
+
+    duplicate_rows: list[dict[str, Any]] = []
+    for target, sources in sorted(duplicate_targets.items()):
+        if len(sources) < 2:
+            continue
+        duplicate_rows.append({
+            "check_id": "S16",
+            "finding": "duplicate_cluster",
+            "canonical_target": target,
+            "duplicate_source_count": len(sources),
+            "duplicate_sources": sorted(sources),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    indexable_count = sum(
+        1 for info in site_pages.values()
+        if info["http_status"] == 200 and not _robots_blocks_indexing(info["robots_directive"])
+    )
+    pages_with_shows = sum(1 for path in site_pages if shows_by_path.get(path, (0, 0))[0] > 0)
+
+    rows: list[dict[str, Any]] = [{
+        "check_id": "S16",
+        "finding": "summary",
+        "crawled_url_count": len(site_pages),
+        "indexable_url_count": indexable_count,
+        "pages_with_organic_shows": pages_with_shows,
+        "duplicate_cluster_count": len(duplicate_rows),
+        "crawl_coverage_caveat": _CRAWL_COVERAGE_CAVEAT,
+        "confidence": _cap("MED", confidence_cap),
+    }]
+    rows.extend(duplicate_rows)
+
+    common.write_metric_artifact(metrics_dir, "s16", rows, confidence_cap=confidence_cap)
+
+
+# ── S17 — title/description/H1 отсутствуют/дублируются/не по спросу ────────
+def _run_s17(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    site_pages = _load_site_pages_full(canonical, paths)
+    if not site_pages:
+        _write_unavailable(
+            metrics_dir, "S17",
+            "site_pages недоступна (site_crawl не выполнен) — title/"
+            "description/H1 проверить нечем",
+        )
+        return
+
+    con = common.open_duckdb(paths)
+    try:
+        shows_by_path = _seo_shows_clicks_by_path(con)
+    finally:
+        con.close()
+
+    missing_rows: list[dict[str, Any]] = []
+    title_pages: dict[str, list[str]] = {}
+    for path, info in sorted(site_pages.items()):
+        shows, clicks = shows_by_path.get(path, (0, 0))
+        if shows < _S17_MIN_SHOWS_FOR_CHECK:
+            continue
+        missing_fields = [
+            field for field in ("title", "description", "h1")
+            if not (info.get(field) or "").strip()
+        ]
+        if missing_fields:
+            missing_rows.append({
+                "check_id": "S17",
+                "finding": "missing_metadata",
+                "page": info["url"] or path,
+                "missing_fields": missing_fields,
+                "total_shows": shows,
+                "total_clicks": clicks,
+                "min_shows_threshold": _S17_MIN_SHOWS_FOR_CHECK,
+                "confidence": _cap("MED", confidence_cap),
+            })
+        title = (info.get("title") or "").strip()
+        if title:
+            title_pages.setdefault(title, []).append(path)
+
+    duplicate_rows: list[dict[str, Any]] = []
+    for title, paths_list in sorted(title_pages.items()):
+        if len(paths_list) < 2:
+            continue
+        duplicate_rows.append({
+            "check_id": "S17",
+            "finding": "duplicate_title",
+            "title": title,
+            "pages": sorted(paths_list),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    rows: list[dict[str, Any]] = [{
+        "check_id": "S17",
+        "finding": "summary",
+        "missing_metadata_count": len(missing_rows),
+        "duplicate_title_count": len(duplicate_rows),
+        "crawled_url_count": len(site_pages),
+        "min_shows_threshold": _S17_MIN_SHOWS_FOR_CHECK,
+        "crawl_coverage_caveat": _CRAWL_COVERAGE_CAVEAT,
+        "confidence": _cap("MED", confidence_cap),
+    }]
+    rows.extend(missing_rows)
+    rows.extend(duplicate_rows)
+
+    common.write_metric_artifact(metrics_dir, "s17", rows, confidence_cap=confidence_cap)
+
+
+# ── S18 — важные страницы имеют мало внутренних ссылок или являются сиротами
+def _run_s18(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    site_pages = _load_site_pages_full(canonical, paths)
+    if not site_pages:
+        _write_unavailable(
+            metrics_dir, "S18",
+            "site_pages недоступна (site_crawl не выполнен) — внутренний "
+            "граф ссылок проверить нечем",
+        )
+        return
+
+    edges = _load_link_graph(canonical, paths)
+    if not edges:
+        _write_unavailable(
+            metrics_dir, "S18",
+            "site_link_graph недоступна (link_graph.parquet не построен — "
+            "BFS не дал рёбер либо не выполнялся, см. src/extract/"
+            "site_crawl.py) — внутренние ссылки страниц проверить нечем",
+        )
+        return
+
+    inbound = _inbound_link_counts(edges)
+
+    rows: list[dict[str, Any]] = []
+    orphan_count = 0
+    low_inlink_count = 0
+    for path in sorted(site_pages):
+        if path == "/":
+            continue
+        count = inbound.get(path, 0)
+        is_orphan = count == 0
+        is_low = 0 < count < _S18_LOW_INLINK_THRESHOLD
+        if is_orphan:
+            orphan_count += 1
+        if is_low:
+            low_inlink_count += 1
+        if not (is_orphan or is_low):
+            continue
+        rows.append({
+            "check_id": "S18",
+            "finding": "orphan_page" if is_orphan else "low_inlink_page",
+            "page": path,
+            "inbound_internal_link_count": count,
+            "low_inlink_threshold": _S18_LOW_INLINK_THRESHOLD,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    rows.insert(0, {
+        "check_id": "S18",
+        "finding": "summary",
+        "orphan_page_count": orphan_count,
+        "low_inlink_page_count": low_inlink_count,
+        "crawled_url_count": len(site_pages),
+        "low_inlink_threshold": _S18_LOW_INLINK_THRESHOLD,
+        "crawl_coverage_caveat": _CRAWL_COVERAGE_CAVEAT,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s18", rows, confidence_cap=confidence_cap)
+
+
+# ── S19 — архитектура сайта требует слишком много кликов до коммерции ──────
+def _run_s19(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    edges = _load_link_graph(canonical, paths)
+    if not edges:
+        _write_unavailable(
+            metrics_dir, "S19",
+            "site_link_graph недоступна (link_graph.parquet не построен — "
+            "BFS не дал рёбер либо не выполнялся, см. src/extract/"
+            "site_crawl.py) — глубину от главной проверить нечем",
+        )
+        return
+
+    has_visits = "visits" in canonical and _table_nonempty(canonical["visits"])
+    organic_context: dict[str, dict[str, Any]] = {}
+    if has_visits:
+        con = common.open_duckdb(paths)
+        try:
+            organic_rows = con.execute(
+                "SELECT entry_page, COUNT(*), "
+                "COUNT(*) FILTER (WHERE form_open OR form_submit OR call_click OR messenger_click) "
+                "FROM visits WHERE source_group = 'organic' GROUP BY entry_page"
+            ).fetchall()
+        finally:
+            con.close()
+        for entry_page, total, engaged in organic_rows:
+            path = _url_path(entry_page)
+            total = int(total or 0)
+            engaged = int(engaged or 0)
+            organic_context[path] = {
+                "organic_visits": total,
+                "organic_engagement_rate": round(engaged / total, 4) if total else None,
+            }
+
+    depth_by_page = _min_depth_by_page(edges)
+
+    rows: list[dict[str, Any]] = []
+    deep_count = 0
+    for path, depth in sorted(depth_by_page.items()):
+        deep = depth >= _S19_DEEP_THRESHOLD
+        if deep:
+            deep_count += 1
+        if not deep:
+            continue
+        row: dict[str, Any] = {
+            "check_id": "S19",
+            "finding": "page_too_deep",
+            "page": path,
+            "depth_from_home": depth,
+            "deep_threshold": _S19_DEEP_THRESHOLD,
+        }
+        row.update(organic_context.get(path, {}))
+        row["confidence"] = _cap("MED", confidence_cap)
+        rows.append(row)
+
+    rows.insert(0, {
+        "check_id": "S19",
+        "finding": "summary",
+        "pages_evaluated": len(depth_by_page),
+        "deep_page_count": deep_count,
+        "deep_threshold": _S19_DEEP_THRESHOLD,
+        "visits_available": has_visits,
+        "commercial_classification_available": False,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s19", rows, confidence_cap=confidence_cap)
+
+
+# ── S20 — мобильная производительность и CWV ухудшают органическую конверсию
+def _run_s20(
+    paths: Any, defaults: dict[str, Any], canonical: dict[str, Path],
+    confidence_cap: str, metrics_dir: Path,
+) -> None:
+    """Источник CWV — тот же приём, что C01/C02 в block3.py (см. докстринг
+
+    модуля, разрыв 7). "CrUX empty -> только manual lab data с MED cap" —
+    прямое требование промта задачи 5bB.
+    """
+    manual_cap_enabled = bool(defaults.get("crux_min_field_data", True))
+    raw = _read_crux_raw(paths)
+
+    con = common.open_duckdb(paths)
+    try:
+        mobile_seo = con.execute(
+            "SELECT SUM(total_shows), SUM(total_clicks), "
+            "SUM(avg_show_position * total_shows) FILTER (WHERE avg_show_position IS NOT NULL), "
+            "SUM(total_shows) FILTER (WHERE avg_show_position IS NOT NULL) "
+            "FROM seo_queries WHERE device = 'mobile'"
+        ).fetchone()
+        has_visits = "visits" in canonical and _table_nonempty(canonical["visits"])
+        organic_by_device = _organic_visit_context_by_device(con) if has_visits else {}
+    finally:
+        con.close()
+
+    mobile_shows, mobile_clicks, pos_w, shows_pos = mobile_seo
+    mobile_shows = int(mobile_shows or 0)
+    mobile_clicks = int(mobile_clicks or 0)
+    mobile_avg_position = (pos_w / shows_pos) if (pos_w is not None and shows_pos) else None
+
+    rows: list[dict[str, Any]] = [{
+        "check_id": "S20",
+        "finding": "mobile_seo_context",
+        "mobile_total_shows": mobile_shows,
+        "mobile_total_clicks": mobile_clicks,
+        "mobile_avg_position": round(mobile_avg_position, 2) if mobile_avg_position is not None else None,
+        "confidence": _cap("MED", confidence_cap),
+    }]
+
+    mobile_engagement = organic_by_device.get("mobile")
+    desktop_engagement = organic_by_device.get("desktop")
+    if mobile_engagement and desktop_engagement:
+        both_material = (
+            mobile_engagement["visits"] >= _S20_MIN_VISITS_FOR_DEVICE_COMPARISON
+            and desktop_engagement["visits"] >= _S20_MIN_VISITS_FOR_DEVICE_COMPARISON
+        )
+        gap_ratio = None
+        mobile_worse = False
+        if (both_material and desktop_engagement["engagement_rate"]
+                and mobile_engagement["engagement_rate"] is not None):
+            gap_ratio = mobile_engagement["engagement_rate"] / desktop_engagement["engagement_rate"]
+            mobile_worse = gap_ratio <= _S20_MOBILE_ENGAGEMENT_GAP_RATIO
+        rows.append({
+            "check_id": "S20",
+            "finding": "mobile_vs_desktop_organic_engagement",
+            "mobile_visits": mobile_engagement["visits"],
+            "mobile_engagement_rate": mobile_engagement["engagement_rate"],
+            "desktop_visits": desktop_engagement["visits"],
+            "desktop_engagement_rate": desktop_engagement["engagement_rate"],
+            "engagement_ratio_mobile_to_desktop": round(gap_ratio, 3) if gap_ratio is not None else None,
+            "gap_ratio_threshold": _S20_MOBILE_ENGAGEMENT_GAP_RATIO,
+            "min_visits_threshold": _S20_MIN_VISITS_FOR_DEVICE_COMPARISON,
+            "material_sample": both_material,
+            "mobile_engagement_significantly_worse": bool(mobile_worse),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    if raw and raw.get("cwv_field_data_available"):
+        for record in raw.get("records") or []:
+            if not record.get("field_data_available"):
+                continue
+            p75 = record.get("p75") or {}
+            ratings = {f"{name}_rating": _rate_cwv_metric(name, value) for name, value in p75.items()}
+            rows.append({
+                "check_id": "S20",
+                "finding": "field_cwv",
+                "target_type": record.get("target_type"),
+                "target": record.get("target"),
+                **p75,
+                **ratings,
+                "any_metric_poor": any(v == "poor" for v in ratings.values()),
+                "device_specific": False,
+                "device_specific_note": (
+                    "CrUX-запрос не фильтрует по formFactor (см. src/extract/"
+                    "crux.py, тот же прецедент, что C01 в block3.py) — p75 "
+                    "агрегирован по всем устройствам, не только мобильным."
+                ),
+                "source": "crux_field",
+                "confidence": _cap("MED", confidence_cap),
+            })
+        common.write_metric_artifact(metrics_dir, "s20", rows, confidence_cap=confidence_cap)
+        return
+
+    inputs = common.load_inputs(paths)
+    manual = inputs.get("manual_cwv")
+    if _yaml_populated(manual, ("tested_at",)):
+        cap_level = "MED" if manual_cap_enabled else "LOW"
+        for pattern in (manual or {}).get("patterns") or []:
+            if not isinstance(pattern, dict):
+                continue
+            ratings = {
+                "lcp_rating": _rate_cwv_metric("largest_contentful_paint", pattern.get("lcp_ms")),
+                "cls_rating": _rate_cwv_metric("cumulative_layout_shift", pattern.get("cls")),
+                "inp_rating": _rate_cwv_metric("interaction_to_next_paint", pattern.get("inp_ms")),
+            }
+            rows.append({
+                "check_id": "S20",
+                "finding": "manual_lab_cwv",
+                "device": (manual.get("meta") or {}).get("device"),
+                **pattern, **ratings,
+                "source": "manual_lab",
+                "confidence": _cap(cap_level, confidence_cap),
+            })
+        common.write_metric_artifact(metrics_dir, "s20", rows, confidence_cap=confidence_cap)
+        return
+
+    rows.append({
+        "check_id": "S20",
+        "finding": "cwv_unavailable",
+        "reason": (
+            "нет ни полевых данных CrUX (data/raw/crux/crux.json отсутствует "
+            "или cwv_field_data_available=false), ни ручного лабораторного "
+            "замера (inputs/manual_cwv.yaml не заполнен — meta.tested_at пуст)"
+        ),
+        "confidence": _cap("LOW", confidence_cap),
+    })
+    common.write_metric_artifact(metrics_dir, "s20", rows, confidence_cap=confidence_cap)
+
+
 # ── Диспетчер блока ──────────────────────────────────────────────────────────
 def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[str]:
     """Выполнить S01-S10 из числа доступных; вернуть имена записанных артефактов.
@@ -1062,5 +2029,46 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
     if "S10" in runnable_ids and has_seo:
         _run_s10(paths, has_visits, caps.get("S10", "HIGH"), metrics_dir)
         artifacts.append("s10")
+
+    # ── Задача 5bB: S11-S20 ──────────────────────────────────────────────────
+    if "S11" in runnable_ids and has_seo:
+        _run_s11(paths, canonical, caps.get("S11", "HIGH"), metrics_dir)
+        artifacts.append("s11")
+
+    if "S12" in runnable_ids and has_seo:
+        _run_s12(paths, canonical, caps.get("S12", "HIGH"), metrics_dir)
+        artifacts.append("s12")
+
+    if "S13" in runnable_ids and has_seo:
+        _run_s13(paths, canonical, caps.get("S13", "HIGH"), metrics_dir)
+        artifacts.append("s13")
+
+    if "S14" in runnable_ids and has_seo:
+        _run_s14(paths, canonical, caps.get("S14", "HIGH"), metrics_dir)
+        artifacts.append("s14")
+
+    if "S15" in runnable_ids and "site_pages" in canonical:
+        _run_s15(paths, canonical, caps.get("S15", "HIGH"), metrics_dir)
+        artifacts.append("s15")
+
+    if "S16" in runnable_ids and has_seo:
+        _run_s16(paths, canonical, caps.get("S16", "HIGH"), metrics_dir)
+        artifacts.append("s16")
+
+    if "S17" in runnable_ids and has_seo:
+        _run_s17(paths, canonical, caps.get("S17", "HIGH"), metrics_dir)
+        artifacts.append("s17")
+
+    if "S18" in runnable_ids and "site_pages" in canonical:
+        _run_s18(paths, canonical, caps.get("S18", "HIGH"), metrics_dir)
+        artifacts.append("s18")
+
+    if "S19" in runnable_ids and "site_pages" in canonical:
+        _run_s19(paths, canonical, caps.get("S19", "HIGH"), metrics_dir)
+        artifacts.append("s19")
+
+    if "S20" in runnable_ids and has_seo:
+        _run_s20(paths, defaults, canonical, caps.get("S20", "HIGH"), metrics_dir)
+        artifacts.append("s20")
 
     return artifacts

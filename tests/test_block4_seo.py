@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import pandas as pd
+import yaml
 
 from src.compute import block4_seo  # noqa: E402
 
@@ -47,6 +48,27 @@ def _write_seo_queries(paths: _Paths, rows: list[dict]) -> None:
 def _write_visits(paths: _Paths, rows: list[dict]) -> None:
     paths.canonical.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_parquet(paths.canonical / "visits.parquet")
+
+
+def _write_site_pages(paths: _Paths, rows: list[dict]) -> None:
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(paths.canonical / "site_pages.parquet")
+
+
+def _write_link_graph(paths: _Paths, rows: list[dict]) -> None:
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(paths.canonical / "site_link_graph.parquet")
+
+
+def _write_crux_raw(paths: _Paths, data: dict) -> None:
+    out_dir = paths.raw / "crux"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "crux.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def _write_input_yaml(paths: _Paths, name: str, data: dict) -> None:
+    paths.inputs.mkdir(parents=True, exist_ok=True)
+    (paths.inputs / f"{name}.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
 
 
 def _write_degradation(paths: _Paths, checks: list[dict]) -> None:
@@ -83,7 +105,20 @@ def _base_visit(**overrides) -> dict:
     return row
 
 
+def _base_site_page(**overrides) -> dict:
+    row = {
+        "url": "https://example.com/page", "http_status": 200, "redirect_chain": "[]",
+        "final_url": "https://example.com/page", "canonical_url": "https://example.com/page",
+        "robots_directive": "", "in_sitemap": True, "title": "Заголовок",
+        "description": "Описание", "h1": "H1", "crawled_at": "2026-07-20T00:00:00Z",
+        "js_content_diff": None,
+    }
+    row.update(overrides)
+    return row
+
+
 ALL_S01_10 = {f"S{i:02d}" for i in range(1, 11)}
+ALL_S11_20 = {f"S{i:02d}" for i in range(11, 21)}
 
 
 # ── S01 — брендовый/небрендовый органический трафик смешан ─────────────────
@@ -322,6 +357,271 @@ def test_s10_runs_without_visits_and_reports_unavailable_context(tmp_path):
     summary = next(r for r in rows if r["finding"] == "summary")
     assert summary["visits_available"] is False
     assert summary["wrong_page_ranking_candidates"] == 0
+
+
+# ── S11 — важные страницы закрыты robots/noindex ────────────────────────────
+def test_s11_flags_robots_blocked_important_page(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [
+        _base_site_page(url="https://example.com/promo", robots_directive="noindex",
+                         in_sitemap=True),
+    ])
+    _write_seo_queries(paths, [_base_seo_row(page="/promo", total_shows=30, total_clicks=1)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S11"})
+
+    assert "s11" in artifacts
+    rows = _read_metric(paths, "s11")
+    candidate = next(r for r in rows if r["finding"] == "robots_blocks_important_page")
+    assert candidate["page"] == "https://example.com/promo"
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["candidate_count"] == 1
+    assert summary["crawled_url_count"] == 1
+    assert "экстраполир" in summary["crawl_coverage_caveat"].lower()
+
+
+def test_s11_unavailable_without_site_pages(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [_base_seo_row(total_shows=30)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S11"})
+
+    assert "s11" in artifacts
+    rows = _read_metric(paths, "s11")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── S12 — canonical указывает на неверную страницу ──────────────────────────
+def test_s12_flags_canonical_pointing_elsewhere(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [
+        _base_site_page(url="https://example.com/dup", canonical_url="https://example.com/main"),
+    ])
+    _write_seo_queries(paths, [_base_seo_row(page="/dup", total_shows=25, total_clicks=2)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S12"})
+
+    assert "s12" in artifacts
+    rows = _read_metric(paths, "s12")
+    candidate = next(r for r in rows if r["finding"] == "canonical_points_elsewhere")
+    assert candidate["page"] == "https://example.com/dup"
+    assert candidate["total_shows"] == 25
+
+
+# ── S13 — sitemap неполный/устаревший/с ошибочными URL ──────────────────────
+def test_s13_flags_missing_from_sitemap_and_broken_in_sitemap(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [
+        _base_site_page(url="https://example.com/a", in_sitemap=False),
+        _base_site_page(url="https://example.com/b", in_sitemap=True, http_status=404),
+    ])
+    _write_seo_queries(paths, [_base_seo_row(page="/a", total_shows=25, total_clicks=1)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S13"})
+
+    assert "s13" in artifacts
+    rows = _read_metric(paths, "s13")
+    missing = next(r for r in rows if r["finding"] == "traffic_page_missing_from_sitemap")
+    assert missing["page"] == "https://example.com/a"
+    broken = next(r for r in rows if r["finding"] == "sitemap_contains_broken_url")
+    assert broken["page"] == "https://example.com/b"
+
+
+# ── S14 — органический трафик ведёт на 404/удалённые страницы ─────────────
+def test_s14_flags_organic_traffic_to_broken_page(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [_base_site_page(url="https://example.com/gone", http_status=404)])
+    _write_seo_queries(paths, [_base_seo_row(page="/gone", total_shows=10, total_clicks=3)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S14"})
+
+    assert "s14" in artifacts
+    rows = _read_metric(paths, "s14")
+    candidate = next(r for r in rows if r["finding"] == "organic_traffic_to_broken_page")
+    assert candidate["http_status"] == 404
+
+
+# ── S15 — цепочки и массовые редиректы размывают сигнал ─────────────────────
+def test_s15_flags_excessive_redirect_chain(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [
+        _base_site_page(
+            url="https://example.com/old",
+            redirect_chain=json.dumps(["https://example.com/mid1", "https://example.com/mid2"]),
+            final_url="https://example.com/new",
+        ),
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S15"})
+
+    assert "s15" in artifacts
+    rows = _read_metric(paths, "s15")
+    candidate = next(r for r in rows if r["finding"] == "redirect_chain")
+    assert candidate["redirect_hops"] == 2
+    assert candidate["excessive_redirect_chain"] is True
+
+
+# ── S16 — индекс раздут дублями/параметрами/тонкими страницами ─────────────
+def test_s16_flags_duplicate_cluster(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [
+        _base_site_page(url="https://example.com/product", canonical_url="https://example.com/product"),
+        _base_site_page(url="https://example.com/product-copy1", canonical_url="https://example.com/product"),
+        _base_site_page(url="https://example.com/product-copy2", canonical_url="https://example.com/product"),
+    ])
+    _write_seo_queries(paths, [_base_seo_row(page="/product", total_shows=5, total_clicks=1)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S16"})
+
+    assert "s16" in artifacts
+    rows = _read_metric(paths, "s16")
+    cluster = next(r for r in rows if r["finding"] == "duplicate_cluster")
+    assert cluster["canonical_target"] == "/product"
+    assert cluster["duplicate_source_count"] == 2
+
+
+# ── S17 — title/description/H1 отсутствуют/дублируются ─────────────────────
+def test_s17_flags_missing_metadata_and_duplicate_title(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [
+        _base_site_page(url="https://example.com/a", title="", description="", h1=""),
+        _base_site_page(url="https://example.com/b", title="Одинаковый заголовок"),
+        _base_site_page(url="https://example.com/c", title="Одинаковый заголовок"),
+    ])
+    _write_seo_queries(paths, [
+        _base_seo_row(page="/a", total_shows=25, total_clicks=1),
+        _base_seo_row(page="/b", total_shows=25, total_clicks=1),
+        _base_seo_row(page="/c", total_shows=25, total_clicks=1),
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S17"})
+
+    assert "s17" in artifacts
+    rows = _read_metric(paths, "s17")
+    missing = next(r for r in rows if r["finding"] == "missing_metadata")
+    assert missing["page"] == "https://example.com/a"
+    assert set(missing["missing_fields"]) == {"title", "description", "h1"}
+    duplicate = next(r for r in rows if r["finding"] == "duplicate_title")
+    assert set(duplicate["pages"]) == {"/b", "/c"}
+
+
+# ── S18 — важные страницы имеют мало внутренних ссылок/сироты ──────────────
+def test_s18_flags_orphan_and_low_inlink_pages(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [
+        _base_site_page(url="https://example.com/orphan"),
+        _base_site_page(url="https://example.com/weak"),
+        _base_site_page(url="https://example.com/strong"),
+    ])
+    _write_link_graph(paths, [
+        {"from_url": "https://example.com/", "to_url": "https://example.com/weak", "depth_from_home": 1},
+        {"from_url": "https://example.com/", "to_url": "https://example.com/strong", "depth_from_home": 1},
+        {"from_url": "https://example.com/other", "to_url": "https://example.com/strong", "depth_from_home": 2},
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S18"})
+
+    assert "s18" in artifacts
+    rows = _read_metric(paths, "s18")
+    orphan = next(r for r in rows if r.get("page") == "/orphan")
+    assert orphan["finding"] == "orphan_page"
+    weak = next(r for r in rows if r.get("page") == "/weak")
+    assert weak["finding"] == "low_inlink_page"
+    assert not any(r.get("page") == "/strong" for r in rows if r["finding"] != "summary")
+
+
+def test_s18_unavailable_without_link_graph(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [_base_site_page()])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S18"})
+
+    assert "s18" in artifacts
+    rows = _read_metric(paths, "s18")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── S19 — архитектура требует слишком много кликов до коммерции ────────────
+def test_s19_flags_pages_beyond_depth_threshold(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [_base_site_page(url="https://example.com/deep")])
+    _write_link_graph(paths, [
+        {"from_url": "https://example.com/p1", "to_url": "https://example.com/p2", "depth_from_home": 1},
+        {"from_url": "https://example.com/p2", "to_url": "https://example.com/p3", "depth_from_home": 2},
+        {"from_url": "https://example.com/p3", "to_url": "https://example.com/p4", "depth_from_home": 3},
+        {"from_url": "https://example.com/p4", "to_url": "https://example.com/deep", "depth_from_home": 4},
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S19"})
+
+    assert "s19" in artifacts
+    rows = _read_metric(paths, "s19")
+    deep = next(r for r in rows if r.get("finding") == "page_too_deep")
+    assert deep["page"] == "/deep"
+    assert deep["depth_from_home"] == 4
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["commercial_classification_available"] is False
+
+
+# ── S20 — мобильная производительность и CWV ────────────────────────────────
+def test_s20_crux_field_data_present(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_crux_raw(paths, {
+        "cwv_field_data_available": True,
+        "records": [{
+            "target_type": "origin", "target": "https://example.com",
+            "field_data_available": True,
+            "p75": {"largest_contentful_paint": 5000},
+        }],
+    })
+    _write_seo_queries(paths, [
+        _base_seo_row(device="mobile", total_shows=40, total_clicks=2, avg_show_position=8.0),
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S20"})
+
+    assert "s20" in artifacts
+    rows = _read_metric(paths, "s20")
+    field_row = next(r for r in rows if r["finding"] == "field_cwv")
+    assert field_row["largest_contentful_paint_rating"] == "poor"
+    assert field_row["confidence"] == "MED"
+
+
+def test_s20_crux_empty_falls_back_to_manual_lab_med(tmp_path):
+    """CrUX отсутствует -> ручной лабораторный замер, confidence MED (задача 5bB, промт)."""
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [_base_seo_row(device="mobile", total_shows=40, total_clicks=2)])
+    _write_input_yaml(paths, "manual_cwv", {
+        "meta": {"tested_at": "2026-07-20", "device": "mobile"},
+        "patterns": [{"url": "/", "lcp_ms": 6000, "cls": 0.3, "inp_ms": 100}],
+    })
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S20"})
+
+    assert "s20" in artifacts
+    rows = _read_metric(paths, "s20")
+    manual_row = next(r for r in rows if r["finding"] == "manual_lab_cwv")
+    assert manual_row["device"] == "mobile"
+    assert manual_row["lcp_rating"] == "poor"
+    assert manual_row["confidence"] == "MED"
+
+
+def test_s20_neither_source_available_is_low_confidence(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [_base_seo_row(device="mobile", total_shows=40, total_clicks=2)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S20"})
+
+    assert "s20" in artifacts
+    rows = _read_metric(paths, "s20")
+    unavailable = next(r for r in rows if r["finding"] == "cwv_unavailable")
+    assert unavailable["confidence"] == "LOW"
+
+
+def test_run_ignores_s11_20_when_sources_missing(tmp_path):
+    paths = _Paths(tmp_path)
+    artifacts = block4_seo.run(paths, DEFAULTS, ALL_S11_20)
+    assert artifacts == []
 
 
 # ── Диспетчер: confidence_cap из degradation_report ─────────────────────────
