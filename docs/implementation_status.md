@@ -1309,3 +1309,56 @@ check_id только из known_check_ids) — сам вызов API не по�
 `pytest tests/test_analyze_draft_findings.py tests/test_money_frame.py
 tests/test_compute_common.py tests/test_degradation.py
 tests/test_methodology_goals_requires.py` — **67 passed**, 0 failed.
+
+---
+
+**6B** DONE — 2026-07-29. Подключён сам вызов модели в `src/analyze/
+draft_findings.py` (единственное место в пайплайне, где это разрешено —
+принцип 3 CLAUDE.md); `schemas.py` не менялся. `_call_llm()` — один
+структурированный вызов (`output_config.format` c JSON Schema
+`_findings_response_schema()`/`_finding_item_schema()`, зеркалящей поля
+`Finding`; `enum` на `status`/`confidence`/`money_category` намеренно не
+задан в самой схеме — смысловую проверку значений всё равно делает
+`schemas.validate_finding`) с предсказуемым бюджетом `LLM_MAX_TOKENS=8000` и
+`timeout=180s`/`max_retries=2` на транспортном уровне SDK (сеть/429/5xx) —
+без повторной генерации после того, как получен валидный (парсящийся) ответ:
+дальнейшая фильтрация находок целиком локальная. Модель — `DEFAULT_LLM_MODEL
+="claude-opus-4-8"`, переопределяется через project env `ANALYZE_LLM_MODEL`;
+ключ — через `anthropic.Anthropic()` по умолчанию (`ANTHROPIC_API_KEY`/
+`ANTHROPIC_AUTH_TOKEN` из process env), явно НЕ из `clients/<name>/.env`
+(принцип 6 — секреты клиента относятся к источникам данных, не к самому
+пайплайну). `client` — необязательный keyword-параметр `_call_llm()`/
+`draft()` для подмены в тестах.
+
+`draft()`: всегда сначала пишет аудиторский артефакт `_analyze_input_pack.json`
+(то же тело, что уходит модели), затем зовёт `_call_llm()` один раз, режет
+ответ до `schemas.MAX_FINDINGS_PER_RUN` (лишние из ответа модели отбрасываются
+без повторного вызова), для каждой находки собирает `schemas.Finding` через
+`_finding_from_dict()` (только известные поля dataclass; форма не совпала ->
+`None`, находка молча пропускается — глубокая проверка evidence снаружи
+scope, задача 6C), прогоняет `schemas.validate_finding()` (regsitry
+check_id + `confidence_cap` конкретного check_id из
+`degradation_report.json`) и пишет прошедшие как
+`findings/draft/F-<блок>-<nn>.yaml` — блок = первая буква `check_id`
+(D/A/T/C/S), `nn` — сквозной счётчик внутри блока за этот прогон
+(`_finding_filenames()`), YAML в порядке карточки каталога v2
+(`schemas.finding_to_ordered_dict`). `requirements.txt`: добавлен
+`anthropic>=0.69` (пакет отсутствовал в окружении).
+
+Тесты: `tests/test_analyze_draft_findings.py` — сценарий "ровно один
+артефакт" обновлён под мок-клиент (`_MockClient`) с пустым `findings: []` —
+явно заданное ломающее изменение контракта `draft()` (теперь она зовёт
+модель). Новый файл `tests/test_analyze_draft_findings_llm.py` (10 тестов,
+мок API, сеть не трогаем): форма запроса `_call_llm` (model/max_tokens/
+system/messages/output_config.format) и разбор ответа; `_resolve_llm_model`
+— дефолт и переопределение через `ANALYZE_LLM_MODEL`; валидные находки из
+разных блоков пишутся как `F-D-01.yaml`/`F-A-01.yaml`; несколько находок
+одного блока нумеруются подряд (`F-A-01`, `F-A-02`); невалидная находка
+(`significant=false`) отбрасывается без повторного `messages.create` (ровно
+1 вызов); находки сверх `MAX_FINDINGS_PER_RUN` обрезаются, вызов модели
+по-прежнему один. `pytest tests/test_analyze_draft_findings.py
+tests/test_analyze_draft_findings_llm.py tests/test_money_frame.py
+tests/test_compute_common.py tests/test_degradation.py
+tests/test_methodology_goals_requires.py` — **74 passed**, 0 failed
+(венв `.venv`; `anthropic` в тестах не импортируется — везде передан мок
+`client`).

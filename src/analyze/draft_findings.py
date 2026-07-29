@@ -19,23 +19,45 @@
       * degradation_report.checks[*].type_effective — тип находки (A|B|Q) уже
         после пост-хок понижения; analyze берёт его как есть, не «повышает».
 
-Задача 6A — детерминированная оболочка БЕЗ вызова API Anthropic:
+Задача 6A дала детерминированную оболочку (без вызова API Anthropic):
     build_input_pack()   — собирает всё, что модель получит на вход: метрики,
                             качественные inputs, деградацию (оба потолка
                             уверенности), контекст клиента, реестр check_id.
     build_system_prompt() — текст системного промта с запретами модели (см.
                             docstring функции).
-    draft()               — на этом этапе только собирает и валидирует пакет,
-                            пишет его как аудиторский артефакт в findings/draft/
-                            (НЕ находка — сама генерация находок LLM подключается
-                            отдельной задачей, когда появится вызов API).
+
+Задача 6B подключает сам вызов модели (единственное место в пайплайне,
+где это разрешено — принцип 3 CLAUDE.md):
+    _call_llm()           — один структурированный вызов (output_config.format)
+                            поверх input_pack; предсказуемый токен-бюджет
+                            (LLM_MAX_TOKENS), без повторной генерации после
+                            валидного ответа (ретраи — только транспортные,
+                            через timeout/max_retries самого SDK).
+    draft()               — собирает пакет, пишет его как аудиторский артефакт
+                            (INPUT_PACK_ARTIFACT_NAME), вызывает модель и
+                            записывает прошедшие schemas.validate_finding
+                            находки как findings/draft/F-<блок>-<nn>.yaml
+                            (не больше schemas.MAX_FINDINGS_PER_RUN).
+
+    Модель и ключ API берутся из project env (anthropic.Anthropic() по
+    умолчанию читает ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN из process env),
+    а НЕ из clients/<name>/.env — секреты клиента (принцип 6 CLAUDE.md)
+    относятся к источникам данных, а не к самому пайплайну.
+
+    Глубокая программная проверка evidence находок (что цифры в evidence
+    реально соответствуют metrics/degradation) — отдельная задача 6C; здесь
+    только структурная валидация схемы (schemas.validate_finding).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import os
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from ..pipeline import orchestrator as orchestrator_mod
 from . import schemas
@@ -73,8 +95,6 @@ def _load_metrics(paths: Any) -> dict[str, Any]:
 
 def _load_inputs(paths: Any) -> dict[str, Any]:
     """Прочитать все inputs/*.yaml клиента как {имя_файла_без_расширения: данные}."""
-    import yaml
-
     inputs_dir = Path(paths.inputs)
     result: dict[str, Any] = {}
     if not inputs_dir.exists():
@@ -236,25 +256,198 @@ def build_system_prompt(defaults: dict[str, Any] | None = None) -> str:
     )
 
 
+# ── Вызов модели (задача 6B; единственное место в пайплайне — принцип 3) ────
+# Модель и ключ — из project env (anthropic.Anthropic() по умолчанию читает
+# ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN из process env), НЕ из
+# clients/<name>/.env — см. докстринг модуля.
+LLM_MODEL_ENV_VAR = "ANALYZE_LLM_MODEL"
+DEFAULT_LLM_MODEL = "claude-opus-4-8"
+LLM_MAX_TOKENS = 8000          # предсказуемый бюджет одного структурированного вызова
+LLM_TIMEOUT_SECONDS = 180.0
+LLM_MAX_RETRIES = 2            # ретраи транспортного уровня SDK (сеть/429/5xx)
+
+_FINDING_FIELD_NAMES = frozenset(f.name for f in dataclasses.fields(schemas.Finding))
+
+
+def _resolve_llm_model() -> str:
+    return os.environ.get(LLM_MODEL_ENV_VAR) or DEFAULT_LLM_MODEL
+
+
+def _finding_item_schema() -> dict[str, Any]:
+    """JSON Schema одной находки для output_config.format.
+
+    Форма зеркалит schemas.Finding. Допустимые значения status/confidence/
+    money_category намеренно не заданы через enum здесь — их проверяет
+    schemas.validate_finding после разбора ответа (structured outputs плохо
+    сочетают nullable-поля с enum; смысловая проверка и так нужна отдельно).
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "check_id": {"type": "string"},
+            "name": {"type": "string"},
+            "status": {"type": "string"},
+            "confidence": {"type": "string"},
+            "significant": {"type": "boolean"},
+            "period": {"type": "string"},
+            "segment": {"type": ["string", "null"]},
+            "data_source": {"type": "string"},
+            "evidence": {"type": "string"},
+            "control_metric": {"type": ["string", "null"]},
+            "what_is_distorted": {"type": "string"},
+            "money_category": {"type": ["string", "null"]},
+            "money_amount_rub": {"type": ["number", "null"]},
+            "money_not_assessable": {"type": "boolean"},
+            "assumptions": {"type": "array", "items": {"type": "string"}},
+            "recommended_action": {"type": "string"},
+            "how_to_measure": {"type": "string"},
+            "what_cannot_be_concluded": {"type": "string"},
+            "source_check_ids": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": [
+            "check_id", "name", "status", "confidence", "significant", "period",
+            "data_source", "evidence", "what_is_distorted", "money_not_assessable",
+            "assumptions", "recommended_action", "how_to_measure",
+            "what_cannot_be_concluded", "source_check_ids",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _findings_response_schema() -> dict[str, Any]:
+    """Схема ответа целиком: {"findings": [...]} — один структурированный вызов."""
+    return {
+        "type": "object",
+        "properties": {"findings": {"type": "array", "items": _finding_item_schema()}},
+        "required": ["findings"],
+        "additionalProperties": False,
+    }
+
+
+def _call_llm(
+    system_prompt: str, input_pack: dict[str, Any], *, client: Any = None
+) -> dict[str, Any]:
+    """Один структурированный вызов модели поверх input_pack. Возвращает {"findings": [...]}.
+
+    Ретраи (``timeout``/``max_retries``) — только на транспортном уровне SDK
+    (сетевые сбои, 429, 5xx). Если модель уже вернула валидный (парсящийся)
+    ответ, повторный вызов не делается — дальнейшая фильтрация находок
+    происходит локально в draft().
+
+    ``client`` — точка подмены для тестов (см. tests/test_analyze*.py); по
+    умолчанию создаётся anthropic.Anthropic() (ключ/модель — из project env,
+    см. докстринг модуля).
+    """
+    if client is None:
+        import anthropic
+
+        client = anthropic.Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=LLM_MAX_RETRIES)
+
+    response = client.messages.create(
+        model=_resolve_llm_model(),
+        max_tokens=LLM_MAX_TOKENS,
+        system=system_prompt,
+        messages=[{
+            "role": "user",
+            "content": (
+                "Входной пакет (metrics/inputs/degradation/контекст клиента) в "
+                "формате JSON:\n\n" + json.dumps(input_pack, ensure_ascii=False)
+            ),
+        }],
+        output_config={"format": {"type": "json_schema", "schema": _findings_response_schema()}},
+    )
+
+    text = next(block.text for block in response.content if getattr(block, "type", None) == "text")
+    return json.loads(text)
+
+
+def _finding_from_dict(item: Any) -> schemas.Finding | None:
+    """Собрать Finding из одного элемента ответа модели; некорректная форма -> None.
+
+    Только структурная сборка (нужные ключи, dataclass принял значения) —
+    смысловую проверку полей делает schemas.validate_finding в draft().
+    """
+    if not isinstance(item, dict):
+        return None
+    kwargs = {k: v for k, v in item.items() if k in _FINDING_FIELD_NAMES}
+    try:
+        return schemas.Finding(**kwargs)
+    except TypeError:
+        return None
+
+
+def _finding_filenames(findings: list[schemas.Finding]) -> list[str]:
+    """F-<блок>-<nn>.yaml — nn последовательный внутри блока для этого прогона."""
+    counters: dict[str, int] = {}
+    names: list[str] = []
+    for finding in findings:
+        block = (finding.check_id[:1] if finding.check_id else "X").upper()
+        counters[block] = counters.get(block, 0) + 1
+        names.append(f"F-{block}-{counters[block]:02d}.yaml")
+    return names
+
+
 # ── Точка входа слоя (контракт: см. докстринг модуля) ──────────────────────
-def draft(paths: Any, config: dict[str, Any], methodology: dict[str, Any]) -> list[str]:
-    """Собрать и провалидировать входной пакет для модели; API пока не вызывается.
+def draft(
+    paths: Any,
+    config: dict[str, Any],
+    methodology: dict[str, Any],
+    *,
+    client: Any = None,
+) -> list[str]:
+    """Собрать входной пакет, вызвать модель и записать находки в findings/draft/.
 
-    Задача 6A — только детерминированная оболочка: собрать input pack, построить
-    системный промт, записать их как аудиторский артефакт в findings/draft/ (имя
-    начинается с "_", чтобы не перепутать с настоящей находкой — находки-карточки
-    появятся отдельной задачей вместе с подключением вызова модели).
+    Всегда пишет аудиторский артефакт (INPUT_PACK_ARTIFACT_NAME, имя начинается
+    с "_", чтобы не перепутать с находкой) — то же тело запроса, что ушло
+    модели, для сверки/отладки. Затем вызывает модель один раз (см. _call_llm)
+    и записывает прошедшие schemas.validate_finding находки как
+    findings/draft/F-<блок>-<nn>.yaml (не больше schemas.MAX_FINDINGS_PER_RUN;
+    лишние в ответе модели отбрасываются, а не докидываются в отчёт).
 
-    Возвращает список записанных имён файлов (сейчас — ровно один аудиторский
-    артефакт, не находка).
+    ``client`` — точка подмены для тестов, см. _call_llm.
+
+    Возвращает список записанных имён файлов: аудиторский артефакт + карточки
+    прошедших валидацию находок. Глубокая проверка evidence — задача 6C.
     """
     paths.findings_draft.mkdir(parents=True, exist_ok=True)
     defaults = orchestrator_mod.load_defaults()
 
     pack = build_input_pack(paths, config, methodology, defaults)
-    pack["system_prompt"] = build_system_prompt(defaults)
+    system_prompt = build_system_prompt(defaults)
 
     out_path = Path(paths.findings_draft) / INPUT_PACK_ARTIFACT_NAME
-    out_path.write_text(json.dumps(pack, ensure_ascii=False, indent=2), encoding="utf-8")
+    out_path.write_text(
+        json.dumps({**pack, "system_prompt": system_prompt}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    written = [out_path.name]
 
-    return [out_path.name]
+    response_data = _call_llm(system_prompt, pack, client=client)
+    raw_findings = (response_data.get("findings") or [])[: schemas.MAX_FINDINGS_PER_RUN]
+
+    known_ids = schemas.known_check_ids(methodology)
+    confidence_caps = _confidence_caps(_load_degradation_report(paths))
+
+    valid_findings: list[schemas.Finding] = []
+    for item in raw_findings:
+        finding = _finding_from_dict(item)
+        if finding is None:
+            continue
+        cap = confidence_caps.get(finding.check_id)
+        if schemas.validate_finding(finding, known_ids=known_ids, confidence_cap=cap):
+            continue
+        valid_findings.append(finding)
+
+    for finding, filename in zip(valid_findings, _finding_filenames(valid_findings)):
+        finding_path = Path(paths.findings_draft) / filename
+        finding_path.write_text(
+            yaml.safe_dump(
+                schemas.finding_to_ordered_dict(finding),
+                allow_unicode=True,
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        written.append(filename)
+
+    return written

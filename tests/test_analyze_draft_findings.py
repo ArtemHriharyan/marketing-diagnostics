@@ -1,12 +1,15 @@
 """Тесты слоя analyze (задача 6A): src/analyze/draft_findings.py + schemas.py.
 
-Задача — детерминированная оболочка БЕЗ вызова API Anthropic. Сценарии:
+Сценарии для детерминированной части (задача 6A):
 
 1. build_input_pack: собирает metrics/inputs/degradation/client_context/
    known_check_ids/confidence_ceilings/money_categories.
-2. Input pack целиком JSON-сериализуем (это будущее тело запроса к API).
-3. draft(): пишет ровно один аудиторский артефакт в findings/draft/
-   (не находку), возвращает его имя; содержимое парсится обратно.
+2. Input pack целиком JSON-сериализуем (это тело запроса к API).
+3. draft(): при пустом ответе модели пишет ровно один аудиторский артефакт
+   в findings/draft/ (не находку), возвращает его имя; содержимое парсится
+   обратно. Вызов API подменён мок-клиентом (_MockClient) — задача 6B
+   подключает реальный вызов, см. tests/test_analyze_draft_findings_llm.py
+   для сценариев с находками.
 4. build_system_prompt: содержит все обязательные запреты текстом.
 5. schemas.Finding/validate_finding: валидная находка не даёт нарушений;
    каждое нарушение (significant=false, confidence > cap, money_category
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sys
+import types
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -146,13 +150,31 @@ def test_input_pack_round_trips_through_json(tmp_path):
     assert restored == pack
 
 
-# ── 3. draft(): аудиторский артефакт, не находка ────────────────────────────
+# ── 3. draft(): аудиторский артефакт всегда пишется первым ─────────────────
+# Задача 6B подключила вызов модели (см. tests/test_analyze_draft_findings_llm.py
+# для сценариев с находками) — здесь только проверяем, что при пустом ответе
+# модели (findings: []) draft() по-прежнему пишет ровно аудиторский артефакт,
+# а не «находку». Реальный вызов API подменяется мок-клиентом.
+
+class _MockMessages:
+    def __init__(self, findings_payload):
+        self._payload = findings_payload
+
+    def create(self, **kwargs):
+        text = json.dumps({"findings": self._payload}, ensure_ascii=False)
+        return types.SimpleNamespace(content=[types.SimpleNamespace(type="text", text=text)])
+
+
+class _MockClient:
+    def __init__(self, findings_payload):
+        self.messages = _MockMessages(findings_payload)
+
 
 def test_draft_writes_single_audit_artifact_not_a_finding(tmp_path):
     paths = _Paths(tmp_path)
     _write_degradation(paths, [{"check_id": "D01", "runnable": True, "confidence_cap": "HIGH"}])
 
-    names = draft_findings.draft(paths, CONFIG, METHODOLOGY)
+    names = draft_findings.draft(paths, CONFIG, METHODOLOGY, client=_MockClient([]))
 
     assert names == [draft_findings.INPUT_PACK_ARTIFACT_NAME]
     written = list(paths.findings_draft.glob("*"))

@@ -11,6 +11,7 @@ python-dotenv>=1.0
 requests>=2.31
 playwright>=1.40       # headless JS-рендеринг для js_content_diff; после pip install: playwright install chromium
 tapi-yandex-metrika>=2022.4.8   # клиент Logs API / Reports API Метрики (или свой)
+anthropic>=0.69         # LLM-вызов слоя analyze (src/analyze/draft_findings.py); ключ — из project env
 
 # Stats
 scipy>=1.11
