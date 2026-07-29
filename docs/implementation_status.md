@@ -1260,3 +1260,52 @@ Python без `scipy`/`duckdb` не годится для этого модул�
    Pognali-прогоне частично: A01/A02/A03 (`campaign_strategies` не в
    манифесте) — skipped с явной причиной, остальные A-проверки (costs+visits
    есть) — ok.
+
+---
+
+**6A** DONE — 2026-07-29. Детерминированная оболочка слоя analyze, без вызова
+API Anthropic. `src/analyze/schemas.py` (новый файл) — типизированная
+карточка находки `Finding` (поля по единой карточке каталога v2 §12),
+`validate_finding`/`validate_findings_batch` (структурные проверки, ничего не
+бросают — возвращают список нарушений): формат/регистрация check_id (новый
+реестр D/A/T/C/S против `known_check_ids(methodology)`), `significant=false`
+запрещено, confidence не выше `confidence_cap` (кроме `client-HIGH`, который
+потолку источника не подчиняется), `money_category` — ровно одна из 4
+категорий каталога v2 (правило 15, заданы отдельно от
+`src.compute.money_frame.MONEY_CATEGORIES` по тому же первоисточнику — не
+импортируются, чтобы не тянуть duckdb-зависимости compute в лёгкий
+schemas.py), `money_category`+`money_not_assessable` одновременно и
+`money_amount_rub` без категории — обе комбинации запрещены,
+`MAX_FINDINGS_PER_RUN=12` — лимит на пакет.
+
+`src/analyze/draft_findings.py`: `build_input_pack()` собирает всё, что уйдёт
+модели, — `data/metrics/*.json` (кроме `degradation_report`/`metrics_summary`),
+`inputs/*.yaml`, полный `degradation_report` (runnable/skipped/checks/counts),
+контекст клиента (имя/ниша/гео/бренд-термины/окно анализа),
+`known_check_ids`, оба потолка уверенности явно (`confidence_ceilings`:
+`sample_size_rule` — параметры `min_sample_visits`/`significance_alpha` из
+defaults.yaml, уже применённые к полю `confidence` внутри `metrics`, и
+`source_cap_by_check` — per-check `confidence_cap` из degradation) и
+`money_categories`. Пакет — только примитивы/списки/словари, целиком проходит
+`json.dumps`/`json.loads` без потерь (тест round-trip). `build_system_prompt()`
+— текст промта с 8 запретами (числа только из пакета; significant=false;
+п.п. ≠ %; денежные категории не смешивать; максимум 12 находок; без
+обвинений конкретных людей; confidence не выше меньшего из двух потолков;
+check_id только из known_check_ids) — сам вызов API не подключён, это задача
+другой сессии. `draft()` собирает пакет + промт и пишет их одним аудиторским
+артефактом `_analyze_input_pack.json` в `findings/draft/` (имя с `_`, чтобы не
+перепутать с настоящей находкой-карточкой — генерация находок LLM появится
+вместе с подключением вызова модели).
+
+Тесты `tests/test_analyze_draft_findings.py` (новый файл, 17 тестов): сборка
+всех секций пакета, пустые источники не роняют сборку, JSON round-trip,
+`draft()` пишет ровно один артефакт с ожидаемым именем, промт содержит все 8
+запретов текстом, валидная находка без нарушений, каждое нарушение
+(`significant=false`, `confidence` выше `confidence_cap`, `client-HIGH`
+обходит потолок источника, невалидная/смешанная денежная категория, сумма
+без категории, неверный формат/незарегистрированный `check_id`, пустое
+обязательное поле) детектируется отдельно, лимit пакета в 12 находок.
+`pytest tests/test_analyze_draft_findings.py` — **17 passed**. Регрессия:
+`pytest tests/test_analyze_draft_findings.py tests/test_money_frame.py
+tests/test_compute_common.py tests/test_degradation.py
+tests/test_methodology_goals_requires.py` — **67 passed**, 0 failed.
