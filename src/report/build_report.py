@@ -31,6 +31,30 @@ _seo_confidence_cap_summary — report только форматирует го�
 единственный машинный источник). Поэтому сортировка построена на полях,
 которые реально есть на находке: уверенность, затем денежная сумма — см.
 ``_priority_key``.
+
+Задача 7C: план действий + assignee + приложение (footnotes), закрывает
+разрывы, намеренно оставленные 7A. Решения, не заданные явно источниками
+истины (задокументировано, не угадано молча):
+    * ``schemas.Finding`` не несёт поля длительности/трудоёмкости — в каталоге
+      v2 и methodology-v2.md такого поля тоже нет. План «2 недели»/«2 месяца»
+      поэтому строится на уже существующем и согласованном с остальным
+      отчётом порядке приоритета (``_priority_key`` — та же сортировка, что
+      «Три главных разрыва»): первые находки с рекомендацией — в план на
+      2 недели (лимит ``MAX_ACTION_PLAN_2W``), следующие — на 2 месяца
+      (лимит ``MAX_ACTION_PLAN_2M``). Не выдаётся за оценку трудоёмкости —
+      это порядок приоритета, а не срок исполнения по существу.
+    * ``schemas.Finding`` не несёт поля ``assignee`` (его нет ни в одном
+      источнике истины). Карточка YAML может нести необязательный ключ
+      ``assignee`` (аналитик проставляет вручную при утверждении находки);
+      при отсутствии — «уточнить» (см. ``_assignee``), никогда не выдумывается.
+    * Приложение выносит за пределы бюджета ≤10 страниц основного текста:
+      находки уровня LOW (гипотезы — раздел «Ключевые находки» их больше не
+      показывает) и находки сверх ``MAX_REPORT_FINDINGS`` — вместо того, чтобы
+      молча обрезаться пометкой без списка (как было в 7A). Отдельно —
+      подраздел «SEO-ядро — не посчитано»: те же элементы
+      ``degradation.skipped``, что и в «Что не удалось проверить», но
+      отфильтрованные по блоку 4 (S, каталог v2 §9) для быстрой навигации
+      клиента к SEO-разрывам без прочтения всего списка.
 """
 
 from __future__ import annotations
@@ -49,14 +73,22 @@ CONFIG_DIR = REPO_ROOT / "config"
 REPORT_FILENAME = "diagnostic_report.md"
 GLOSSARY_FILENAME = "report_glossary.yaml"
 
-# Бюджет отчёта — не больше 10 страниц. Заголовок, резюме, «что не удалось
-# проверить» и глоссарий занимают ориентировочно 2 страницы фиксированного
-# объёма; на находки (~1 страница на находку) остаётся оставшийся бюджет.
+# Бюджет отчёта — не больше 10 страниц. Заголовок, резюме, план действий,
+# «что не удалось проверить» и глоссарий занимают ориентировочно 2 страницы
+# фиксированного объёма; на находки (~1 страница на находку) остаётся
+# оставшийся бюджет. Находки сверх лимита и уровня LOW уходят в «Приложение»
+# (задача 7C) — в 10-страничный бюджет основного текста не считаются.
 MAX_REPORT_FINDINGS = 8
 
 # Три главных разрыва на первой странице (вердикт) — top-N той же
 # отсортированной последовательности, что и весь раздел находок.
 MAX_VERDICT_GAPS = 3
+
+# План действий (задача 7C) — короткие списки, лимиты по числу пунктов, не
+# по трудоёмкости (см. докстринг модуля). Оба списка идут подряд из одной и
+# той же отсортированной последовательности находок с непустой рекомендацией.
+MAX_ACTION_PLAN_2W = 7
+MAX_ACTION_PLAN_2M = 5
 
 _CONFIDENCE_RANK: dict[str, int] = {
     "HIGH": 0,
@@ -147,6 +179,12 @@ def format_pp(fraction_diff: float, digits: int = 1) -> str:
     return f"{sign}{fraction_diff * 100:.{digits}f} п.п."
 
 
+def _assignee(finding: dict[str, Any]) -> str:
+    """Ответственный за находку; «уточнить», если аналитик не проставил (см. докстринг модуля)."""
+    value = finding.get("assignee")
+    return value.strip() if isinstance(value, str) and value.strip() else "уточнить"
+
+
 def _format_money(finding: dict[str, Any], currency_round: int) -> str | None:
     category = finding.get("money_category")
     not_assessable = bool(finding.get("money_not_assessable"))
@@ -178,8 +216,7 @@ def _build_header(config: dict[str, Any]) -> list[str]:
         lines.append("")
 
     lines.append(
-        "_Черновой рендер (задача 7A): скелет отчёта без приложений-сносок "
-        "и повестки созвона._"
+        "_Черновой рендер: без повестки созвона с клиентом (не входит в эту задачу)._"
     )
     lines.append("")
     return lines
@@ -270,6 +307,41 @@ def _build_summary_section(
     return "\n".join(lines)
 
 
+# ── План действий (задача 7C) ────────────────────────────────────────────
+def _format_action_line(rank: int, finding: dict[str, Any]) -> str:
+    check_id = finding.get("check_id", "")
+    action = finding.get("recommended_action") or ""
+    return f"{rank}. **{check_id}** — {action} _(ответственный: {_assignee(finding)})_"
+
+
+def _build_action_plan_section(findings: list[dict[str, Any]]) -> str:
+    actionable = [f for f in findings if (f.get("recommended_action") or "").strip()]
+    two_week = actionable[:MAX_ACTION_PLAN_2W]
+    two_month = actionable[MAX_ACTION_PLAN_2W:MAX_ACTION_PLAN_2W + MAX_ACTION_PLAN_2M]
+
+    lines = ["## План действий", ""]
+
+    lines.append("### 2 недели")
+    lines.append("")
+    if not two_week:
+        lines.append("Утверждённых находок с рекомендацией нет — план не сформирован.")
+    else:
+        for rank, finding in enumerate(two_week, start=1):
+            lines.append(_format_action_line(rank, finding))
+    lines.append("")
+
+    lines.append("### 2 месяца")
+    lines.append("")
+    if not two_month:
+        lines.append("Дополнительных действий на горизонт 2 месяцев не выявлено.")
+    else:
+        for rank, finding in enumerate(two_month, start=1):
+            lines.append(_format_action_line(rank, finding))
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 def _format_finding_md(finding: dict[str, Any], currency_round: int) -> str:
     check_id, name = finding.get("check_id", ""), finding.get("name", "")
     lines = [f"### {check_id} — {name}", ""]
@@ -279,6 +351,7 @@ def _format_finding_md(finding: dict[str, Any], currency_round: int) -> str:
                         ("segment", "сегмент"), ("period", "период")):
         if finding.get(key):
             meta_parts.append(f"{label}: {finding[key]}")
+    meta_parts.append(f"ответственный: {_assignee(finding)}")
     if meta_parts:
         lines.append("_" + "; ".join(meta_parts) + "_")
         lines.append("")
@@ -315,18 +388,48 @@ def _format_finding_md(finding: dict[str, Any], currency_round: int) -> str:
     return "\n".join(lines)
 
 
-def _build_findings_section(findings: list[dict[str, Any]], currency_round: int) -> str:
+def _is_low_confidence(finding: dict[str, Any]) -> bool:
+    return (finding.get("confidence") or "LOW") == "LOW"
+
+
+def split_findings_for_report(
+    findings: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Разбить отсортированные находки: тело отчёта (≤``MAX_REPORT_FINDINGS``,
+    без LOW) + приложение (LOW-находки и находки сверх лимита, см. докстринг
+    модуля, задача 7C). Порядок сохраняется — обе части остаются частью той
+    же отсортированной по приоритету последовательности.
+    """
+    main_candidates = [f for f in findings if not _is_low_confidence(f)]
+    shown = main_candidates[:MAX_REPORT_FINDINGS]
+    overflow = main_candidates[MAX_REPORT_FINDINGS:]
+    low_findings = [f for f in findings if _is_low_confidence(f)]
+    return shown, overflow + low_findings
+
+
+def _build_findings_section(
+    shown: list[dict[str, Any]],
+    main_candidate_count: int,
+    has_any_approved: bool,
+    currency_round: int,
+) -> str:
     lines = ["## Ключевые находки", ""]
-    if not findings:
-        lines.append("Утверждённых находок нет.")
+    if not shown:
+        if has_any_approved:
+            lines.append(
+                "Находок уровня HIGH/MED/client-HIGH нет — утверждённые находки "
+                "уровня LOW вынесены в приложение (см. «Приложение»)."
+            )
+        else:
+            lines.append("Утверждённых находок нет.")
         lines.append("")
         return "\n".join(lines)
 
-    shown = findings[:MAX_REPORT_FINDINGS]
-    if len(shown) < len(findings):
+    if len(shown) < main_candidate_count:
         lines.append(
-            f"_Показаны {len(shown)} находок из {len(findings)} утверждённых "
-            "(лимит рендера — бюджет отчёта ≤10 страниц)._"
+            f"_Показаны {len(shown)} находок из {main_candidate_count} утверждённых "
+            "уровня HIGH/MED/client-HIGH (лимит рендера — бюджет отчёта ≤10 страниц; "
+            "остальное — в приложении)._"
         )
         lines.append("")
 
@@ -336,7 +439,7 @@ def _build_findings_section(findings: list[dict[str, Any]], currency_round: int)
 
 
 def _build_skipped_section(skipped: list[dict[str, Any]]) -> str:
-    lines = ["## Что не удалось проверить", ""]
+    lines = ["## Что не удалось проверить и почему", ""]
     if not skipped:
         lines.append("Все проверки реестра выполнены при текущих источниках.")
     else:
@@ -344,6 +447,57 @@ def _build_skipped_section(skipped: list[dict[str, Any]]) -> str:
             block_part = f" (блок {item['block']})" if item.get("block") is not None else ""
             lines.append(f"- **{item.get('id', '?')}**{block_part}: {item.get('reason', '')}")
     lines.append("")
+    return "\n".join(lines)
+
+
+# ── Приложение (задача 7C) ───────────────────────────────────────────────
+def _format_appendix_finding_line(finding: dict[str, Any], currency_round: int) -> str:
+    check_id, name = finding.get("check_id", ""), finding.get("name", "")
+    confidence = finding.get("confidence") or "LOW"
+    money_line = _format_money(finding, currency_round) or format_rub(None)
+    action = finding.get("recommended_action") or "рекомендация не задана"
+    return (
+        f"- **{check_id} — {name}** (уверенность: {confidence}; "
+        f"ответственный: {_assignee(finding)}) — {money_line}. "
+        f"Рекомендация: {action}"
+    )
+
+
+def _build_appendix_findings(appendix_findings: list[dict[str, Any]], currency_round: int) -> list[str]:
+    lines = [
+        "### Дополнительные находки (уровень LOW и сверх лимита раздела)", "",
+    ]
+    if not appendix_findings:
+        lines.append("Дополнительных находок нет.")
+    else:
+        for finding in appendix_findings:
+            lines.append(_format_appendix_finding_line(finding, currency_round))
+    lines.append("")
+    return lines
+
+
+def _build_appendix_seo_core(degradation: dict[str, Any]) -> list[str]:
+    lines = ["### SEO-ядро — не посчитано", ""]
+    seo_skipped = [
+        item for item in (degradation.get("skipped") or []) if item.get("block") == _BLOCK_ORDER["S"]
+    ]
+    if not seo_skipped:
+        lines.append("Все проверки блока SEO (S) выполнены при текущих источниках.")
+    else:
+        for item in seo_skipped:
+            lines.append(f"- **{item.get('id', '?')}**: {item.get('reason', '')}")
+    lines.append("")
+    return lines
+
+
+def _build_appendix_section(
+    appendix_findings: list[dict[str, Any]],
+    degradation: dict[str, Any],
+    currency_round: int,
+) -> str:
+    lines = ["## Приложение", ""]
+    lines.extend(_build_appendix_findings(appendix_findings, currency_round))
+    lines.extend(_build_appendix_seo_core(degradation))
     return "\n".join(lines)
 
 
@@ -367,12 +521,19 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> str:
 
     currency_round = int(defaults.get("currency_round") or 0)
 
+    shown_findings, appendix_findings = split_findings_for_report(findings)
+    main_candidate_count = len(findings) - sum(1 for f in findings if _is_low_confidence(f))
+
     lines: list[str] = []
     lines.extend(_build_header(config))
     lines.append(_build_verdict_section(findings, degradation, metrics_summary, currency_round))
     lines.append(_build_summary_section(findings, degradation, metrics_summary))
-    lines.append(_build_findings_section(findings, currency_round))
+    lines.append(_build_action_plan_section(findings))
+    lines.append(
+        _build_findings_section(shown_findings, main_candidate_count, bool(findings), currency_round)
+    )
     lines.append(_build_skipped_section(degradation.get("skipped") or []))
+    lines.append(_build_appendix_section(appendix_findings, degradation, currency_round))
     lines.append(_build_glossary_section(glossary))
 
     report_dir = Path(paths.report)

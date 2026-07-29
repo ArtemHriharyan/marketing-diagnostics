@@ -335,3 +335,194 @@ def test_verdict_seo_med_cap_absent_when_no_seo_data(tmp_path):
     text = Path(out_path).read_text(encoding="utf-8")
 
     assert "Нет выполнимых проверок блока SEO (S) при текущих источниках." in text
+
+
+# ── 10. Задача 7C: план действий (2 недели / 2 месяца) ──────────────────
+
+def test_action_plan_splits_into_2w_and_2m_by_priority_order(tmp_path):
+    paths = _Paths(tmp_path)
+    count = build_report.MAX_ACTION_PLAN_2W + 2  # 9: заполнит 2 недели (7) + 2 месяца (2)
+    for i in range(count):
+        _write_finding(
+            paths, f"F-A-{i:02d}.yaml",
+            check_id="A04", confidence="MED",
+            money_amount_rub=float(count - i),  # первая находка — самая дорогая -> первой по приоритету
+            recommended_action=f"Действие №{i}",
+        )
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "## План действий" in text
+    plan_section = text.split("## План действий")[1].split("## Ключевые находки")[0]
+    two_week = plan_section.split("### 2 недели")[1].split("### 2 месяца")[0]
+    two_month = plan_section.split("### 2 месяца")[1]
+
+    assert "1. **A04** — Действие №0" in two_week
+    assert "7. **A04** — Действие №6" in two_week
+    assert "Действие №7" not in two_week
+    assert "1. **A04** — Действие №7" in two_month
+    assert "2. **A04** — Действие №8" in two_month
+
+
+def test_action_plan_empty_when_no_actionable_findings(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "Утверждённых находок с рекомендацией нет — план не сформирован." in text
+    assert "Дополнительных действий на горизонт 2 месяцев не выявлено." in text
+
+
+# ── 11. Задача 7C: assignee ("уточнить" по умолчанию) ────────────────────
+
+def test_finding_assignee_defaults_to_utochnit(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml")
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "ответственный: уточнить" in text
+
+
+def test_finding_assignee_uses_explicit_value(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml", assignee="Иван Иванов")
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "ответственный: Иван Иванов" in text
+    assert "ответственный: уточнить" not in text
+
+
+# ── 12. Задача 7C: раздел «Что не удалось проверить и почему» ───────────
+
+def test_skipped_section_header_includes_i_pochemu(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml")
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "## Что не удалось проверить и почему" in text
+
+
+# ── 13. Задача 7C: приложение — LOW-находки и переполнение ──────────────
+
+def test_low_finding_excluded_from_main_section_and_listed_in_appendix(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml", check_id="A01", confidence="MED")
+    _write_finding(paths, "F-A-02.yaml", check_id="A02", confidence="LOW",
+                    recommended_action="Проверить гипотезу вручную")
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    main_section = text.split("## Ключевые находки")[1].split("## Что не удалось проверить")[0]
+    appendix_section = text.split("## Приложение")[1]
+
+    assert "A01" in main_section
+    assert "A02" not in main_section
+    assert "A02" in appendix_section
+    assert "уверенность: LOW" in appendix_section
+
+
+def test_all_low_findings_main_section_points_to_appendix(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml", check_id="A01", confidence="LOW")
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    main_section = text.split("## Ключевые находки")[1].split("## Что не удалось проверить")[0]
+    assert (
+        "Находок уровня HIGH/MED/client-HIGH нет — утверждённые находки уровня LOW "
+        "вынесены в приложение" in main_section
+    )
+    assert "A01" in text.split("## Приложение")[1]
+
+
+def test_findings_beyond_limit_are_listed_in_appendix_not_dropped(tmp_path):
+    paths = _Paths(tmp_path)
+    count = build_report.MAX_REPORT_FINDINGS + 2
+    for i in range(count):
+        _write_finding(
+            paths, f"F-A-{i:02d}.yaml",
+            check_id="A04", confidence="MED", money_amount_rub=float(count - i),
+        )
+    _write_degradation(paths)
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    appendix_section = text.split("## Приложение")[1]
+    assert "Дополнительных находок нет." not in appendix_section
+    # Последние две (за пределами лимита) находки должны быть перечислены, не просто посчитаны.
+    assert appendix_section.count("**A04 —") == 2
+
+
+# ── 14. Задача 7C: приложение — SEO-ядро, не посчитанное ────────────────
+
+def test_appendix_seo_core_lists_only_block_s_skips(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml")
+    _write_degradation(paths, skipped=[
+        {"id": "S07", "block": 4, "reason": "нет источника: спрос Wordstat"},
+        {"id": "A01", "block": 1, "reason": "нет источника: campaign_strategies"},
+    ])
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    appendix_section = text.split("## Приложение")[1]
+    seo_core_section = appendix_section.split("### SEO-ядро — не посчитано")[1]
+    assert "**S07**: нет источника: спрос Wordstat" in seo_core_section
+    assert "A01" not in seo_core_section
+
+
+def test_appendix_seo_core_clean_when_no_seo_skips(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-A-01.yaml")
+    _write_degradation(paths, skipped=[])
+    _write_metrics_summary(paths)
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "Все проверки блока SEO (S) выполнены при текущих источниках." in text
+
+
+# ── 15. split_findings_for_report ─────────────────────────────────────────
+
+def test_split_findings_for_report_moves_low_and_overflow_to_appendix():
+    findings = [
+        {"check_id": f"A{i:02d}", "confidence": "MED", "money_amount_rub": float(100 - i)}
+        for i in range(build_report.MAX_REPORT_FINDINGS)
+    ] + [
+        {"check_id": "A99", "confidence": "MED", "money_amount_rub": 1.0},
+        {"check_id": "L01", "confidence": "LOW"},
+    ]
+    shown, appendix = build_report.split_findings_for_report(findings)
+
+    assert len(shown) == build_report.MAX_REPORT_FINDINGS
+    assert all(f["confidence"] != "LOW" for f in shown)
+    assert [f["check_id"] for f in appendix] == ["A99", "L01"]
