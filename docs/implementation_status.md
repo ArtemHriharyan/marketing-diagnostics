@@ -1044,3 +1044,71 @@ corrected), несколько cookie одного client (T07, честный �
 дедупликации), аномальный источник (T09, спайк x6 от медианы), спам-реферал
 и нормальный реферал (T10, позитив/негатив), unavailable без
 `source_group_resolved` (T02). `pytest tests/test_block2.py` — **15 passed**.
+
+---
+
+**5G** DONE — 2026-07-29. Бизнес-логика C01–C12 в `src/compute/block3.py`
+(блок 3 «CRO, сайт и воронка до обращения», первая часть — каталог v2 §8).
+C13–C25 вне скоупа этой задачи, не диспетчеризуются.
+
+Три известных структурных разрыва задокументированы в докстринге модуля, не
+устранены (вне `allowed_files`): (1) `src/extract/crux.py` не даёт канонической
+таблицы (`CANONICAL_TABLES = []`) — `requires: [crux]` (C01/C02) никогда не
+станет `runnable` через автоматическую деградацию, тот же класс разрыва, что
+у 4I-goals-canonical; (2) `src/extract/site_crawl.py: CANONICAL_TABLES =
+["pages"]`, а фактическая каноническая таблица — `site_pages` (SCHEMAS,
+build_canonical.py) — то же для `requires: [site_crawl]` (C03/C08/C11); тесты,
+как в test_block1.py/test_block2.py, конструируют `runnable_ids` явным
+множеством, не полагаясь на реальную деградацию. (3) `inputs/manual_form_tests.
+yaml` не упомянут в requires/optional ни одной проверки C01–C12 в
+config/methodology.yaml, хотя marketing-diagnostics-methodology-v2.md §6 прямо
+называет C03/C08–C11 требующими его — блок читает файл напрямую (тот же приём,
+что T06/T09 в block2.py читают `client_answers.yaml` напрямую, не входя в их
+`requires`).
+
+CrUX (C01/C02) читается напрямую из `data/raw/crux/crux.json` (не canonical —
+у источника нет канонической таблицы), рейтинг по официальным порогам Google
+Core Web Vitals (LCP/CLS/INP/FCP, общеизвестный отраслевой стандарт, не
+изобретён для задачи); при `cwv_field_data_available=false` — фолбэк на
+`inputs/manual_cwv.yaml` с confidence принудительно MED
+(`defaults.crux_min_field_data`); при отсутствии обоих источников — явный
+`unavailable`. C01 явно помечает `device_specific: false` — CrUX-запрос не
+фильтрует по formFactor, p75 агрегирован по всем устройствам, не только
+мобильным (структурное ограничение экстрактора). C02 сравнивает p75 каждого
+проверенного key_url с origin-агрегатом (шаблон = URL, т.к. отдельной схемы
+"тип страницы" в конфиге/canonical нет).
+
+C03/C08/C11 — полностью ручные (каталог Источник=B, methodology v2 §6:
+«не автоматизируются в принципе»), общий хелпер `_run_manual_only_check`
+транспортирует patterns/conclusions `inputs/manual_form_tests.yaml` КАК ЕСТЬ
+(без переклассификации по check_id — единственный источник не несёт разметки
+"это C03 vs C08", реклассификация оставлена analyze/аналитику), гейт —
+`site_pages` в canonical (крawler как инфраструктурная предпосылка, не
+источник самих находок). C04/C05 джойнят `visits.entry_page` (уже нормализован
+transform'ом) с `site_pages.url` через тот же принцип нормализации пути
+(`_url_path`, зеркало `normalize_entry_page`); без `site_pages` — unavailable.
+C05 явно помечает `utm_preservation_verifiable: false` (site_pages хранит
+только `final_url`, не query string на каждом хопе цепочки). C06 — воронка
+open→submit (легаси 1.1) по сегментам device/source_group; каталожная
+трёхступенчатая воронка open→start→submit НЕ реализована — признака "начал
+заполнять форму" нет в `goal_flags()`/`config.goals` (структурный разрыв,
+поле `stage_start_available: false` в артефакте). C07/C09/C12 — автоматические
+визит-уровневые сигналы (общий отвал формы, device-разрез конверсии через
+двухвыборочный z-тест, доля визитов без единого целевого действия по
+`entry_page`) + необязательное обогащение `inputs/webvisor_findings.yaml` КАК
+ЕСТЬ. **C10 — сверка с D01.overtrigger** (`data/metrics/d01.json`, тот же
+прецедент, что A03 в block1.py читает d01/d03): переотработка цели
+`form_submit` уже подтверждена на реальных данных Pognali как системный
+артефакт двойного счёта целей (goal-flags-overtrigger-symmetry-check,
+87.9% визитов-хитов), а не обязательно повторной физической отправкой формы —
+при `confounded_by_goal_overtrigger=true` автоматический сигнал C10 прижимается
+к LOW и не считается самостоятельным подтверждением проблемы.
+
+Тесты `tests/test_block3.py` — обязательные из промта: воронка по сегментам
+(C06, device + source_group), CrUX отсутствует → ручной замер с confidence MED
+(C01), ручной input отсутствует → unavailable (C03), плюс по 1–2 сценария на
+остальные C02/C04/C05/C07/C08/C09/C10/C11/C12 и capping через
+degradation_report. `pytest tests/test_block3.py` — **22 passed**. Регрессия:
+`pytest tests/test_block0.py tests/test_block1.py tests/test_block2.py
+tests/test_block3.py tests/test_compute_common.py tests/test_degradation.py
+tests/test_smoke.py` — **154 passed**, 0 failed.
