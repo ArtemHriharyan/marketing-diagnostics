@@ -1362,3 +1362,68 @@ tests/test_compute_common.py tests/test_degradation.py
 tests/test_methodology_goals_requires.py` — **74 passed**, 0 failed
 (венв `.venv`; `anthropic` в тестах не импортируется — везде передан мок
 `client`).
+
+---
+
+**6C** DONE — 2026-07-29. Новый модуль `src/analyze/validate_findings.py`
+(`schemas.py` не менялся) — глубокая программная проверка evidence поверх
+структурной `schemas.validate_finding`, чтобы не пропускать галлюцинации
+LLM. `validate_finding_evidence(finding, *, metrics, inputs=None,
+degradation_report=None)` возвращает список причин отказа (пустой список —
+находка подтверждена), ничего сама не пишет:
+
+- **source_file** — `data/metrics/<check_id в нижнем регистре>.json`
+  (соглашение об имени то же, что у `common.write_metric_artifact` в
+  `src/compute/block*.py`); отсутствие файла в пакете `metrics` -> отказ.
+- **evidence/money_amount_rub** — каждое число, извлечённое из свободного
+  текста (`extract_numbers()`: тысячи через пробел/неразрывный пробел,
+  десятичные через `.`/`,`), обязано находиться среди числовых значений
+  source_file (допуск на округление до рубля — `_ABS_TOL`/`_REL_TOL`; для
+  чисел в диапазоне доли/процента добавлены эквиваленты ×100/÷100, диапазон
+  ограничен намеренно, иначе ×100 денежной суммы даёт ложные совпадения).
+  Не найдено -> отказ с текстом числа.
+- **confidence <= compute-уровень** — третий потолок поверх
+  `confidence_cap` источника (который уже проверяет `schemas.
+  validate_finding`): confidence находки не выше наивысшего `confidence`
+  среди строк source_file для этого check_id
+  (`compute_confidence_for_check`); `client-HIGH` этот потолок обходит (как
+  и потолок источника — факт не из compute).
+- **assumptions** — числа в каждом элементе списка обязаны подтверждаться
+  где-то во всём входном пакете (`metrics ∪ inputs ∪ degradation_report`,
+  не только в source_file конкретной проверки — assumptions часто
+  опираются на анкету клиента/соседние проверки).
+
+`draft_findings.draft()` (`src/analyze/draft_findings.py`) подключил обе
+проверки: для каждого элемента ответа модели сначала `schemas.
+validate_finding`, затем `validate_findings_mod.validate_finding_evidence`;
+объединённые причины при непустом списке -> находка идёт не в
+`findings/draft/`, а в **`findings/draft/rejected/R-<nn>.yaml`**
+(`{"reasons": [...], "finding": <исходный элемент ответа модели>}`) — это
+ломающее изменение контракта `draft()` по сравнению с 6B (там невалидные
+находки молча отбрасывались, не записываясь никуда). Ответы, не собравшиеся
+в `schemas.Finding` (не хватает обязательных полей), тоже идут в
+`rejected/` с причиной "не совпадают поля". Возвращаемый `draft()` список
+`names` не включает файлы `rejected/` (только аудиторский артефакт + принятые
+находки) — существующие тесты 6B, проверяющие `names`, не потребовали
+изменения контракта возврата.
+
+Тесты: новый `tests/test_analyze_validate_findings.py` (12 тестов) —
+валидная находка без нарушений; выдуманное число в evidence; выдуманный
+`money_amount_rub`; confidence выше compute-уровня отклонена, confidence
+на уровне/ниже принята, `client-HIGH` обходит потолок; несуществующий
+source_file (в т.ч. пустой пакет metrics целиком); неподтверждённое число
+в assumptions отклонено, подтверждённое из `inputs` принято;
+`extract_numbers()` — нормализация тысяч/десятичных разделителей.
+`tests/test_analyze_draft_findings_llm.py` — 4 теста, ожидавшие находки в
+`findings/draft/`, дополнены fixture `data/metrics/<check>.json`,
+подтверждающим числа evidence (иначе новая проверка отклоняла бы их как
+неподтверждённые) — явно заданное ломающее изменение контракта; сценарий
+"невалидная находка отбрасывается" дополнен проверкой, что она попала в
+`findings/draft/rejected/` с причиной `significant=false` в `reasons`.
+`pytest tests/test_analyze_draft_findings.py
+tests/test_analyze_draft_findings_llm.py tests/test_analyze_validate_findings.py
+tests/test_money_frame.py tests/test_compute_common.py tests/test_degradation.py
+tests/test_methodology_goals_requires.py` — **84 passed**, 1 failed
+(`test_money_frame.py::test_dispatch_blocks_runs_money_frame_by_default` —
+`ModuleNotFoundError: scipy`, окружение, `src/compute/block1.py`, вне
+`allowed_files` этой задачи и не связано с изменениями 6C).

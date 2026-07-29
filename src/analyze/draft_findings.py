@@ -61,6 +61,7 @@ import yaml
 
 from ..pipeline import orchestrator as orchestrator_mod
 from . import schemas
+from . import validate_findings as validate_findings_mod
 
 # Служебные артефакты data/metrics/, которые не являются результатом
 # конкретной проверки D/A/T/C/S и не входят в пакет "metrics" как есть —
@@ -387,6 +388,29 @@ def _finding_filenames(findings: list[schemas.Finding]) -> list[str]:
     return names
 
 
+REJECTED_DIRNAME = "rejected"
+
+
+def _write_rejected(findings_draft_dir: Path, index: int, raw_item: Any, reasons: list[str]) -> str:
+    """Записать один отклонённый ответ модели в findings/draft/rejected/R-<nn>.yaml.
+
+    ``raw_item`` — необработанный элемент ответа модели (как есть, до сборки
+    в schemas.Finding, чтобы причина отказа была видна вместе с исходным
+    текстом даже для структурно сломанных ответов). ``reasons`` — машинные
+    причины отказа (schemas.validate_finding + validate_findings_mod.
+    validate_finding_evidence), не меньше одной.
+    """
+    rejected_dir = findings_draft_dir / REJECTED_DIRNAME
+    rejected_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"R-{index:02d}.yaml"
+    payload = {"reasons": reasons, "finding": raw_item}
+    (rejected_dir / filename).write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return filename
+
+
 # ── Точка входа слоя (контракт: см. докстринг модуля) ──────────────────────
 def draft(
     paths: Any,
@@ -400,14 +424,20 @@ def draft(
     Всегда пишет аудиторский артефакт (INPUT_PACK_ARTIFACT_NAME, имя начинается
     с "_", чтобы не перепутать с находкой) — то же тело запроса, что ушло
     модели, для сверки/отладки. Затем вызывает модель один раз (см. _call_llm)
-    и записывает прошедшие schemas.validate_finding находки как
+    и для каждой находки в ответе проверяет структурную форму
+    (schemas.validate_finding) и evidence (validate_findings_mod.
+    validate_finding_evidence — задача 6C: числа находки обязаны реально
+    присутствовать в data/metrics, confidence не выше compute-уровня).
+    Прошедшие обе проверки находки пишутся как
     findings/draft/F-<блок>-<nn>.yaml (не больше schemas.MAX_FINDINGS_PER_RUN;
     лишние в ответе модели отбрасываются, а не докидываются в отчёт).
+    Не прошедшие — в findings/draft/rejected/R-<nn>.yaml с машинной причиной
+    (для ручного разбора аналитиком, не для повторной генерации).
 
     ``client`` — точка подмены для тестов, см. _call_llm.
 
-    Возвращает список записанных имён файлов: аудиторский артефакт + карточки
-    прошедших валидацию находок. Глубокая проверка evidence — задача 6C.
+    Возвращает список записанных имён файлов в findings/draft/ (не в
+    rejected/): аудиторский артефакт + карточки прошедших валидацию находок.
     """
     paths.findings_draft.mkdir(parents=True, exist_ok=True)
     defaults = orchestrator_mod.load_defaults()
@@ -426,15 +456,32 @@ def draft(
     raw_findings = (response_data.get("findings") or [])[: schemas.MAX_FINDINGS_PER_RUN]
 
     known_ids = schemas.known_check_ids(methodology)
-    confidence_caps = _confidence_caps(_load_degradation_report(paths))
+    degradation_report = _load_degradation_report(paths)
+    confidence_caps = _confidence_caps(degradation_report)
 
     valid_findings: list[schemas.Finding] = []
+    rejected_count = 0
     for item in raw_findings:
         finding = _finding_from_dict(item)
         if finding is None:
+            rejected_count += 1
+            _write_rejected(
+                Path(paths.findings_draft), rejected_count, item,
+                ["ответ модели не собирается в schemas.Finding (не совпадают поля)"],
+            )
             continue
+
         cap = confidence_caps.get(finding.check_id)
-        if schemas.validate_finding(finding, known_ids=known_ids, confidence_cap=cap):
+        errors = schemas.validate_finding(finding, known_ids=known_ids, confidence_cap=cap)
+        errors += validate_findings_mod.validate_finding_evidence(
+            finding,
+            metrics=pack["metrics"],
+            inputs=pack["inputs"],
+            degradation_report=degradation_report,
+        )
+        if errors:
+            rejected_count += 1
+            _write_rejected(Path(paths.findings_draft), rejected_count, item, errors)
             continue
         valid_findings.append(finding)
 

@@ -74,6 +74,28 @@ def _write_degradation(paths: _Paths, checks: list[dict]) -> None:
     )
 
 
+def _write_metrics(paths: _Paths, name: str, rows: list[dict]) -> None:
+    """data/metrics/<name>.json — source_file, который сверяет задача 6C
+    (validate_findings_mod.validate_finding_evidence)."""
+    paths.metrics.mkdir(parents=True, exist_ok=True)
+    (paths.metrics / f"{name}.json").write_text(
+        json.dumps(rows, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _evidence_metrics_row(check_id: str, confidence: str) -> dict:
+    """Строка metrics, подтверждающая числа evidence по умолчанию в _finding_dict
+    (10 000 ₽ / 0 конверсий / 6 месяцев) — нужна после задачи 6C, где
+    draft() сверяет числа находки с data/metrics/<check_id>.json."""
+    return {
+        "check_id": check_id,
+        "cost_normalized_rub": 10000.0,
+        "net_conversions": 0,
+        "period_months": 6,
+        "confidence": confidence,
+    }
+
+
 class _MockMessages:
     """Подмена client.messages — capture пишет kwargs каждого вызова."""
 
@@ -159,6 +181,8 @@ def test_draft_writes_valid_findings_with_block_numbered_filenames(tmp_path):
         {"check_id": "D01", "runnable": True, "confidence_cap": "HIGH"},
         {"check_id": "A04", "runnable": True, "confidence_cap": "MED"},
     ])
+    _write_metrics(paths, "d01", [_evidence_metrics_row("D01", "HIGH")])
+    _write_metrics(paths, "a04", [_evidence_metrics_row("A04", "MED")])
     payload = [_finding_dict("D01", confidence="HIGH"), _finding_dict("A04", confidence="MED")]
 
     names = draft_findings.draft(paths, CONFIG, METHODOLOGY, client=_MockClient(payload))
@@ -176,6 +200,7 @@ def test_draft_writes_valid_findings_with_block_numbered_filenames(tmp_path):
 def test_draft_numbers_multiple_findings_in_same_block_sequentially(tmp_path):
     paths = _Paths(tmp_path)
     _write_degradation(paths, [{"check_id": "A04", "runnable": True, "confidence_cap": "MED"}])
+    _write_metrics(paths, "a04", [_evidence_metrics_row("A04", "MED")])
     payload = [_finding_dict("A04"), _finding_dict("A04")]
 
     names = draft_findings.draft(paths, CONFIG, METHODOLOGY, client=_MockClient(payload))
@@ -183,11 +208,13 @@ def test_draft_numbers_multiple_findings_in_same_block_sequentially(tmp_path):
     assert names == [draft_findings.INPUT_PACK_ARTIFACT_NAME, "F-A-01.yaml", "F-A-02.yaml"]
 
 
-# ── 4. Невалидные находки отбрасываются без повторного вызова модели ────────
+# ── 4. Невалидные находки отбрасываются в rejected/ без повторного вызова
+#      модели (задача 6C: и schema-, и evidence-нарушения) ──────────────────
 
 def test_draft_drops_invalid_findings_without_regenerating(tmp_path):
     paths = _Paths(tmp_path)
     _write_degradation(paths, [{"check_id": "A04", "runnable": True, "confidence_cap": "MED"}])
+    _write_metrics(paths, "a04", [_evidence_metrics_row("A04", "MED")])
     payload = [
         _finding_dict("A04", significant=False),  # невалидна: significant=false запрещено
         _finding_dict("A04"),                      # валидна
@@ -199,12 +226,20 @@ def test_draft_drops_invalid_findings_without_regenerating(tmp_path):
     assert names == [draft_findings.INPUT_PACK_ARTIFACT_NAME, "F-A-01.yaml"]
     assert len(capture) == 1  # ни одного повторного вызова модели
 
+    rejected = sorted((paths.findings_draft / "rejected").glob("*.yaml"))
+    assert len(rejected) == 1
+    import yaml
+
+    rejected_data = yaml.safe_load(rejected[0].read_text(encoding="utf-8"))
+    assert any("significant=false" in reason for reason in rejected_data["reasons"])
+
 
 # ── 5. Лимит MAX_FINDINGS_PER_RUN соблюдается ───────────────────────────────
 
 def test_draft_truncates_findings_over_max_per_run(tmp_path):
     paths = _Paths(tmp_path)
     _write_degradation(paths, [{"check_id": "A04", "runnable": True, "confidence_cap": "MED"}])
+    _write_metrics(paths, "a04", [_evidence_metrics_row("A04", "MED")])
     payload = [_finding_dict("A04") for _ in range(schemas.MAX_FINDINGS_PER_RUN + 1)]
     capture: list[dict] = []
 
