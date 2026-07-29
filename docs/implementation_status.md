@@ -1427,3 +1427,33 @@ tests/test_methodology_goals_requires.py` — **84 passed**, 1 failed
 (`test_money_frame.py::test_dispatch_blocks_runs_money_frame_by_default` —
 `ModuleNotFoundError: scipy`, окружение, `src/compute/block1.py`, вне
 `allowed_files` этой задачи и не связано с изменениями 6C).
+
+**6D** DONE — 2026-07-29. `run_analyze()` (`src/pipeline/orchestrator.py`)
+подключён к `src.analyze.draft_findings.draft()` вместо заглушки: загружает
+`config.yaml` и `config/methodology.yaml`, вызывает `draft()` без подмены
+`client` (в проде — реальный `anthropic.Anthropic()`, см. докстринг
+`draft_findings.py`) и логирует список записанных карточек находок.
+
+Перед вызовом `draft()` `findings/draft/` перезаписывается целиком
+(`shutil.rmtree` + `mkdir`) — файлы находок нумеруются заново внутри каждого
+прогона (`F-<блок>-<nn>.yaml`), поэтому без очистки более многочисленный
+предыдущий прогон мог бы оставить лишние файлы рядом с новыми; это и делает
+повторный запуск `analyze` идемпотентным (принцип 2 — свой слой можно
+перезаписывать целиком). `findings/approved/` стейдж не создаёт и не трогает —
+гейт перед `report` (`approved_findings_present`/`report_gate_message`)
+изменению не подвергался. После записи черновиков выводится инструкция
+аналитику: проверить `findings/draft/`, вручную перенести утверждённые в
+`findings/approved/`, затем повторить `--stage report`.
+
+Тесты: новый `tests/test_orchestrator_analyze_gate.py` (5 тестов,
+`draft_findings.draft` подменяется через monkeypatch — реальный LLM не
+нужен) — `run_analyze` делегирует в `draft()`; `report` остаётся под гейтом
+после `analyze` (approved пуст); лог содержит инструкцию о ручной проверке
+с путями `findings/draft`/`findings/approved` и командой `--stage report`;
+находки в `rejected/` не считаются approved (гейт `report` по-прежнему
+закрыт); повторный запуск `run_analyze` с меньшим числом находок не
+оставляет файлы предыдущего прогона.
+`pytest tests/test_orchestrator_analyze_gate.py tests/test_analyze_draft_findings.py
+tests/test_analyze_draft_findings_llm.py tests/test_analyze_validate_findings.py
+tests/test_orchestrator_error_logging.py tests/test_smoke.py` — **59 passed**.
+Blocker: нет.

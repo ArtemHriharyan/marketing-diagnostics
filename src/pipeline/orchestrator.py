@@ -523,9 +523,45 @@ def run_compute(paths: ClientPaths, log: StageLogger) -> None:
 
 
 def run_analyze(paths: ClientPaths, log: StageLogger) -> None:
-    """metrics + inputs/ -> findings/draft/*.yaml. Единственный слой с LLM."""
+    """metrics + inputs/ -> findings/draft/*.yaml. Единственный слой с LLM.
+
+    Перед вызовом src.analyze.draft_findings.draft() findings/draft/
+    перезаписывается целиком (принцип 2 — свой слой можно перезаписывать
+    полностью): имена файлов находок нумеруются заново внутри каждого
+    прогона (F-<блок>-<nn>.yaml), поэтому без очистки старые файлы
+    предыдущего прогона (например, более многочисленного) могли бы
+    остаться рядом с новыми — повторный запуск не был бы идемпотентен.
+    findings/approved/ этот стейдж не трогает и не создаёт — гейт перед
+    report (report_gate_message) остаётся под ручным контролем аналитика.
+    """
+    import shutil
+
+    from ..analyze import draft_findings
+
+    if paths.findings_draft.exists():
+        shutil.rmtree(paths.findings_draft)
     paths.findings_draft.mkdir(parents=True, exist_ok=True)
-    log("analyze: заглушка — src/analyze/draft_findings.py не реализован.")
+
+    config = load_client_config(paths)
+    methodology = load_methodology()
+
+    written = draft_findings.draft(paths, config, methodology)
+    finding_files = [
+        name for name in written if name != draft_findings.INPUT_PACK_ARTIFACT_NAME
+    ]
+
+    log(f"analyze: черновиков находок записано {len(finding_files)} -> {paths.findings_draft}")
+    if finding_files:
+        log(f"  {', '.join(finding_files)}")
+    log("")
+    log(
+        "ГЕЙТ ПЕРЕД REPORT: черновики в findings/draft/ — не факт для отчёта, "
+        "нужна ручная проверка аналитика.\n"
+        f"  1. Проверь черновики находок в: {paths.findings_draft}\n"
+        f"  2. Утверждённые вручную перенеси в: {paths.findings_approved}\n"
+        "  3. Затем запусти: python run.py "
+        f"{paths.client} --stage report"
+    )
 
 
 def run_report(paths: ClientPaths, log: StageLogger) -> bool:
