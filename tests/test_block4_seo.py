@@ -731,6 +731,87 @@ def test_s24_flags_high_value_page_losing_visibility(tmp_path):
     assert summary["losing_visibility_candidates"] == 1
 
 
+# ── S23/S24 device-разрез (задача 5bC, промт: "используют device так же,
+# как в 5bA") ────────────────────────────────────────────────────────────────
+def test_s23_device_split_reports_by_device_and_excludes_nothing_from_overall(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [_base_seo_row(page="/x", total_shows=30, total_clicks=3)])
+    visits = (
+        [_base_visit(source_group="organic", device="desktop", entry_page="/x", form_submit=False)
+         for _ in range(25)]
+        + [_base_visit(source_group="paid", device="desktop", entry_page="/x", form_submit=(i < 20))
+           for i in range(25)]
+        + [_base_visit(source_group="organic", device="mobile", entry_page="/x", form_submit=(i < 20))
+           for i in range(25)]
+        + [_base_visit(source_group="paid", device="mobile", entry_page="/x", form_submit=(i < 20))
+           for i in range(25)]
+    )
+    _write_visits(paths, visits)
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S23"})
+
+    assert "s23" in artifacts
+    rows = _read_metric(paths, "s23")
+    by_device = [r for r in rows if r["finding"] == "organic_underperforms_other_traffic_by_device"]
+    devices_seen = {r["device"] for r in by_device}
+    assert devices_seen == {"desktop", "mobile"}
+    desktop_row = next(r for r in by_device if r["device"] == "desktop")
+    mobile_row = next(r for r in by_device if r["device"] == "mobile")
+    assert desktop_row["organic_significantly_worse"] is True
+    assert mobile_row["organic_significantly_worse"] is False
+
+    # overall (device-агностический) агрегат по-прежнему считает ВСЕ визиты страницы.
+    overall = next(r for r in rows if r["finding"] == "organic_underperforms_other_traffic")
+    assert overall["organic_visits"] == 50
+    assert overall["other_traffic_visits"] == 50
+
+
+def test_s24_device_split_flags_high_value_page_losing_visibility_by_device(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="a", page="/blog/a", month="2026-01", device="desktop",
+                       total_shows=100, total_clicks=20),
+        _base_seo_row(query="a", page="/blog/a", month="2026-02", device="desktop",
+                       total_shows=100, total_clicks=5),
+    ])
+    _write_visits(paths, [
+        _base_visit(entry_page="/blog/a", device="desktop", form_submit=(i < 5)) for i in range(25)
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S24"})
+
+    assert "s24" in artifacts
+    rows = _read_metric(paths, "s24")
+    by_device = [r for r in rows if r["finding"] == "high_value_page_losing_visibility_by_device"]
+    assert len(by_device) == 1
+    assert by_device[0]["device"] == "desktop"
+    assert by_device[0]["losing_visibility_candidate"] is True
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["device_losing_visibility_candidates"] == 1
+
+
+def test_s24_device_split_excludes_unknown_device_but_keeps_overall(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="a", page="/blog/a", month="2026-01", device="unknown",
+                       total_shows=100, total_clicks=20),
+        _base_seo_row(query="a", page="/blog/a", month="2026-02", device="unknown",
+                       total_shows=100, total_clicks=5),
+    ])
+    _write_visits(paths, [
+        _base_visit(entry_page="/blog/a", form_submit=(i < 5)) for i in range(25)
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S24"})
+
+    assert "s24" in artifacts
+    rows = _read_metric(paths, "s24")
+    by_device = [r for r in rows if r["finding"] == "high_value_page_losing_visibility_by_device"]
+    assert by_device == []
+    overall = next(r for r in rows if r["finding"] == "high_value_page_losing_visibility")
+    assert overall["page_declining"] is True
+
+
 # ── S25 — сниппет не использует структурированные данные/элементы выдачи ───
 def test_s25_flags_snippet_gap_candidate_on_page1(tmp_path):
     paths = _Paths(tmp_path)

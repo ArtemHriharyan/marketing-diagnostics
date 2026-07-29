@@ -221,6 +221,18 @@ S01-S07 (не требуют device по промту этой задачи) dev
     не готов" (промт задачи 5bC, тот же принцип, что S26) — не тихий пропуск и
     не пометка "optional". Кандидат — `text_changed=true` ИЛИ непустой
     `links_only_in_rendered` при материальном органическом объёме страницы.
+
+15. **S23/S24 device-разрез** — та же обязательная конвенция, что S08/S09
+    (докстринг выше, "S08-S10: обязательный device-разрез"): overall
+    (device-агностический) агрегат считает ВСЕ строки, `*_by_device`-находки
+    исключают только `device="unknown"`. Единая точка правды —
+    `_exclude_unknown_device_sql()`/`_UNKNOWN_DEVICE`, которую переиспользуют
+    S08, S09, S23, S24 (не по копии условия на функцию, промт задачи 5bC: "не
+    дублировать логику, вынести общую функцию device-фильтрации"). На стороне
+    `visits` (S23/S24 by-device engagement) фильтр фактически избыточен —
+    `map_device` никогда не пишет "unknown" (см. build_canonical.py) — но
+    применяется для единообразия конвенции и на случай будущего источника
+    визитов без device-разбивки.
 """
 
 from __future__ import annotations
@@ -467,6 +479,27 @@ def _position_bucket(position: float | None) -> str | None:
         if position >= low and (high is None or position <= high):
             return name
     return None
+
+
+# S08/S09/S23/S24 обязательный device-разрез: "unknown" (Вебмастер не отдаёт
+# device, has_device_column=False у обоих экстракторов — см. build_canonical.
+# build_seo_queries_webmaster) исключается ТОЛЬКО из *_by_device находок,
+# остаётся в device-агностическом overall наравне с остальными строками (см.
+# докстринг модуля, "S08-S10: обязательный device-разрез"). Единая точка
+# определения фильтра — не дублируется по функциям блока.
+_UNKNOWN_DEVICE = "unknown"
+
+
+def _exclude_unknown_device_sql() -> str:
+    """SQL-условие ``device != 'unknown'`` для *_by_device выборок блока 4.
+
+    Общий для всех проверок с device-разрезом (S08/S09/S23/S24) — visits
+    всегда несёт конкретное устройство (map_device по умолчанию -> "desktop",
+    "unknown" в этой таблице не появляется), поэтому на visits-запросах
+    условие безопасно-избыточно; на seo_queries оно и убирает Вебмастер-строки
+    без разбивки по устройству.
+    """
+    return f"device != '{_UNKNOWN_DEVICE}'"
 
 
 def _aggregate_query_page(con: Any, where_sql: str = "") -> list[dict[str, Any]]:
@@ -1143,7 +1176,7 @@ def _run_s08(
         ).fetchall()
         by_device = con.execute(
             "SELECT page, device, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
-            "WHERE device != 'unknown' GROUP BY page, device"
+            f"WHERE {_exclude_unknown_device_sql()} GROUP BY page, device"
         ).fetchall()
         organic_by_page = _organic_visits_by_page(con)
         organic_by_page_device = _organic_visits_by_page_device(con)
@@ -1234,7 +1267,7 @@ def _run_s09(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
         ).fetchall()
         by_device = con.execute(
             "SELECT query, device, page, SUM(total_shows) FROM seo_queries "
-            "WHERE device != 'unknown' GROUP BY query, device, page"
+            f"WHERE {_exclude_unknown_device_sql()} GROUP BY query, device, page"
         ).fetchall()
     finally:
         con.close()
@@ -2267,10 +2300,41 @@ def _organic_vs_other_by_page(con: Any) -> dict[str, tuple[int, int, int, int]]:
     return out
 
 
+def _organic_vs_other_by_page_device(con: Any) -> dict[tuple[str, str], tuple[int, int, int, int]]:
+    """{(normalized_path, device): (organic_visits, organic_engaged, other_visits, other_engaged)}.
+
+    Тот же device-разрез, что S08/S09 (см. `_exclude_unknown_device_sql`) —
+    единый фильтр, не отдельная копия условия. visits.device всегда конкретен
+    (map_device по умолчанию -> "desktop"), поэтому фильтр здесь избыточен по
+    факту, но применяется для единообразия конвенции блока (задача 5bC, промт:
+    "S23/S24 используют device так же, как в 5bA").
+    """
+    rows = con.execute(
+        "SELECT entry_page, device, "
+        "COUNT(*) FILTER (WHERE source_group = 'organic') AS organic_visits, "
+        "COUNT(*) FILTER (WHERE source_group = 'organic' AND "
+        "(form_open OR form_submit OR call_click OR messenger_click)) AS organic_engaged, "
+        "COUNT(*) FILTER (WHERE source_group != 'organic') AS other_visits, "
+        "COUNT(*) FILTER (WHERE source_group != 'organic' AND "
+        "(form_open OR form_submit OR call_click OR messenger_click)) AS other_engaged "
+        f"FROM visits WHERE {_exclude_unknown_device_sql()} GROUP BY entry_page, device"
+    ).fetchall()
+    out: dict[tuple[str, str], tuple[int, int, int, int]] = {}
+    for entry_page, device, ov, oe, otv, ote in rows:
+        key = (_url_path(entry_page), device)
+        prev_ov, prev_oe, prev_otv, prev_ote = out.get(key, (0, 0, 0, 0))
+        out[key] = (
+            prev_ov + int(ov or 0), prev_oe + int(oe or 0),
+            prev_otv + int(otv or 0), prev_ote + int(ote or 0),
+        )
+    return out
+
+
 def _run_s23(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     con = common.open_duckdb(paths)
     try:
         by_page = _organic_vs_other_by_page(con)
+        by_page_device = _organic_vs_other_by_page_device(con)
         seo_shows_by_path = _seo_shows_clicks_by_path(con)
     finally:
         con.close()
@@ -2305,17 +2369,95 @@ def _run_s23(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
             "confidence": _cap("MED", confidence_cap),
         })
 
+    worse_by_device_count = 0
+    for (path, device), (ov, oe, otv, ote) in sorted(by_page_device.items()):
+        if ov < _S23_MIN_VISITS_FOR_COMPARISON or otv < _S23_MIN_VISITS_FOR_COMPARISON:
+            continue
+        organic_rate = oe / ov
+        other_rate = ote / otv
+        ratio = (organic_rate / other_rate) if other_rate else None
+        worse = ratio is not None and ratio <= _S23_ENGAGEMENT_GAP_RATIO
+        if worse:
+            worse_by_device_count += 1
+        rows.append({
+            "check_id": "S23",
+            "finding": "organic_underperforms_other_traffic_by_device",
+            "page": path,
+            "device": device,
+            "organic_visits": ov,
+            "organic_engaged_visits": oe,
+            "organic_engagement_rate": round(organic_rate, 4),
+            "other_traffic_visits": otv,
+            "other_traffic_engaged_visits": ote,
+            "other_traffic_engagement_rate": round(other_rate, 4),
+            "engagement_ratio_organic_to_other": round(ratio, 3) if ratio is not None else None,
+            "gap_ratio_threshold": _S23_ENGAGEMENT_GAP_RATIO,
+            "min_visits_threshold": _S23_MIN_VISITS_FOR_COMPARISON,
+            "organic_significantly_worse": bool(worse),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
     rows.insert(0, {
         "check_id": "S23",
         "finding": "summary",
-        "pages_evaluated": len(rows),
+        "pages_evaluated": sum(1 for r in rows if r["finding"] == "organic_underperforms_other_traffic"),
         "pages_organic_worse": worse_count,
+        "device_rows_evaluated": sum(
+            1 for r in rows if r["finding"] == "organic_underperforms_other_traffic_by_device"
+        ),
+        "device_rows_organic_worse": worse_by_device_count,
         "min_visits_threshold": _S23_MIN_VISITS_FOR_COMPARISON,
         "gap_ratio_threshold": _S23_ENGAGEMENT_GAP_RATIO,
         "confidence": _cap("MED", confidence_cap),
     })
 
     common.write_metric_artifact(metrics_dir, "s23", rows, confidence_cap=confidence_cap)
+
+
+def _s24_trend_candidate(
+    months_map: dict[str, tuple[int, int]],
+    organic_visits: int,
+    engaged: int,
+) -> dict[str, Any] | None:
+    """Общая оценка тренда+вовлечённости для (страница) или (страница, device).
+
+    Не содержит SQL/device-фильтрации (та живёт в вызывающих запросах, единый
+    источник — `_exclude_unknown_device_sql`) — только арифметика, общая для
+    overall и by_device веток S24, чтобы не дублировать пороговую логику.
+    """
+    months = sorted(months_map)
+    if len(months) < 2:
+        return None
+    mid = len(months) // 2
+    early_months, late_months = months[:mid], months[mid:]
+    early_shows = sum(months_map[m][0] for m in early_months)
+    early_clicks = sum(months_map[m][1] for m in early_months)
+    late_clicks = sum(months_map[m][1] for m in late_months)
+    if early_shows < _S24_MIN_SHOWS_FOR_TREND:
+        return None
+    if organic_visits < _S24_MIN_ORGANIC_VISITS_FOR_CHECK:
+        return None
+
+    click_ratio = (late_clicks / early_clicks) if early_clicks > 0 else None
+    declining = click_ratio is not None and click_ratio <= _S24_DECLINE_CLICK_RATIO
+    engagement_rate = engaged / organic_visits
+    high_value = engagement_rate >= _S24_HIGH_ENGAGEMENT_RATE
+    losing_visibility = bool(declining and high_value)
+
+    return {
+        "months_available": months,
+        "early_clicks": early_clicks,
+        "late_clicks": late_clicks,
+        "click_ratio_late_to_early": round(click_ratio, 3) if click_ratio is not None else None,
+        "decline_ratio_threshold": _S24_DECLINE_CLICK_RATIO,
+        "organic_visits": organic_visits,
+        "organic_engaged_visits": engaged,
+        "organic_engagement_rate": round(engagement_rate, 4),
+        "high_engagement_rate_threshold": _S24_HIGH_ENGAGEMENT_RATE,
+        "page_declining": bool(declining),
+        "high_value_page": bool(high_value),
+        "losing_visibility_candidate": losing_visibility,
+    }
 
 
 # ── S24 — высококонверсионные SEO-страницы теряют видимость ────────────────
@@ -2325,6 +2467,9 @@ def _run_s24(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     вовлечённостью страницы (та же вовлечённость, что S08/S22) — кандидат,
     только если страница ОДНОВРЕМЕННО теряет видимость И уже доказала свою
     коммерческую ценность (высокая вовлечённость), а не любая падающая страница.
+    Device-разрез — та же конвенция, что S08/S09/S23 (единый фильтр
+    `_exclude_unknown_device_sql`, промт задачи 5bC: "S23/S24 используют
+    device так же, как в 5bA").
     """
     con = common.open_duckdb(paths)
     try:
@@ -2332,7 +2477,12 @@ def _run_s24(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
             "SELECT page, month, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
             "GROUP BY page, month"
         ).fetchall()
+        by_page_device_month = con.execute(
+            "SELECT page, device, month, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
+            f"WHERE {_exclude_unknown_device_sql()} GROUP BY page, device, month"
+        ).fetchall()
         organic_by_page = _organic_visits_by_page(con)
+        organic_by_page_device = _organic_visits_by_page_device(con)
     finally:
         con.close()
 
@@ -2343,54 +2493,52 @@ def _run_s24(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     rows: list[dict[str, Any]] = []
     losing_visibility_count = 0
     for page, months_map in sorted(by_page.items()):
-        months = sorted(months_map)
-        if len(months) < 2:
-            continue
-        mid = len(months) // 2
-        early_months, late_months = months[:mid], months[mid:]
-        early_shows = sum(months_map[m][0] for m in early_months)
-        early_clicks = sum(months_map[m][1] for m in early_months)
-        late_clicks = sum(months_map[m][1] for m in late_months)
-        if early_shows < _S24_MIN_SHOWS_FOR_TREND:
-            continue
-
         path = _url_path(page)
         organic_visits, engaged = organic_by_page.get(path, (0, 0))
-        if organic_visits < _S24_MIN_ORGANIC_VISITS_FOR_CHECK:
+        candidate = _s24_trend_candidate(months_map, organic_visits, engaged)
+        if candidate is None:
             continue
-
-        click_ratio = (late_clicks / early_clicks) if early_clicks > 0 else None
-        declining = click_ratio is not None and click_ratio <= _S24_DECLINE_CLICK_RATIO
-        engagement_rate = engaged / organic_visits
-        high_value = engagement_rate >= _S24_HIGH_ENGAGEMENT_RATE
-        losing_visibility = bool(declining and high_value)
-        if losing_visibility:
+        if candidate["losing_visibility_candidate"]:
             losing_visibility_count += 1
-
         rows.append({
             "check_id": "S24",
             "finding": "high_value_page_losing_visibility",
             "page": page,
-            "months_available": months,
-            "early_clicks": early_clicks,
-            "late_clicks": late_clicks,
-            "click_ratio_late_to_early": round(click_ratio, 3) if click_ratio is not None else None,
-            "decline_ratio_threshold": _S24_DECLINE_CLICK_RATIO,
-            "organic_visits": organic_visits,
-            "organic_engaged_visits": engaged,
-            "organic_engagement_rate": round(engagement_rate, 4),
-            "high_engagement_rate_threshold": _S24_HIGH_ENGAGEMENT_RATE,
-            "page_declining": bool(declining),
-            "high_value_page": bool(high_value),
-            "losing_visibility_candidate": losing_visibility,
+            **candidate,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    by_page_device: dict[tuple[str, str], dict[str, tuple[int, int]]] = {}
+    for page, device, month, shows, clicks in by_page_device_month:
+        by_page_device.setdefault((page, device), {})[month] = (int(shows or 0), int(clicks or 0))
+
+    losing_visibility_by_device_count = 0
+    for (page, device), months_map in sorted(by_page_device.items()):
+        path = _url_path(page)
+        organic_visits, engaged = organic_by_page_device.get((path, device), (0, 0))
+        candidate = _s24_trend_candidate(months_map, organic_visits, engaged)
+        if candidate is None:
+            continue
+        if candidate["losing_visibility_candidate"]:
+            losing_visibility_by_device_count += 1
+        rows.append({
+            "check_id": "S24",
+            "finding": "high_value_page_losing_visibility_by_device",
+            "page": page,
+            "device": device,
+            **candidate,
             "confidence": _cap("MED", confidence_cap),
         })
 
     rows.insert(0, {
         "check_id": "S24",
         "finding": "summary",
-        "pages_evaluated": len(rows),
+        "pages_evaluated": sum(1 for r in rows if r["finding"] == "high_value_page_losing_visibility"),
         "losing_visibility_candidates": losing_visibility_count,
+        "device_rows_evaluated": sum(
+            1 for r in rows if r["finding"] == "high_value_page_losing_visibility_by_device"
+        ),
+        "device_losing_visibility_candidates": losing_visibility_by_device_count,
         "min_shows_threshold": _S24_MIN_SHOWS_FOR_TREND,
         "min_organic_visits_threshold": _S24_MIN_ORGANIC_VISITS_FOR_CHECK,
         "high_engagement_rate_threshold": _S24_HIGH_ENGAGEMENT_RATE,
