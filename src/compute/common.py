@@ -295,6 +295,27 @@ def dispatch_blocks(
     return result
 
 
+def _seo_confidence_cap_summary(degradation_report: dict[str, Any]) -> dict[str, Any]:
+    """Агрегат по блоку 4 (SEO, id начинается с "S"): сколько runnable-проверок
+
+    капнуты до confidence_cap=MED и какая это доля — не бизнес-число конкретной
+    находки, а структурная сводка методологии по всему блоку (та же природа,
+    что уже существующий degradation_report["counts"]), чтобы report мог
+    показать это одной цифрой без обхода всех s*.json (задача 5bC, промт).
+    """
+    s_checks = [
+        c for c in (degradation_report.get("checks") or [])
+        if isinstance(c.get("check_id"), str) and c["check_id"].startswith("S") and c.get("runnable")
+    ]
+    total = len(s_checks)
+    med_cap = sum(1 for c in s_checks if c.get("confidence_cap") == "MED")
+    return {
+        "runnable_count": total,
+        "med_cap_count": med_cap,
+        "med_cap_share": round(med_cap / total, 4) if total else None,
+    }
+
+
 # ── metrics_summary (без бизнес-чисел) ──────────────────────────────────────
 def build_metrics_summary(
     degradation_report: dict[str, Any],
@@ -302,10 +323,12 @@ def build_metrics_summary(
 ) -> dict[str, Any]:
     """Собрать metrics_summary — только структурные факты о прогоне compute.
 
-    НИ ОДНОГО бизнес-числа (сумм, ставок, метрик, долей) — они живут
+    НИ ОДНОГО бизнес-числа (сумм, ставок, метрик, долей находок) — они живут
     исключительно в артефактах конкретных проверок (data/metrics/<check>.csv
     /.json). Здесь — что выполнимо, что пропущено и почему, что вернул каждый
-    блок. Годится для лога/аудита прогона, не для отчёта клиенту.
+    блок, плюс сводка по confidence_cap блока 4 (SEO) — структурный факт о
+    самом прогоне, не бизнес-метрика. Годится для лога/аудита прогона, не для
+    отчёта клиенту.
     """
     skipped = [
         {"id": s.get("id"), "block": s.get("block"), "reason": s.get("reason")}
@@ -316,6 +339,7 @@ def build_metrics_summary(
         "skipped": skipped,
         "block_status": dispatch_result.get("block_status") or {},
         "artifacts": sorted(dispatch_result.get("artifacts") or []),
+        "seo_confidence_cap": _seo_confidence_cap_summary(degradation_report),
     }
     if dispatch_result.get("block_errors"):
         summary["block_errors"] = dispatch_result["block_errors"]

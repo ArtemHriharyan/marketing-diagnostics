@@ -1,10 +1,12 @@
-"""Тесты блока 4 compute (задача 5bA): S01-S10 (SEO и органический спрос).
+"""Тесты блока 4 compute (задачи 5bA/5bB/5bC): S01-S27 (SEO и органический спрос).
 
 По каждой проверке — минимум один сценарий. Обязательные сценарии из промта
-задачи: device есть -> device-разрез считается (S08/S09); device="unknown" ->
-исключается только из device-специфичных находок, но участвует в остальных
-агрегатах (не выбрасывается целиком). Плюс: S07 всегда unavailable (wordstat
-структурно недоступен), confidence_cap из degradation_report применяется.
+задачи 5bA: device есть -> device-разрез считается (S08/S09); device="unknown"
+-> исключается только из device-специфичных находок, но участвует в остальных
+агрегатах (не выбрасывается целиком). Плюс: S07/S26 всегда unavailable
+(wordstat структурно недоступен), confidence_cap из degradation_report
+применяется. Задача 5bC добавляет S21-S27 и агрегат SEO confidence_cap в
+metrics_summary (src.compute.common.build_metrics_summary).
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import pandas as pd
 import yaml
 
 from src.compute import block4_seo  # noqa: E402
+from src.compute import common as compute_common  # noqa: E402
 
 
 class _Paths:
@@ -119,6 +122,7 @@ def _base_site_page(**overrides) -> dict:
 
 ALL_S01_10 = {f"S{i:02d}" for i in range(1, 11)}
 ALL_S11_20 = {f"S{i:02d}" for i in range(11, 21)}
+ALL_S21_27 = {f"S{i:02d}" for i in range(21, 28)}
 
 
 # ── S01 — брендовый/небрендовый органический трафик смешан ─────────────────
@@ -624,6 +628,206 @@ def test_run_ignores_s11_20_when_sources_missing(tmp_path):
     assert artifacts == []
 
 
+# ── S21 — Яндекс и Google показывают противоположную картину ───────────────
+def test_s21_flags_cross_system_divergence(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="q1", page="/p", source="gsc",
+                       total_shows=30, total_clicks=9, avg_show_position=3.0),
+        _base_seo_row(query="q1", page="/p", source="webmaster",
+                       total_shows=30, total_clicks=1, avg_show_position=15.0),
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S21"})
+
+    assert "s21" in artifacts
+    rows = _read_metric(paths, "s21")
+    candidate = next(r for r in rows if r["finding"] == "cross_system_divergence")
+    assert candidate["cross_system_divergent"] is True
+    assert candidate["position_gap"] == 12.0
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["pages_compared"] == 1
+    assert summary["divergent_page_count"] == 1
+
+
+def test_s21_ignores_pages_present_in_only_one_system(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="q1", page="/p", source="gsc", total_shows=30, total_clicks=3),
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S21"})
+
+    assert "s21" in artifacts
+    rows = _read_metric(paths, "s21")
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["pages_compared"] == 0
+
+
+# ── S22 — контент получает органику, не переводит в коммерческий раздел ────
+def test_s22_flags_dead_end_organic_page(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="what is x", page="/blog/x", total_shows=30, total_clicks=5),
+    ])
+    _write_visits(paths, [
+        _base_visit(entry_page="/blog/x", form_submit=False) for _ in range(25)
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S22"})
+
+    assert "s22" in artifacts
+    rows = _read_metric(paths, "s22")
+    candidate = next(r for r in rows if r["finding"] == "organic_page_without_conversion_path")
+    assert candidate["no_conversion_path"] is True
+    assert candidate["page_classification_available"] is False
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["dead_end_page_count"] == 1
+    assert summary["dead_end_click_share"] == 1.0
+
+
+# ── S23 — органические посадочные конвертируют хуже сопоставимых страниц ───
+def test_s23_flags_organic_underperforming_other_traffic(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [_base_seo_row(page="/x", total_shows=30, total_clicks=3)])
+    visits = (
+        [_base_visit(source_group="organic", entry_page="/x", form_submit=False) for _ in range(25)]
+        + [_base_visit(source_group="paid", entry_page="/x", form_submit=(i < 20)) for i in range(25)]
+    )
+    _write_visits(paths, visits)
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S23"})
+
+    assert "s23" in artifacts
+    rows = _read_metric(paths, "s23")
+    candidate = next(r for r in rows if r["finding"] == "organic_underperforms_other_traffic")
+    assert candidate["organic_engagement_rate"] == 0.0
+    assert candidate["other_traffic_engagement_rate"] == 0.8
+    assert candidate["organic_significantly_worse"] is True
+
+
+# ── S24 — высококонверсионные SEO-страницы теряют видимость ────────────────
+def test_s24_flags_high_value_page_losing_visibility(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="a", page="/blog/a", month="2026-01",
+                       total_shows=100, total_clicks=20),
+        _base_seo_row(query="a", page="/blog/a", month="2026-02",
+                       total_shows=100, total_clicks=5),
+    ])
+    _write_visits(paths, [
+        _base_visit(entry_page="/blog/a", form_submit=(i < 5)) for i in range(25)
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S24"})
+
+    assert "s24" in artifacts
+    rows = _read_metric(paths, "s24")
+    candidate = next(r for r in rows if r["finding"] == "high_value_page_losing_visibility")
+    assert candidate["page_declining"] is True
+    assert candidate["high_value_page"] is True
+    assert candidate["losing_visibility_candidate"] is True
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["losing_visibility_candidates"] == 1
+
+
+# ── S25 — сниппет не использует структурированные данные/элементы выдачи ───
+def test_s25_flags_snippet_gap_candidate_on_page1(tmp_path):
+    paths = _Paths(tmp_path)
+    rows_in = [
+        _base_seo_row(query=f"q{i}", page=f"/p{i}", total_shows=100, total_clicks=10,
+                       avg_show_position=7.0)
+        for i in range(4)
+    ]
+    rows_in.append(
+        _base_seo_row(query="q_outlier", page="/p_outlier", total_shows=100, total_clicks=2,
+                       avg_show_position=7.0)
+    )
+    _write_seo_queries(paths, rows_in)
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S25"})
+
+    assert "s25" in artifacts
+    rows = _read_metric(paths, "s25")
+    outlier = next(r for r in rows if r.get("query") == "q_outlier")
+    assert outlier["snippet_gap_candidate"] is True
+    assert outlier["structured_data_field_available"] is False
+    assert outlier["manual_serp_check_required"] is True
+    normal = next(r for r in rows if r.get("query") == "q0")
+    assert normal["snippet_gap_candidate"] is False
+
+
+# ── S26 — геоспрос не покрыт отдельными релевантными страницами ────────────
+def test_s26_always_unavailable_wordstat_missing(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [_base_seo_row(total_shows=100, total_clicks=10)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S26"})
+
+    assert "s26" in artifacts
+    rows = _read_metric(paths, "s26")
+    assert rows[0]["status"] == "unavailable"
+    assert "wordstat" in rows[0]["reason"]
+    assert "ядро не посчитано" in rows[0]["reason"]
+
+
+# ── S27 — JS-контент или ссылки недоступны поисковому роботу ───────────────
+def test_s27_flags_js_rendering_gap_candidate(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [
+        _base_site_page(
+            url="https://example.com/app",
+            js_content_diff=json.dumps({
+                "raw_link_count": 2, "rendered_link_count": 10,
+                "links_only_in_rendered": ["https://example.com/app/a", "https://example.com/app/b"],
+                "text_changed": True,
+            }),
+        ),
+    ])
+    _write_seo_queries(paths, [_base_seo_row(page="/app", total_shows=30, total_clicks=2)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S27"})
+
+    assert "s27" in artifacts
+    rows = _read_metric(paths, "s27")
+    candidate = next(r for r in rows if r["finding"] == "js_rendering_gap_candidate")
+    assert candidate["js_rendering_gap_candidate"] is True
+    assert candidate["links_only_in_rendered_count"] == 2
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["js_rendering_gap_candidates"] == 1
+
+
+def test_s27_unavailable_without_site_pages(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [_base_seo_row(total_shows=30)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S27"})
+
+    assert "s27" in artifacts
+    rows = _read_metric(paths, "s27")
+    assert rows[0]["status"] == "unavailable"
+    assert "ядро не посчитано" in rows[0]["reason"]
+
+
+def test_s27_unavailable_when_js_diff_never_populated(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [_base_site_page(js_content_diff=None)])
+    _write_seo_queries(paths, [_base_seo_row(total_shows=30)])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S27"})
+
+    assert "s27" in artifacts
+    rows = _read_metric(paths, "s27")
+    assert rows[0]["status"] == "unavailable"
+    assert "ядро не посчитано" in rows[0]["reason"]
+
+
+def test_run_ignores_s21_27_when_seo_queries_missing(tmp_path):
+    paths = _Paths(tmp_path)
+    artifacts = block4_seo.run(paths, DEFAULTS, ALL_S21_27)
+    assert artifacts == []
+
+
 # ── Диспетчер: confidence_cap из degradation_report ─────────────────────────
 def test_confidence_cap_from_degradation_report_applied(tmp_path):
     paths = _Paths(tmp_path)
@@ -650,3 +854,35 @@ def test_run_ignores_s01_10_when_seo_queries_missing(tmp_path):
     paths = _Paths(tmp_path)
     artifacts = block4_seo.run(paths, DEFAULTS, ALL_S01_10)
     assert artifacts == []
+
+
+# ── metrics_summary: агрегат confidence_cap блока 4 (SEO), задача 5bC ──────
+def test_metrics_summary_seo_confidence_cap_counts_med_checks():
+    degradation_report = {
+        "checks": [
+            {"check_id": "S01", "runnable": True, "confidence_cap": "HIGH"},
+            {"check_id": "S07", "runnable": True, "confidence_cap": "MED"},
+            {"check_id": "S26", "runnable": True, "confidence_cap": "MED"},
+            {"check_id": "S27", "runnable": False, "confidence_cap": "MED"},
+            {"check_id": "A01", "runnable": True, "confidence_cap": "MED"},
+        ],
+    }
+    dispatch_result = {"artifacts": [], "block_status": {}}
+
+    summary = compute_common.build_metrics_summary(degradation_report, dispatch_result)
+
+    # Только runnable S-проверки: S01, S07, S26 (S27 не runnable, A01 не блок 4).
+    assert summary["seo_confidence_cap"] == {
+        "runnable_count": 3,
+        "med_cap_count": 2,
+        "med_cap_share": round(2 / 3, 4),
+    }
+
+
+def test_metrics_summary_seo_confidence_cap_handles_no_checks():
+    summary = compute_common.build_metrics_summary({}, {"artifacts": [], "block_status": {}})
+    assert summary["seo_confidence_cap"] == {
+        "runnable_count": 0,
+        "med_cap_count": 0,
+        "med_cap_share": None,
+    }

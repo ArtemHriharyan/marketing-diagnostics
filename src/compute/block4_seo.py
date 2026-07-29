@@ -1,5 +1,6 @@
 """Блок 4 — SEO и органический спрос (каталог v2 §9, задачи 5bA: S01–S10,
-5bB: S11–S20 — технический SEO и производительность).
+5bB: S11–S20 — технический SEO и производительность, 5bC: S21–S27 — кросс-
+системные, коммерческие и структурные проверки, завершает блок 4).
 
 Проверки (config/methodology.yaml, catalog-proveryaemyh-marketingovyh-ugroz-v2.md §9):
     S01  брендовый и небрендовый органический трафик смешаны   [seo_queries]
@@ -22,6 +23,13 @@
     S18  важные страницы имеют мало внутренних ссылок/сироты     [site_crawl]
     S19  архитектура требует слишком много кликов до коммерции   [site_crawl] (+visits)
     S20  мобильная производительность и CWV ухудшают конверсию   [seo_queries, crux] (+visits)
+    S21  Яндекс и Google показывают противоположную картину       [seo_queries]
+    S22  контент получает органику, не переводит в коммерцию      [seo_queries, visits]
+    S23  органические посадочные конвертируют хуже сопоставимых   [seo_queries, visits]
+    S24  высококонверсионные SEO-страницы теряют видимость        [seo_queries, visits]
+    S25  сниппет не использует структурированные данные/SERP      [seo_queries] (+site_crawl)
+    S26  геоспрос не покрыт отдельными релевантными страницами    [wordstat, seo_queries] (+site_crawl)
+    S27  JS-контент/ссылки недоступны поисковому роботу            [seo_queries] (+site_crawl)
 
 Контракт:
     Читает   — data/canonical/{seo_queries,visits,site_pages,site_link_graph}.parquet,
@@ -33,17 +41,7 @@
                config клиента НЕ читается: is_brand уже посчитан в transform
                (build_canonical.is_brand_query, config.brand_terms применены
                там), здесь используется готовая колонка seo_queries.is_brand.
-    Пишет    — data/metrics/{s01..s20}.csv/.json. БЕЗ LLM.
-
-S21–S27 не реализуются этой задачей (задача 5bB реализует S11–S20) — не
-путать с config/methodology.yaml, где они уже зарегистрированы для будущих
-задач.
-
-── S21–S27 не реализуются (задача 5bB реализует только S11–S20) ────────────
-requires/optional этих ID уже есть в methodology.yaml (регистр общий на весь
-блок 4), но диспетчер run() ниже гейтит только S01-S20 — S21-S27 остаются
-"not_implemented" до отдельной задачи, тот же прецедент, что C01-C12 (5G) vs
-C13-C25 (5H) в block3.py и S01-S10 (5bA) vs S11-S20 (5bB) здесь же.
+    Пишет    — data/metrics/{s01..s27}.csv/.json. БЕЗ LLM.
 
 ── Структурные разрывы задачи 5bA (S01-S10, НЕ устраняются здесь — вне allowed_files) ───────────
 
@@ -160,6 +158,69 @@ S01-S07 (не требуют device по промту этой задачи) dev
    `_S19_DEEP_THRESHOLD`; `commercial_classification_available: false` в
    summary — приоритизация среди них по коммерческой значимости остаётся за
    аналитиком.
+
+── Структурные разрывы задачи 5bC (S21-S27, завершает блок 4) ──────────────
+
+10. **S21** ("Яндекс и Google показывают противоположную картину") — сравнение
+    строится по `seo_queries.source` (`gsc`|`webmaster`), агрегированному по
+    странице (не по (query, page): Вебмастер отдаёт `page` только с 3B-patch,
+    а `_url_path` нормализует оба представления URL к одному ключу — тот же
+    приём, что _organic_visits_by_page). Вебмастер (`popular-queries`) — это
+    снимок за всё окно выгрузки (один `month` на строку, см. docstring
+    build_seo_queries_webmaster в transform), а не помесячный ряд, как GSC —
+    поэтому сравнение "система A растёт, система B падает" по месяцам
+    невозможно без искажения (разные единицы времени); реализовано
+    сравнение агрегированной позиции и CTR каждой системы за всё окно —
+    расхождение по позиции/CTR при материальном объёме показов в обеих
+    системах, не расхождение трендов.
+
+11. **S22** ("контент получает органику, не переводит в коммерческий раздел")
+    — та же структурная нехватка, что разрыв 4 (S08): в canonical-слое нет
+    классификации "информационная/коммерческая страница", а `visits` не несёт
+    последовательность страниц сессии (только `entry_page`) — сравнить "вход
+    на инфо-страницу -> переход в коммерческий раздел" буквально нечем.
+    Автоматическая часть здесь по necessity пересекается с S08 (тот же прокси
+    "нулевая вовлечённость при материальном органическом трафике"), но S22
+    считает это на уровне ВСЕГО сайта — доля кликов органики, оседающая на
+    страницах без единой вовлечённости (`dead_end_click_share`), а не на
+    уровне отдельной страницы, как S08. `page_classification_available: false`
+    в каждой строке и summary.
+
+12. **S25** ("сниппет не использует структурированные данные и элементы
+    выдачи") — ни в одной канонической таблице (`site_pages`: см. разрыв 4)
+    нет поля структурированных данных/типа сниппета — каталог сам относит
+    финальную проверку к "ручной SERP-проверке" (не только к недостающему
+    полю), поэтому это не расширяется здесь надуманным полем. Автоматическая
+    часть — CTR аномально низкий относительно медианы своего бакета СРЕДИ
+    запросов на позициях 1–10 (`_S25_MAX_POSITION_FOR_SNIPPET_CHECK`, тот же
+    метод, что S04, у же диапазон: только страница 1, где элементы выдачи
+    визуально заметны). Каждая строка несёт
+    `structured_data_field_available: false` и `manual_serp_check_required:
+    true` — находка остаётся кандидатом на ручную проверку, не вердиктом.
+
+13. **S26** ("географический/локальный спрос не покрыт отдельными
+    релевантными страницами") — requires=[wordstat, seo_queries]; тот же
+    структурный разрыв, что S07 (разрыв 1 выше): `wordstat.parquet` не
+    строится в canonical-слое ни при каких условиях в текущем состоянии
+    transform. S26 поэтому ВСЕГДА пишет unavailable, независимо от
+    runnable_ids/manifest — тот же прецедент, что S07/A07/A16/A25. Причина
+    сформулирована явно как "ядро не посчитано: источник wordstat не готов"
+    (промт задачи 5bC: не оформлять отсутствие ядра как
+    optional/upsell-примечание).
+
+14. **S27** ("JS-контент или ссылки недоступны поисковому роботу") —
+    реализует компонент, зарезервированный в разрыве 6 выше (`js_content_diff`
+    относится к S27, не к S11, по data-export-spec-v2.md §G1). Требует
+    `site_pages` (optional=[site_crawl] по methodology.yaml, но без него
+    считать нечего — тот же принцип, что S11-S14/S16/S17: если `site_pages`
+    отсутствует ИЛИ `js_content_diff` не заполнен ни на одной обойдённой
+    странице (headless выключен, playwright недоступен в среде обхода, либо
+    сайт полностью SSR — различить эти причины нечем без записи в manifest
+    обхода, см. src/extract/site_crawl.py: `headless_stats`), проверка пишет
+    unavailable с явной формулировкой "ядро не посчитано: источник site_crawl
+    не готов" (промт задачи 5bC, тот же принцип, что S26) — не тихий пропуск и
+    не пометка "optional". Кандидат — `text_changed=true` ИЛИ непустой
+    `links_only_in_rendered` при материальном органическом объёме страницы.
 """
 
 from __future__ import annotations
@@ -284,6 +345,48 @@ _S19_DEEP_THRESHOLD = 4
 # минимум визитов в каждом сравниваемом сегменте.
 _S20_MOBILE_ENGAGEMENT_GAP_RATIO = 0.7
 _S20_MIN_VISITS_FOR_DEVICE_COMPARISON = 30
+
+# S21: минимум показов у КАЖДОЙ системы (Яндекс/Google) по странице, чтобы
+# сравнение было материальным; разрыв позиций между системами и во сколько
+# раз CTR одной системы должен превышать другую, чтобы считать картину
+# "противоположной", а не шумом снятия/агрегации.
+_S21_MIN_SHOWS_FOR_COMPARISON = 20
+_S21_POSITION_GAP_THRESHOLD = 10.0
+_S21_CTR_RATIO_THRESHOLD = 3.0
+
+# S22: тот же порог материальности, что _MIN_SHOWS_FOR_OPPORTUNITY/S08 —
+# минимум показов страницы и минимум органических визитов, чтобы судить о
+# «пути к деньгам».
+_S22_MIN_SHOWS_FOR_CHECK = 20
+_S22_MIN_ORGANIC_VISITS_FOR_CHECK = 20
+
+# S23: минимум визитов в каждом из сравниваемых сегментов (органика и прочий
+# трафик той же страницы); во сколько раз вовлечённость органики должна быть
+# ниже вовлечённости прочего трафика, чтобы разрыв считался материальным (тот
+# же коэффициент, что _S20_MOBILE_ENGAGEMENT_GAP_RATIO — просело минимум на 30%).
+_S23_MIN_VISITS_FOR_COMPARISON = 20
+_S23_ENGAGEMENT_GAP_RATIO = 0.7
+
+# S24: тот же принцип и числа тренда, что S05 (_S05_MIN_SHOWS_FOR_TREND /
+# _S05_DECLINE_CLICK_RATIO) — независимые константы, блоки/проверки этого
+# модуля не делят пороги между собой; "высококонверсионная" страница — доля
+# вовлечённых органических визитов не ниже порога.
+_S24_MIN_SHOWS_FOR_TREND = 50
+_S24_DECLINE_CLICK_RATIO = 0.7
+_S24_HIGH_ENGAGEMENT_RATE = 0.05
+_S24_MIN_ORGANIC_VISITS_FOR_CHECK = 20
+
+# S25: тот же метод и числа, что S04 (медиана CTR по бакету), суженные до
+# страницы 1 (позиции 1-10) — там, где элементы выдачи/rich results визуально
+# заметны и способны менять CTR при равной позиции.
+_S25_MIN_SHOWS_FOR_ROW = 20
+_S25_MIN_QUERIES_FOR_MEDIAN = 5
+_S25_CTR_LOW_RATIO = 0.5
+_S25_MAX_POSITION_FOR_SNIPPET_CHECK = 10.0
+
+# S27: минимум органических показов страницы, чтобы расхождение raw/rendered
+# считалось значимым для SEO (страница без показов не влияет на выдачу).
+_S27_MIN_SHOWS_FOR_CHECK = 20
 
 
 # ── Общие хелперы (дублируют паттерн block0/1/2/3.py — блоки compute не
@@ -1975,11 +2078,541 @@ def _run_s20(
     common.write_metric_artifact(metrics_dir, "s20", rows, confidence_cap=confidence_cap)
 
 
+# ── S21 — Яндекс и Google показывают противоположную картину (легаси 5.4) ───
+def _run_s21(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
+    """Сравнение агрегировано по странице за всё окно (не помесячно, см.
+
+    докстринг модуля, разрыв 10 — Вебмастер отдаёт один снимок на всё окно,
+    помесячный тренд для него не существует).
+    """
+    con = common.open_duckdb(paths)
+    try:
+        rows_raw = con.execute(
+            "SELECT page, source, SUM(total_shows) AS shows, SUM(total_clicks) AS clicks, "
+            "SUM(avg_show_position * total_shows) FILTER (WHERE avg_show_position IS NOT NULL) AS pos_w, "
+            "SUM(total_shows) FILTER (WHERE avg_show_position IS NOT NULL) AS shows_pos "
+            "FROM seo_queries GROUP BY page, source"
+        ).fetchall()
+    finally:
+        con.close()
+
+    by_page: dict[str, dict[str, dict[str, Any]]] = {}
+    for page, source, shows, clicks, pos_w, shows_pos in rows_raw:
+        path = _url_path(page)
+        shows = int(shows or 0)
+        clicks = int(clicks or 0)
+        shows_pos = int(shows_pos or 0)
+        position = (pos_w / shows_pos) if (pos_w is not None and shows_pos > 0) else None
+        by_page.setdefault(path, {})[source] = {"shows": shows, "clicks": clicks, "position": position}
+
+    rows: list[dict[str, Any]] = []
+    divergent_count = 0
+    for path, sources in sorted(by_page.items()):
+        gsc = sources.get("gsc")
+        webmaster = sources.get("webmaster")
+        if not gsc or not webmaster:
+            continue
+        if gsc["shows"] < _S21_MIN_SHOWS_FOR_COMPARISON or webmaster["shows"] < _S21_MIN_SHOWS_FOR_COMPARISON:
+            continue
+
+        gsc_ctr = (gsc["clicks"] / gsc["shows"]) if gsc["shows"] else None
+        wm_ctr = (webmaster["clicks"] / webmaster["shows"]) if webmaster["shows"] else None
+        position_gap = None
+        if gsc["position"] is not None and webmaster["position"] is not None:
+            position_gap = abs(gsc["position"] - webmaster["position"])
+        ctr_ratio = None
+        if gsc_ctr and wm_ctr:
+            ctr_ratio = max(gsc_ctr, wm_ctr) / min(gsc_ctr, wm_ctr)
+
+        divergent = bool(
+            (position_gap is not None and position_gap >= _S21_POSITION_GAP_THRESHOLD)
+            or (ctr_ratio is not None and ctr_ratio >= _S21_CTR_RATIO_THRESHOLD)
+        )
+        if divergent:
+            divergent_count += 1
+        rows.append({
+            "check_id": "S21",
+            "finding": "cross_system_divergence",
+            "page": path,
+            "gsc_shows": gsc["shows"],
+            "gsc_clicks": gsc["clicks"],
+            "gsc_position": round(gsc["position"], 2) if gsc["position"] is not None else None,
+            "gsc_ctr": round(gsc_ctr, 4) if gsc_ctr is not None else None,
+            "webmaster_shows": webmaster["shows"],
+            "webmaster_clicks": webmaster["clicks"],
+            "webmaster_position": round(webmaster["position"], 2) if webmaster["position"] is not None else None,
+            "webmaster_ctr": round(wm_ctr, 4) if wm_ctr is not None else None,
+            "position_gap": round(position_gap, 2) if position_gap is not None else None,
+            "ctr_ratio": round(ctr_ratio, 3) if ctr_ratio is not None else None,
+            "position_gap_threshold": _S21_POSITION_GAP_THRESHOLD,
+            "ctr_ratio_threshold": _S21_CTR_RATIO_THRESHOLD,
+            "cross_system_divergent": divergent,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    pages_compared = len(rows)
+    rows.insert(0, {
+        "check_id": "S21",
+        "finding": "summary",
+        "pages_compared": pages_compared,
+        "divergent_page_count": divergent_count,
+        "min_shows_threshold": _S21_MIN_SHOWS_FOR_COMPARISON,
+        "position_gap_threshold": _S21_POSITION_GAP_THRESHOLD,
+        "ctr_ratio_threshold": _S21_CTR_RATIO_THRESHOLD,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s21", rows, confidence_cap=confidence_cap)
+
+
+# ── S22 — контент получает органику, не переводит её в коммерческий раздел ──
+def _run_s22(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    """Автоматическая часть пересекается с S08 по данным (см. докстринг модуля,
+
+    разрыв 11) — здесь дополнительно считается доля кликов органики,
+    оседающая на страницах без единой вовлечённости (site-level агрегат,
+    которого нет в S08).
+    """
+    con = common.open_duckdb(paths)
+    try:
+        overall = con.execute(
+            "SELECT page, SUM(total_shows), SUM(total_clicks) FROM seo_queries GROUP BY page"
+        ).fetchall()
+        total_organic_clicks_row = con.execute(
+            "SELECT SUM(total_clicks) FROM seo_queries"
+        ).fetchone()
+        organic_by_page = _organic_visits_by_page(con)
+    finally:
+        con.close()
+
+    total_organic_clicks = int((total_organic_clicks_row or (0,))[0] or 0)
+    site_titles = _load_site_titles(canonical, paths)
+
+    rows: list[dict[str, Any]] = []
+    dead_end_count = 0
+    dead_end_clicks = 0
+    for page, shows, clicks in overall:
+        shows = int(shows or 0)
+        clicks = int(clicks or 0)
+        if shows < _S22_MIN_SHOWS_FOR_CHECK:
+            continue
+        path = _url_path(page)
+        organic_visits, engaged = organic_by_page.get(path, (0, 0))
+        if organic_visits < _S22_MIN_ORGANIC_VISITS_FOR_CHECK:
+            continue
+        no_conversion_path = engaged == 0
+        if no_conversion_path:
+            dead_end_count += 1
+            dead_end_clicks += clicks
+        context = site_titles.get(path, {})
+        rows.append({
+            "check_id": "S22",
+            "finding": "organic_page_without_conversion_path",
+            "page": page,
+            "total_shows": shows,
+            "total_clicks": clicks,
+            "organic_visits": organic_visits,
+            "organic_engaged_visits": engaged,
+            "no_conversion_path": bool(no_conversion_path),
+            "page_title": context.get("title"),
+            "page_h1": context.get("h1"),
+            "page_classification_available": False,
+            "min_shows_threshold": _S22_MIN_SHOWS_FOR_CHECK,
+            "min_organic_visits_threshold": _S22_MIN_ORGANIC_VISITS_FOR_CHECK,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    dead_end_click_share = (dead_end_clicks / total_organic_clicks) if total_organic_clicks else None
+    rows.insert(0, {
+        "check_id": "S22",
+        "finding": "summary",
+        "pages_evaluated": len(rows),
+        "dead_end_page_count": dead_end_count,
+        "dead_end_clicks": dead_end_clicks,
+        "total_organic_clicks": total_organic_clicks,
+        "dead_end_click_share": round(dead_end_click_share, 4) if dead_end_click_share is not None else None,
+        "page_classification_available": False,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s22", rows, confidence_cap=confidence_cap)
+
+
+# ── S23 — органические посадочные конвертируют хуже сопоставимых страниц ───
+def _organic_vs_other_by_page(con: Any) -> dict[str, tuple[int, int, int, int]]:
+    """{normalized_path: (organic_visits, organic_engaged, other_visits, other_engaged)}.
+
+    "Сопоставимая" группа — та же страница, другой трафик (source_group !=
+    organic): контролирует саму страницу, не требует внешней классификации
+    типа страницы (см. докстринг модуля, разрыв 11 — то же ограничение схемы).
+    """
+    rows = con.execute(
+        "SELECT entry_page, "
+        "COUNT(*) FILTER (WHERE source_group = 'organic') AS organic_visits, "
+        "COUNT(*) FILTER (WHERE source_group = 'organic' AND "
+        "(form_open OR form_submit OR call_click OR messenger_click)) AS organic_engaged, "
+        "COUNT(*) FILTER (WHERE source_group != 'organic') AS other_visits, "
+        "COUNT(*) FILTER (WHERE source_group != 'organic' AND "
+        "(form_open OR form_submit OR call_click OR messenger_click)) AS other_engaged "
+        "FROM visits GROUP BY entry_page"
+    ).fetchall()
+    out: dict[str, tuple[int, int, int, int]] = {}
+    for entry_page, ov, oe, otv, ote in rows:
+        path = _url_path(entry_page)
+        prev_ov, prev_oe, prev_otv, prev_ote = out.get(path, (0, 0, 0, 0))
+        out[path] = (
+            prev_ov + int(ov or 0), prev_oe + int(oe or 0),
+            prev_otv + int(otv or 0), prev_ote + int(ote or 0),
+        )
+    return out
+
+
+def _run_s23(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
+    con = common.open_duckdb(paths)
+    try:
+        by_page = _organic_vs_other_by_page(con)
+        seo_shows_by_path = _seo_shows_clicks_by_path(con)
+    finally:
+        con.close()
+
+    rows: list[dict[str, Any]] = []
+    worse_count = 0
+    for path, (ov, oe, otv, ote) in sorted(by_page.items()):
+        if ov < _S23_MIN_VISITS_FOR_COMPARISON or otv < _S23_MIN_VISITS_FOR_COMPARISON:
+            continue
+        organic_rate = oe / ov
+        other_rate = ote / otv
+        ratio = (organic_rate / other_rate) if other_rate else None
+        worse = ratio is not None and ratio <= _S23_ENGAGEMENT_GAP_RATIO
+        if worse:
+            worse_count += 1
+        seo_shows, _ = seo_shows_by_path.get(path, (0, 0))
+        rows.append({
+            "check_id": "S23",
+            "finding": "organic_underperforms_other_traffic",
+            "page": path,
+            "organic_visits": ov,
+            "organic_engaged_visits": oe,
+            "organic_engagement_rate": round(organic_rate, 4),
+            "other_traffic_visits": otv,
+            "other_traffic_engaged_visits": ote,
+            "other_traffic_engagement_rate": round(other_rate, 4),
+            "engagement_ratio_organic_to_other": round(ratio, 3) if ratio is not None else None,
+            "seo_total_shows": seo_shows,
+            "gap_ratio_threshold": _S23_ENGAGEMENT_GAP_RATIO,
+            "min_visits_threshold": _S23_MIN_VISITS_FOR_COMPARISON,
+            "organic_significantly_worse": bool(worse),
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    rows.insert(0, {
+        "check_id": "S23",
+        "finding": "summary",
+        "pages_evaluated": len(rows),
+        "pages_organic_worse": worse_count,
+        "min_visits_threshold": _S23_MIN_VISITS_FOR_COMPARISON,
+        "gap_ratio_threshold": _S23_ENGAGEMENT_GAP_RATIO,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s23", rows, confidence_cap=confidence_cap)
+
+
+# ── S24 — высококонверсионные SEO-страницы теряют видимость ────────────────
+def _run_s24(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
+    """Соединяет тренд S05 (падение показов/кликов по месяцам) с органической
+
+    вовлечённостью страницы (та же вовлечённость, что S08/S22) — кандидат,
+    только если страница ОДНОВРЕМЕННО теряет видимость И уже доказала свою
+    коммерческую ценность (высокая вовлечённость), а не любая падающая страница.
+    """
+    con = common.open_duckdb(paths)
+    try:
+        by_page_month = con.execute(
+            "SELECT page, month, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
+            "GROUP BY page, month"
+        ).fetchall()
+        organic_by_page = _organic_visits_by_page(con)
+    finally:
+        con.close()
+
+    by_page: dict[str, dict[str, tuple[int, int]]] = {}
+    for page, month, shows, clicks in by_page_month:
+        by_page.setdefault(page, {})[month] = (int(shows or 0), int(clicks or 0))
+
+    rows: list[dict[str, Any]] = []
+    losing_visibility_count = 0
+    for page, months_map in sorted(by_page.items()):
+        months = sorted(months_map)
+        if len(months) < 2:
+            continue
+        mid = len(months) // 2
+        early_months, late_months = months[:mid], months[mid:]
+        early_shows = sum(months_map[m][0] for m in early_months)
+        early_clicks = sum(months_map[m][1] for m in early_months)
+        late_clicks = sum(months_map[m][1] for m in late_months)
+        if early_shows < _S24_MIN_SHOWS_FOR_TREND:
+            continue
+
+        path = _url_path(page)
+        organic_visits, engaged = organic_by_page.get(path, (0, 0))
+        if organic_visits < _S24_MIN_ORGANIC_VISITS_FOR_CHECK:
+            continue
+
+        click_ratio = (late_clicks / early_clicks) if early_clicks > 0 else None
+        declining = click_ratio is not None and click_ratio <= _S24_DECLINE_CLICK_RATIO
+        engagement_rate = engaged / organic_visits
+        high_value = engagement_rate >= _S24_HIGH_ENGAGEMENT_RATE
+        losing_visibility = bool(declining and high_value)
+        if losing_visibility:
+            losing_visibility_count += 1
+
+        rows.append({
+            "check_id": "S24",
+            "finding": "high_value_page_losing_visibility",
+            "page": page,
+            "months_available": months,
+            "early_clicks": early_clicks,
+            "late_clicks": late_clicks,
+            "click_ratio_late_to_early": round(click_ratio, 3) if click_ratio is not None else None,
+            "decline_ratio_threshold": _S24_DECLINE_CLICK_RATIO,
+            "organic_visits": organic_visits,
+            "organic_engaged_visits": engaged,
+            "organic_engagement_rate": round(engagement_rate, 4),
+            "high_engagement_rate_threshold": _S24_HIGH_ENGAGEMENT_RATE,
+            "page_declining": bool(declining),
+            "high_value_page": bool(high_value),
+            "losing_visibility_candidate": losing_visibility,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    rows.insert(0, {
+        "check_id": "S24",
+        "finding": "summary",
+        "pages_evaluated": len(rows),
+        "losing_visibility_candidates": losing_visibility_count,
+        "min_shows_threshold": _S24_MIN_SHOWS_FOR_TREND,
+        "min_organic_visits_threshold": _S24_MIN_ORGANIC_VISITS_FOR_CHECK,
+        "high_engagement_rate_threshold": _S24_HIGH_ENGAGEMENT_RATE,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s24", rows, confidence_cap=confidence_cap)
+
+
+# ── S25 — сниппет не использует структурированные данные/элементы выдачи ───
+def _run_s25(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    """Структурированных данных/типа сниппета нет в canonical-схеме (см.
+
+    докстринг модуля, разрыв 12) — автоматическая часть ограничена CTR-
+    аномалией внутри позиций 1-10 (тот же метод, что S04); финальный вердикт
+    остаётся за ручной SERP-проверкой (сама формулировка проверки в каталоге
+    её требует).
+    """
+    con = common.open_duckdb(paths)
+    try:
+        groups = _aggregate_query_page(con)
+    finally:
+        con.close()
+
+    site_titles = _load_site_titles(canonical, paths)
+
+    candidates = [
+        g for g in groups
+        if g["shows"] >= _S25_MIN_SHOWS_FOR_ROW
+        and g["position"] is not None
+        and g["position"] <= _S25_MAX_POSITION_FOR_SNIPPET_CHECK
+    ]
+
+    rows: list[dict[str, Any]] = []
+    gap_count = 0
+    if len(candidates) >= _S25_MIN_QUERIES_FOR_MEDIAN:
+        ctrs = [g["clicks"] / g["shows"] for g in candidates if g["shows"] > 0]
+        median_ctr = _median(ctrs)
+        if median_ctr is not None and median_ctr > 0:
+            for g in candidates:
+                ctr = g["clicks"] / g["shows"] if g["shows"] else None
+                ratio = (ctr / median_ctr) if ctr is not None else None
+                gap = ratio is not None and ratio <= _S25_CTR_LOW_RATIO
+                if gap:
+                    gap_count += 1
+                path = _url_path(g["page"])
+                context = site_titles.get(path, {})
+                rows.append({
+                    "check_id": "S25",
+                    "finding": "serp_feature_gap_candidate",
+                    "query": g["query"],
+                    "page": g["page"],
+                    "total_shows": g["shows"],
+                    "total_clicks": g["clicks"],
+                    "avg_position": round(g["position"], 2),
+                    "ctr": round(ctr, 4) if ctr is not None else None,
+                    "page1_median_ctr": round(median_ctr, 4),
+                    "ctr_to_median_ratio": round(ratio, 3) if ratio is not None else None,
+                    "low_ctr_ratio_threshold": _S25_CTR_LOW_RATIO,
+                    "snippet_gap_candidate": bool(gap),
+                    "page_title": context.get("title"),
+                    "structured_data_field_available": False,
+                    "manual_serp_check_required": True,
+                    "confidence": _cap("MED", confidence_cap),
+                })
+
+    rows.insert(0, {
+        "check_id": "S25",
+        "finding": "summary",
+        "page1_queries_evaluated": len(candidates),
+        "snippet_gap_candidates": gap_count,
+        "min_shows_threshold": _S25_MIN_SHOWS_FOR_ROW,
+        "min_queries_for_median_threshold": _S25_MIN_QUERIES_FOR_MEDIAN,
+        "max_position_for_check": _S25_MAX_POSITION_FOR_SNIPPET_CHECK,
+        "structured_data_field_available": False,
+        "manual_serp_check_required": True,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s25", rows, confidence_cap=confidence_cap)
+
+
+# ── S26 — геоспрос не покрыт отдельными релевантными страницами ────────────
+def _run_s26(canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    """requires=[wordstat, seo_queries] — wordstat структурно недоступен (тот
+
+    же прецедент, что S07 в этом же модуле, см. докстринг модуля, разрыв 1 и
+    13), поэтому проверка всегда пишет "ядро не посчитано", независимо от
+    confidence_cap/runnable_ids.
+    """
+    if "wordstat" in canonical and _table_nonempty(canonical["wordstat"]):
+        _write_unavailable(
+            metrics_dir, "S26",
+            "ядро не посчитано: источник wordstat не готов — wordstat "
+            "доступен в canonical, но у extract/wordstat.py нет "
+            "задокументированной схемы столбцов (см. докстринг transform) — "
+            "сопоставить гео-спрос с картой страниц нечем",
+        )
+        return
+    _write_unavailable(
+        metrics_dir, "S26",
+        "ядро не посчитано: источник wordstat не готов — wordstat.parquet не "
+        "строится в canonical-слое (src/extract/wordstat.py объявляет "
+        "canonical_tables=['wordstat'], но build_canonical.py эту таблицу не "
+        "собирает) — гео-спрос сопоставить с картой страниц нечем",
+    )
+
+
+# ── S27 — JS-контент или ссылки недоступны поисковому роботу ───────────────
+def _load_site_pages_js_diff(canonical: dict[str, Path], paths: Any) -> dict[str, dict[str, Any]]:
+    """{нормализованный_путь: {url, js_content_diff_raw}} из site_pages.
+
+    Отдельный загрузчик от _load_site_pages_full/_load_site_titles (см. их
+    докстринги) — им js_content_diff не нужен, здесь нужен только он.
+    """
+    if "site_pages" not in canonical or not _table_nonempty(canonical["site_pages"]):
+        return {}
+    con = common.open_duckdb(paths)
+    try:
+        rows = con.execute("SELECT url, js_content_diff FROM site_pages").fetchall()
+    finally:
+        con.close()
+    out: dict[str, dict[str, Any]] = {}
+    for url, js_content_diff in rows:
+        path = _url_path(url)
+        if path in out:
+            continue
+        out[path] = {"url": url, "js_content_diff_raw": js_content_diff}
+    return out
+
+
+def _run_s27(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    """Реализует компонент, зарезервированный в докстрине модуля (разрыв 6 и
+
+    14): js_content_diff относится к S27, не к S11 (data-export-spec-v2.md
+    §G1). Без site_pages либо без заполненного js_content_diff ядро не
+    считается — явная unavailable-запись (промт задачи 5bC), не тихий пропуск.
+    """
+    site_pages = _load_site_pages_js_diff(canonical, paths)
+    if not site_pages:
+        _write_unavailable(
+            metrics_dir, "S27",
+            "ядро не посчитано: источник site_crawl (обход сайта) не готов — "
+            "сравнить исходный HTML и отрендеренный контент нечем",
+        )
+        return
+
+    parsed: dict[str, dict[str, Any]] = {}
+    for path, info in site_pages.items():
+        raw = info.get("js_content_diff_raw")
+        diff = None
+        if raw:
+            try:
+                diff = json.loads(raw)
+            except (TypeError, ValueError):
+                diff = None
+        if diff is not None:
+            parsed[path] = {"url": info["url"], "diff": diff}
+
+    if not parsed:
+        _write_unavailable(
+            metrics_dir, "S27",
+            "ядро не посчитано: источник site_crawl не готов — js_content_diff "
+            "не заполнен ни на одной обойдённой странице (headless-рендеринг "
+            "не выполнялся, playwright недоступен в среде обхода, либо сайт "
+            "полностью SSR — различить эти причины нечем без записи в "
+            "manifest обхода, см. src/extract/site_crawl.py: headless_stats)",
+        )
+        return
+
+    con = common.open_duckdb(paths)
+    try:
+        shows_by_path = _seo_shows_clicks_by_path(con)
+    finally:
+        con.close()
+
+    rows: list[dict[str, Any]] = []
+    candidate_count = 0
+    for path, entry in sorted(parsed.items()):
+        shows, clicks = shows_by_path.get(path, (0, 0))
+        if shows < _S27_MIN_SHOWS_FOR_CHECK:
+            continue
+        diff = entry["diff"]
+        links_only_in_rendered = diff.get("links_only_in_rendered") or []
+        text_changed = bool(diff.get("text_changed"))
+        candidate = bool(text_changed or links_only_in_rendered)
+        if candidate:
+            candidate_count += 1
+        rows.append({
+            "check_id": "S27",
+            "finding": "js_rendering_gap_candidate",
+            "page": entry["url"],
+            "total_shows": shows,
+            "total_clicks": clicks,
+            "text_changed": text_changed,
+            "links_only_in_rendered_count": len(links_only_in_rendered),
+            "raw_link_count": diff.get("raw_link_count"),
+            "rendered_link_count": diff.get("rendered_link_count"),
+            "min_shows_threshold": _S27_MIN_SHOWS_FOR_CHECK,
+            "js_rendering_gap_candidate": candidate,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    rows.insert(0, {
+        "check_id": "S27",
+        "finding": "summary",
+        "pages_with_js_diff_data": len(parsed),
+        "pages_evaluated": len(rows),
+        "js_rendering_gap_candidates": candidate_count,
+        "min_shows_threshold": _S27_MIN_SHOWS_FOR_CHECK,
+        "crawl_coverage_caveat": _CRAWL_COVERAGE_CAVEAT,
+        "confidence": _cap("MED", confidence_cap),
+    })
+
+    common.write_metric_artifact(metrics_dir, "s27", rows, confidence_cap=confidence_cap)
+
+
 # ── Диспетчер блока ──────────────────────────────────────────────────────────
 def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[str]:
-    """Выполнить S01-S10 из числа доступных; вернуть имена записанных артефактов.
+    """Выполнить S01-S27 из числа доступных; вернуть имена записанных артефактов.
 
-    S11-S27 не реализуются этой задачей (см. докстринг модуля).
+    Блок 4 полностью реализован (задачи 5bA/5bB/5bC, см. докстринг модуля).
     """
     canonical = common.load_canonical(paths)
     caps = _confidence_caps(paths)
@@ -2070,5 +2703,34 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
     if "S20" in runnable_ids and has_seo:
         _run_s20(paths, defaults, canonical, caps.get("S20", "HIGH"), metrics_dir)
         artifacts.append("s20")
+
+    # ── Задача 5bC: S21-S27 ──────────────────────────────────────────────────
+    if "S21" in runnable_ids and has_seo:
+        _run_s21(paths, caps.get("S21", "HIGH"), metrics_dir)
+        artifacts.append("s21")
+
+    if "S22" in runnable_ids and has_seo and has_visits:
+        _run_s22(paths, canonical, caps.get("S22", "HIGH"), metrics_dir)
+        artifacts.append("s22")
+
+    if "S23" in runnable_ids and has_seo and has_visits:
+        _run_s23(paths, caps.get("S23", "HIGH"), metrics_dir)
+        artifacts.append("s23")
+
+    if "S24" in runnable_ids and has_seo and has_visits:
+        _run_s24(paths, caps.get("S24", "HIGH"), metrics_dir)
+        artifacts.append("s24")
+
+    if "S25" in runnable_ids and has_seo:
+        _run_s25(paths, canonical, caps.get("S25", "HIGH"), metrics_dir)
+        artifacts.append("s25")
+
+    if "S26" in runnable_ids and has_seo:
+        _run_s26(canonical, caps.get("S26", "HIGH"), metrics_dir)
+        artifacts.append("s26")
+
+    if "S27" in runnable_ids and has_seo:
+        _run_s27(paths, canonical, caps.get("S27", "HIGH"), metrics_dir)
+        artifacts.append("s27")
 
     return artifacts
