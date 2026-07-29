@@ -25,6 +25,18 @@ manual_source_confidence_cap: "MED"   # ни одна проверка, чьи r
 crux_min_field_data: true             # если CrUX не отдал полевые данные —
                                        # находки CWV капаются в MED автоматически
 
+block4_seo:
+  # S07 (каталог v2 §9, строка 263: "Сопоставить кластеры Wordstat/GSC с
+  # картой страниц", источник "Wordstat + GSC + сайт"). Минимальный
+  # суммарный спрос (SUM(wordstat.count) за период) кластера scope==
+  # 'gap-specific', чтобы отсутствие релевантной страницы считалось
+  # материальной находкой, а не шумом единичных показов (тот же порядок
+  # величины, что _MIN_SHOWS_FOR_OPPORTUNITY в src/compute/block4_seo.py —
+  # независимая эвристика, каталог точного числа не даёт). S26 использует
+  # свой собственный хардкод того же значения — вне scope этого ключа
+  # (FIX-s07-site-pages-join, S26 требует отдельного фикса с позициями/гео).
+  s07_min_demand_count: 20
+
 transform:
   # T02/T03: carry-forward источника трафика для internal/undefined визитов
   # (см. marketing-diagnostics-methodology-v2.md §5). Сколько дней истории

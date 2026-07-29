@@ -3,10 +3,15 @@
 По каждой проверке — минимум один сценарий. Обязательные сценарии из промта
 задачи 5bA: device есть -> device-разрез считается (S08/S09); device="unknown"
 -> исключается только из device-специфичных находок, но участвует в остальных
-агрегатах (не выбрасывается целиком). Плюс: S07/S26 всегда unavailable
-(wordstat структурно недоступен), confidence_cap из degradation_report
+агрегатах (не выбрасывается целиком). confidence_cap из degradation_report
 применяется. Задача 5bC добавляет S21-S27 и агрегат SEO confidence_cap в
 metrics_summary (src.compute.common.build_metrics_summary).
+
+Задача FIX-block4-seo-wordstat-consumption (после FIX-wordstat-canonical):
+S07/S26 без canonical["wordstat"] по-прежнему unavailable, но с ним считают
+реальный кластер-спрос-vs-карта-страниц (см. _write_wordstat/_base_wordstat_row
+ниже); S06 поднимает confidence до MED, когда Wordstat реально подтверждает
+или опровергает сезонное объяснение аномалии показов.
 """
 
 from __future__ import annotations
@@ -61,6 +66,23 @@ def _write_site_pages(paths: _Paths, rows: list[dict]) -> None:
 def _write_link_graph(paths: _Paths, rows: list[dict]) -> None:
     paths.canonical.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_parquet(paths.canonical / "site_link_graph.parquet")
+
+
+def _write_wordstat(paths: _Paths, rows: list[dict]) -> None:
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(paths.canonical / "wordstat.parquet")
+
+
+def _base_wordstat_row(**overrides) -> dict:
+    row = {
+        "phrase": "phrase", "normalized_phrase": "phrase",
+        "date": "2026-01-01", "month": "2026-01",
+        "count": 0, "share": None, "purpose": "gap",
+        "seed_mask": "phrase", "scope": "gap-specific",
+        "top_requests_count": None,
+    }
+    row.update(overrides)
+    return row
 
 
 def _write_crux_raw(paths: _Paths, data: dict) -> None:
@@ -256,7 +278,61 @@ def test_s06_reports_trend_and_wordstat_unavailable(tmp_path):
     assert reconciliation["confidence"] == "LOW"
 
 
-# ── S07 — коммерческий спрос без посадочной: всегда unavailable ────────────
+def test_s06_confidence_rises_to_med_when_seasonality_confirmed(tmp_path):
+    """Wordstat повторяет тот же spike в том же месяце -> сезонность
+
+    подтверждена, confidence реально поднимается выше жёсткого LOW."""
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="q", page="/p", month=m, total_shows=s, total_clicks=10)
+        for m, s in [("2026-01", 100), ("2026-02", 100), ("2026-03", 100), ("2026-04", 300)]
+    ])
+    _write_wordstat(paths, [
+        _base_wordstat_row(phrase="q", normalized_phrase="q", month=m, date=f"{m}-01",
+                            count=c, purpose="seasonality", scope="gap-specific")
+        for m, c in [("2026-01", 100), ("2026-02", 100), ("2026-03", 100), ("2026-04", 300)]
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S06"})
+
+    assert "s06" in artifacts
+    rows = _read_metric(paths, "s06")
+    reconciliation = next(r for r in rows if r["finding"] == "seasonality_reconciliation")
+    assert reconciliation["wordstat_available"] is True
+    assert reconciliation["confidence"] == "MED"
+    assert reconciliation["verdict"] == "seasonality_explains_anomaly"
+    month_entry = next(m for m in reconciliation["months"] if m["month"] == "2026-04")
+    assert month_entry["seasonality_confirmed"] is True
+
+
+def test_s06_confidence_rises_to_med_when_seasonality_not_confirmed(tmp_path):
+    """Wordstat плоский в месяце SEO-аномалии -> сезонность НЕ подтверждена,
+
+    но confidence всё равно MED (реальная сверка состоялась, а не гипотеза)."""
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="q", page="/p", month=m, total_shows=s, total_clicks=10)
+        for m, s in [("2026-01", 100), ("2026-02", 100), ("2026-03", 100), ("2026-04", 300)]
+    ])
+    _write_wordstat(paths, [
+        _base_wordstat_row(phrase="q", normalized_phrase="q", month=m, date=f"{m}-01",
+                            count=100, purpose="seasonality", scope="gap-specific")
+        for m in ("2026-01", "2026-02", "2026-03", "2026-04")
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S06"})
+
+    rows = _read_metric(paths, "s06")
+    reconciliation = next(r for r in rows if r["finding"] == "seasonality_reconciliation")
+    assert reconciliation["confidence"] == "MED"
+    assert reconciliation["verdict"] == "anomaly_not_fully_explained_by_seasonality"
+    month_entry = next(m for m in reconciliation["months"] if m["month"] == "2026-04")
+    assert month_entry["seasonality_confirmed"] is False
+
+
+# ── S07 — коммерческий спрос без посадочной (FIX-s07-site-pages-join:
+# has_matching_query — старая логика по seo_queries.query; has_matching_page —
+# новая, через canonical["site_pages"] title/h1/url-путь) ──────────────────
 def test_s07_always_unavailable_wordstat_missing(tmp_path):
     paths = _Paths(tmp_path)
     _write_seo_queries(paths, [_base_seo_row(total_shows=100, total_clicks=10)])
@@ -267,6 +343,114 @@ def test_s07_always_unavailable_wordstat_missing(tmp_path):
     rows = _read_metric(paths, "s07")
     assert rows[0]["status"] == "unavailable"
     assert "wordstat" in rows[0]["reason"]
+
+
+def test_s07_unavailable_without_site_pages(tmp_path):
+    """wordstat доступен, но site_pages нет — unavailable с caveat "карта
+
+    страниц", НЕ тихий fallback на старую query-only логику.
+    """
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="аренда авто", page="/catalog/", total_shows=100, total_clicks=10),
+    ])
+    _write_wordstat(paths, [
+        _base_wordstat_row(phrase="прокат авто спб", normalized_phrase="прокат авто спб",
+                            count=30),
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S07"})
+
+    assert "s07" in artifacts
+    rows = _read_metric(paths, "s07")
+    assert rows[0]["status"] == "unavailable"
+    assert "карт" in rows[0]["reason"]
+    assert "site_pages" in rows[0]["reason"]
+
+
+def test_s07_reports_gap_candidates_without_query_or_page_match(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="аренда авто", page="/catalog/", total_shows=100, total_clicks=10),
+    ])
+    _write_site_pages(paths, [
+        _base_site_page(url="https://example.com/catalog/", title="Каталог авто", h1="Каталог"),
+    ])
+    _write_wordstat(paths, [
+        _base_wordstat_row(phrase="аренда авто", normalized_phrase="аренда авто",
+                            count=15, date="2026-01-01"),
+        _base_wordstat_row(phrase="аренда авто", normalized_phrase="аренда авто",
+                            count=10, date="2026-01-08"),
+        _base_wordstat_row(phrase="прокат авто спб", normalized_phrase="прокат авто спб",
+                            count=30),
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S07"})
+
+    assert "s07" in artifacts
+    rows = _read_metric(paths, "s07")
+    summary = rows[0]
+    assert summary["finding"] == "summary"
+    assert "status" not in summary
+    assert summary["clusters_evaluated"] == 2
+    assert summary["query_gap_candidate_count"] == 1
+    assert summary["gap_candidate_count"] == 1
+    assert summary["confidence"] == "MED"
+    candidate = next(
+        r for r in rows if r.get("finding") == "commercial_demand_without_landing_page"
+    )
+    assert candidate["normalized_phrase"] == "прокат авто спб"
+    assert candidate["demand_total"] == 30
+    assert candidate["has_matching_query"] is False
+    assert candidate["has_matching_page"] is False
+    assert candidate["confidence"] == "MED"
+
+
+def test_s07_page_match_without_query_match_is_not_a_finding(tmp_path):
+    """Ключевое отличие от старой реализации: кластер без query, но с
+
+    реальной релевантной страницей в site_pages (title/h1 покрывают все
+    слова фразы) — НЕ находка (страница есть, просто не ранжируется).
+    """
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="аренда авто", page="/catalog/", total_shows=100, total_clicks=10),
+    ])
+    _write_site_pages(paths, [
+        _base_site_page(
+            url="https://example.com/rental/", title="Прокат авто в Спб", h1="Прокат авто СПб",
+        ),
+    ])
+    _write_wordstat(paths, [
+        _base_wordstat_row(phrase="прокат авто спб", normalized_phrase="прокат авто спб",
+                            count=30),
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S07"})
+
+    assert "s07" in artifacts
+    rows = _read_metric(paths, "s07")
+    summary = rows[0]
+    assert summary["clusters_evaluated"] == 1
+    assert summary["query_gap_candidate_count"] == 1
+    assert summary["gap_candidate_count"] == 0
+    assert not any(r.get("finding") == "commercial_demand_without_landing_page" for r in rows)
+
+
+def test_s07_below_min_demand_threshold_not_a_candidate(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [_base_seo_row(query="unrelated", total_shows=100, total_clicks=10)])
+    _write_site_pages(paths, [_base_site_page(url="https://example.com/other/")])
+    _write_wordstat(paths, [
+        _base_wordstat_row(phrase="редкая фраза", normalized_phrase="редкая фраза", count=5),
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S07"})
+
+    rows = _read_metric(paths, "s07")
+    summary = rows[0]
+    assert summary["clusters_evaluated"] == 0
+    assert summary["gap_candidate_count"] == 0
 
 
 # ── S08 — страница не соответствует намерению запроса (device-разрез) ──────
@@ -850,6 +1034,30 @@ def test_s26_always_unavailable_wordstat_missing(tmp_path):
     assert rows[0]["status"] == "unavailable"
     assert "wordstat" in rows[0]["reason"]
     assert "ядро не посчитано" in rows[0]["reason"]
+
+
+def test_s26_reports_geo_candidates_when_wordstat_available(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="аренда авто", page="/catalog/", total_shows=100, total_clicks=10),
+    ])
+    _write_wordstat(paths, [
+        _base_wordstat_row(phrase="аренда авто", normalized_phrase="аренда авто", count=25),
+        _base_wordstat_row(phrase="прокат авто спб", normalized_phrase="прокат авто спб", count=30),
+    ])
+
+    artifacts = block4_seo.run(paths, DEFAULTS, {"S26"})
+
+    assert "s26" in artifacts
+    rows = _read_metric(paths, "s26")
+    summary = rows[0]
+    assert "status" not in summary
+    assert summary["geo_dimension_available"] is False
+    assert summary["gap_candidate_count"] == 1
+    candidate = next(r for r in rows if r.get("finding") == "geo_demand_without_landing_page")
+    assert candidate["normalized_phrase"] == "прокат авто спб"
+    assert candidate["geo_dimension_available"] is False
+    assert candidate["confidence"] == "MED"
 
 
 # ── S27 — JS-контент или ссылки недоступны поисковому роботу ───────────────

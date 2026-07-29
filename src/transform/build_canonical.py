@@ -31,8 +31,12 @@ client_answers и webvisor_findings НЕ трансформируются — э
 которые compute/analyze читают напрямую из inputs/ клиента; их доступность
 учитывает src.pipeline.degradation, а не этот модуль.
 
-wordstat.parquet вне контракта этой задачи (схема не задана) — сырьё
-data/raw/wordstat/ пока не трансформируется.
+wordstat.parquet строится через build_wordstat() (LEFT JOIN wordstat_weekly +
+wordstat_core_queries по normalized_phrase — см. докстринг build_wordstat).
+Потребление конкретных колонок этой таблицы в src/compute/block4_seo.py
+(S06/S07/S26) вне контракта этой задачи (block4_seo.py не в allowed_files
+задачи FIX-wordstat-canonical, см. docs/implementation_status.md) — та
+проверка проверяет только наличие/непустоту таблицы, колонки не читает.
 
 Каноническая схема — единственный контракт между transform и compute.
 
@@ -1697,6 +1701,76 @@ def build_crm(crm_dir: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ═══════════════════════════ Чтение сырья: wordstat ═══════════════════════════
+def _wordstat_purpose_to_string(value: Any) -> str | None:
+    """purpose (список ролей отбора фразы — gap/seasonality) -> comma-joined строка.
+
+    Тот же приём, что conditions_raw в build_goals: непримитивное raw-поле
+    сериализуется в string, т.к. SCHEMAS/_ARROW_TYPES не несёт list-типов.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value or None
+    try:
+        items = list(value)
+    except TypeError:
+        return str(value)
+    items = [str(v).strip() for v in items if v is not None and str(v).strip()]
+    return ",".join(sorted(items)) if items else None
+
+
+def build_wordstat(wordstat_dir: Path) -> pd.DataFrame:
+    """data/raw/wordstat/{wordstat_weekly,wordstat_core_queries}.parquet -> wordstat.
+
+    LEFT JOIN недельного временного ряда спроса (wordstat_weekly — WEEKLY_FIELDS,
+    см. src/extract/wordstat.py) с метаданными отбора фразы (wordstat_core_queries —
+    CORE_FIELDS) по normalized_phrase: обе сырые таблицы описывают одну и ту же
+    отобранную фразу target_queries с разных сторон — weekly несёт временной ряд
+    (count/share по датам), core_queries — почему фраза попала в отбор (seed_mask,
+    scope: junk|general|gap-specific, top_requests_count). Без core_queries (файла
+    нет/пуст) join не выполняется — seed_mask/scope/top_requests_count остаются
+    null, сама weekly-часть таблицы всё равно строится (core_queries — контекст
+    отбора, не обязательное условие для канонической строки).
+
+    month — вычисляемая колонка (date.strftime("%Y-%m"), тот же приём, что
+    build_direct_geo) — общий ключ с seo_queries.month для будущей сверки в
+    compute (S06 — сезонность, S07/S26 — requires=[wordstat, seo_queries]).
+
+    purpose — список ролей в сыром parquet -> comma-joined строка (см.
+    _wordstat_purpose_to_string).
+    """
+    weekly_path = wordstat_dir / "wordstat_weekly.parquet"
+    if not weekly_path.exists():
+        return pd.DataFrame()
+    weekly = pd.read_parquet(weekly_path)
+    if weekly.empty:
+        return pd.DataFrame()
+
+    weekly = weekly.copy()
+    weekly["purpose"] = weekly["purpose"].apply(_wordstat_purpose_to_string)
+    parsed_date = pd.to_datetime(weekly["date"], errors="coerce")
+    weekly["month"] = parsed_date.dt.strftime("%Y-%m")
+    weekly["date"] = parsed_date.dt.date
+
+    core_path = wordstat_dir / "wordstat_core_queries.parquet"
+    core = pd.read_parquet(core_path) if core_path.exists() else pd.DataFrame()
+
+    if not core.empty:
+        # normalized_phrase уникален по построению extract (ключ target_queries) —
+        # drop_duplicates только защищает от нарушения этого инварианта сырьём.
+        core_cols = core[["normalized_phrase", "seed_mask", "scope", "top_requests_count"]]
+        core_cols = core_cols.drop_duplicates(subset="normalized_phrase", keep="first")
+        merged = weekly.merge(core_cols, on="normalized_phrase", how="left")
+    else:
+        merged = weekly
+        merged["seed_mask"] = None
+        merged["scope"] = None
+        merged["top_requests_count"] = None
+
+    return merged
+
+
 # ═════════════════════════════ Запись parquet ═══════════════════════════════
 _ARROW_TYPES: dict[str, pa.DataType] = {
     "string": pa.string(),
@@ -1821,6 +1895,15 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "goal_id": "string", "name": "string", "type": "string",
         "url_pattern": "string", "conditions_raw": "string",
         "created_at": "timestamp", "updated_at": "timestamp",
+    },
+    "wordstat": {
+        "phrase": "string", "normalized_phrase": "string",
+        "date": "date", "month": "string",
+        "count": "int", "share": "float",
+        "purpose": "string",   # comma-joined: "gap" | "seasonality" | "gap,seasonality"
+        "seed_mask": "string",
+        "scope": "string",     # junk | general | gap-specific
+        "top_requests_count": "int",
     },
 }
 
@@ -2023,6 +2106,12 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
         if not seo_df.empty:
             write_canonical_table(seo_df, "seo_queries", canonical_dir / "seo_queries.parquet")
             built.append("seo_queries")
+
+    if "wordstat" in sources:
+        ws_df = build_wordstat(raw_dir / "wordstat")
+        if not ws_df.empty:
+            write_canonical_table(ws_df, "wordstat", canonical_dir / "wordstat.parquet")
+            built.append("wordstat")
 
     if "crm" in sources:
         crm_df = build_crm(raw_dir / "crm")

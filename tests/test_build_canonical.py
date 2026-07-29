@@ -2174,3 +2174,112 @@ def test_build_wires_goals_table_and_qa_caveat(tmp_path):
     assert canonical_manifest["flags"]["goals_qa"] == {
         "missing_in_visits": ["999"], "mismatch": True,
     }
+
+
+# ═══════════════════════════ build_wordstat (FIX-wordstat-canonical) ═══════
+def _write_wordstat_fixture(raw_dir: Path, *, with_core: bool = True) -> None:
+    """Пишет data/raw/wordstat/{wordstat_weekly,wordstat_core_queries}.parquet
+    в формате, который реально пишет src/extract/wordstat.py (WEEKLY_FIELDS/
+    CORE_FIELDS, C.write_table с fmt="parquet")."""
+    out_dir = raw_dir / "wordstat"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    weekly_rows = [
+        {"phrase": "аренда авто", "normalized_phrase": "аренда авто",
+         "date": "2026-06-01", "count": 100, "share": 0.01, "purpose": ["gap"]},
+        {"phrase": "аренда авто", "normalized_phrase": "аренда авто",
+         "date": "2026-06-08", "count": 120, "share": 0.012, "purpose": ["gap"]},
+        {"phrase": "прокат авто спб", "normalized_phrase": "прокат авто спб",
+         "date": "2026-06-01", "count": 30, "share": 0.003,
+         "purpose": ["gap", "seasonality"]},
+    ]
+    pd.DataFrame(weekly_rows, columns=[
+        "phrase", "normalized_phrase", "date", "count", "share", "purpose",
+    ]).to_parquet(out_dir / "wordstat_weekly.parquet", index=False)
+
+    if with_core:
+        core_rows = [
+            {"phrase": "аренда авто", "normalized_phrase": "аренда авто",
+             "seed_mask": "аренда авто", "purpose": ["gap"],
+             "scope": "gap-specific", "top_requests_count": 5000},
+            {"phrase": "прокат авто спб", "normalized_phrase": "прокат авто спб",
+             "seed_mask": "аренда авто", "purpose": ["gap", "seasonality"],
+             "scope": "gap-specific", "top_requests_count": 800},
+        ]
+        pd.DataFrame(core_rows, columns=[
+            "phrase", "normalized_phrase", "seed_mask", "purpose", "scope",
+            "top_requests_count",
+        ]).to_parquet(out_dir / "wordstat_core_queries.parquet", index=False)
+
+
+def test_build_wordstat_joins_weekly_with_core_queries(tmp_path):
+    raw_dir = tmp_path / "data" / "raw"
+    _write_wordstat_fixture(raw_dir)
+
+    df = bc.build_wordstat(raw_dir / "wordstat")
+
+    assert len(df) == 3
+    assert set(df["month"]) == {"2026-06"}
+    row = df[
+        (df["normalized_phrase"] == "аренда авто") & (df["date"] == date(2026, 6, 1))
+    ].iloc[0]
+    assert row["count"] == 100
+    assert row["seed_mask"] == "аренда авто"
+    assert row["scope"] == "gap-specific"
+    assert row["top_requests_count"] == 5000
+    assert row["purpose"] == "gap"
+
+    multi_purpose = df[df["normalized_phrase"] == "прокат авто спб"].iloc[0]
+    assert multi_purpose["purpose"] == "gap,seasonality"
+
+
+def test_build_wordstat_without_core_queries_leaves_metadata_null(tmp_path):
+    raw_dir = tmp_path / "data" / "raw"
+    _write_wordstat_fixture(raw_dir, with_core=False)
+
+    df = bc.build_wordstat(raw_dir / "wordstat")
+
+    assert len(df) == 3
+    assert df["seed_mask"].isna().all()
+    assert df["scope"].isna().all()
+    assert df["top_requests_count"].isna().all()
+
+
+def test_build_wordstat_missing_raw_dir_returns_empty(tmp_path):
+    raw_dir = tmp_path / "data" / "raw"
+    df = bc.build_wordstat(raw_dir / "wordstat")
+    assert df.empty
+
+
+def test_build_writes_wordstat_via_orchestrator(tmp_path):
+    """Сквозной тест: build() строит wordstat.parquet, когда источник в манифесте."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    _write_wordstat_fixture(paths.raw)
+
+    manifest_mod.update_source(
+        paths.raw, "wordstat", date_from="2026-06-01", date_to="2026-06-30",
+        rows=3, script_version="test", canonical_tables=["wordstat"],
+    )
+
+    built = bc.build(paths, {"brand_terms": []}, {"utm_undefined_threshold": 0.25})
+    assert "wordstat" in built
+
+    import pyarrow.parquet as pq
+    schema = pq.read_schema(paths.canonical / "wordstat.parquet")
+    for col in ("phrase", "normalized_phrase", "date", "month", "count", "share",
+                "purpose", "seed_mask", "scope", "top_requests_count"):
+        assert col in schema.names
+
+    ws = pd.read_parquet(paths.canonical / "wordstat.parquet")
+    assert len(ws) == 3
+    assert set(ws["scope"]) == {"gap-specific"}
+
+
+def test_build_skips_wordstat_when_source_absent(tmp_path):
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+
+    built = bc.build(paths, {"brand_terms": []}, {"utm_undefined_threshold": 0.25})
+    assert "wordstat" not in built
+    assert not (paths.canonical / "wordstat.parquet").exists()

@@ -21,14 +21,14 @@
 | **2A-patch-2** | DONE    | 2026-07-22: устранена зависимость, оставленная 2A-patch. `src/transform/build_canonical.py` больше не хардкодит `ym:s:regionCity` — новый `_resolve_region_field(manifest_metrika_entry)` читает `manifest.region_field` (записан extract в задаче 2A-patch: `ym:s:regionArea`, если API его принял, либо откат `ym:s:regionCity`, если отклонил); отсутствующий ключ (manifest до 2A-patch) -> откат на исторический `ym:s:regionCity` (константа `_REGION_FIELD_LEGACY_DEFAULT`), а не пустая колонка. Имя поля прокинуто через `_parse_visit_row`, `_parse_backfill_row`, `_read_metrika_backfill`, `_join_backfill`, `build_visits` (новый опциональный параметр `manifest_metrika_entry`); `build()` передаёт `sources.get("metrika_logs")` из `data/raw/manifest.json`. Оба ранее падавших теста (`tests/test_extract_smoke.py::test_metrika_logs_writes_raw_and_manifest`, `tests/test_build_canonical.py::test_dedupe_new_fields_use_last_dt_row`) обновлены под `regionArea` (не откат назад на `regionCity`) — pass. Новые тесты в `tests/test_build_canonical.py`: `test_region_field_falls_back_to_region_city_when_not_verified` (manifest `region_field_verified=false` -> raw CSV реально с колонкой `regionCity` -> canonical читает её, не `None`) и `test_region_field_defaults_to_region_city_without_manifest_entry` (manifest без записи `region_field` вовсе -> тот же откат) — обе pass. Полный `pytest tests/`: **443 passed, 9 failed** — все 9 pre-existing и не связаны с этой задачей (gsc_manual×3, webmaster_manual×2, wordstat legacy×2, metrika_logs×2 `lastSignhasGCLID` в `test_extract_smoke.py`, вне allowed_files). |
 | **2A-direct-strategy-fix** | DONE | 2026-07-22: чинит невалидный FieldNames в `campaigns.get`, обнаруженный боевым прогоном (error 8000, `clients/pognali.rent/logs/extract_20260722_012238.log:63` — API вернул полный enum допустимых значений, "Strategy" среди них нет). `src/extract/direct.py`: `"Strategy"` убран из `CAMPAIGN_FIELD_NAMES`; новая `CAMPAIGNS_FIELD_NAMES_ENUM` (frozenset, взят дословно из текста ошибки) + `_validate_field_names()` — сверяет FieldNames с этим enum ДО отправки запроса и логирует отфильтрованные невалидные имена (не после ответа API), так что опечатка/устаревшее поле больше не роняет источник целиком. `BiddingStrategy` запрашивается отдельным параметром `TextCampaignFieldNames: ["BiddingStrategy"]` в `_fetch_strategies` (TEXT_CAMPAIGN — единственный тип кампаний у клиента сейчас; MOBILE_APP_CAMPAIGN/CPM_BANNER_CAMPAIGN/UNIFIED_CAMPAIGN потребуют свой `*CampaignFieldNames` — известное ограничение, не реализовано). `_strategy_field_present`/`_strategy_field_samples` переписаны читать вложенный `TextCampaign.BiddingStrategy` (через новый `_text_campaign_bidding_strategy()`), а не плоское поле `Strategy` верхнего уровня. `tests/test_direct_2a_strategy.py` обновлён под новый контракт (ломающее изменение, зафиксированное этой задачей): запрос содержит `TextCampaignFieldNames`, не содержит `"Strategy"` в `FieldNames`; парсинг `BiddingStrategyType` из `Search` и `Network`; плоский верхнеуровневый `Strategy` больше не распознаётся; невалидное имя поля фильтруется до отправки запроса, не роняя источник. 36 тестов в `test_direct_2a_strategy.py` + `test_direct_2b_patch.py` — 34 pass, 2 pre-existing fail (`test_query_report_dimensions`, `test_geo_report_schema` — ожидают старую семантику `cost_normalized`, сломанную задачей 4X-direct-normalize-2, не связано с этой задачей). Полный `pytest tests/` (кроме `test_site_crawl*.py` — см. ниже) не показал новых регрессий: те же 11 pre-existing failures, что документированы в 4X-direct-normalize-2/2A-patch/3A-patch. **Побочная находка, не устранена (вне allowed_files):** `tests/test_site_crawl_pages.py` не собирается (`ImportError: cannot import name '_is_path_disallowed'`) — `src/extract/site_crawl.py` в рабочей копии не содержит функций robots.txt-парсинга, описанных как реализованные в записи задачи 3.5-patch этого же файла; похоже на параллельную правку того же файла в другой сессии поверх HEAD, не в скоупе и не в allowed_files этой задачи — не исправлялось. |
 | **2B** | DONE    | 2B-patch 2026-07-20: window truncation 180d, isolation, UTF-8 fix, 16 tests |
-| **2B-patch-2** | CODE DONE, live run pending | см. запись ниже — код + 30 тестов green (mock), реальный прогон на pognali.rent не выполнялся в этой сессии |
+| **2B-patch-2** | CONFIRMED (live) | см. запись ниже для кода; живой прогон 2026-07-22 20:22–20:28 (`clients/pognali.rent/logs/extract_20260722_202250.log`) отработал без error 4000/8000 для campaigns/queries/geo (`report_status` де-факто ok/ok/ok) — см. AUDIT-live-verification-status ниже |
 | **2C** | DONE    | — |
 | **2D** | DONE    | — |
 | **3A** | DONE    | build_canonical.py базовые преобразования. GSC manual path (task_id gsc-3A, task_id 3A-rewrite 2026-07-17): gsc_manual.py переписан под формат папок YYYY-MM/Запросы.csv/Диаграмма.csv/Страницы.csv/Устройства.csv. Выходной контракт seo_queries не изменился. column_map в config.yaml заполнен кириллическими заголовками GSC. tests/test_gsc_manual.py переписан: 9 тестов — 9 pass 2026-07-17. |
 | **3A-patch** | DONE    | 2026-07-22: gsc_manual.py — Запросы.csv теперь может быть комбинированным (query+page+device в одной строке сразу, contract 3A: `column_map["page"]`+`column_map["device"]` оба присутствуют в заголовке) — page/device берутся из строки, `incomplete_dimensions=false`; Страницы.csv в этом случае становится необязательным (page уже есть в Запросы.csv). Старый раздельный формат (только query) по-прежнему парсится без падения, но помечается caveat `incomplete_dimensions` + попадает в `incomplete_dimensions_months`/`device_missing_months` (manifest и report). Сверка кликов Диаграмма vs Запросы (>10% caveat) не менялась. Новый `docs/gsc_export_instructions.md` — как выбрать несколько измерений сразу в интерфейсе GSC перед экспортом. SCRIPT_VERSION 0.2.0→0.3.0. 4 новых теста в tests/test_gsc_manual.py (комбинированный формат, pages необязателен при комбинированном, legacy incomplete_dimensions=true, legacy всё ещё требует Страницы.csv) — 13/13 pass. BLOCKER: 3 старых теста в tests/test_extract_smoke.py (test_gsc_manual_validates_and_writes_same_contract, test_gsc_manual_total_clicks_ui_mismatch_becomes_caveat, test_gsc_manual_missing_device_column_flags_month) падают — это pre-existing из 3A-rewrite (2026-07-17), тестируют старый плоский формат gsc_YYYY-MM.csv без папок YYYY-MM, файл вне allowed_files этой задачи, не редактировался. |
 | **3B** | DONE    | webmaster_manual: переписан под wide-формат (Query×Url×YYYY-MM_cols); агрегация по (query,page), CTR пересчёт, DEMAND=max; manifest: has_page_column=true, page_device_breakdown=true, has_demand_column; tests/test_webmaster_manual.py (12 тестов) — 12 pass 2026-07-17. BLOCKER: build_seo_queries_webmaster (build_canonical.py:942) хардкодит page=None — page из JSON теряется в transform. |
 | **3C** | DONE    | — |
-| **3C-patch** | CODE DONE, live run pending | 2026-07-22: см. запись ниже — конфиг и подключение к оркестратору уже были на месте, добавлены тесты (ping + оркестратор-интеграция); реальный CRUX_API_KEY в этой сессии недоступен. |
+| **3C-patch** | CONFIRMED (live) | 2026-07-22: код+тесты см. запись ниже; реальный `CRUX_API_KEY` использован тем же днём позже — живой прогон 2026-07-22 17:23 UTC дал `cwv_field_data_available=true`, без `error` (`clients/pognali.rent/data/raw/crux/crux.json`, лог `extract_20260722_202250.log:95-102`) — см. AUDIT-live-verification-status ниже |
 | **3D** | DONE    | Побочных изменений нет: 3A/3B затрагивают build_canonical.py, 3C — scripts/verify_metrika.py; wordstat.py и crm_import.py не изменены. Git-репо отсутствует (проверка кодом). 39 тестов GSC/Webmaster/CrUX/Wordstat/CRM — 39 pass 2026-07-14. |
 | **3.5A** | DONE  | Каркас кролера без HTTP: src/extract/site_crawl.py (build_url_priority_list, resolve_max_urls, extract); crawl_seed_urls + crawl.max_urls=30 в _template/config.yaml; inputs/manual_cwv.yaml и inputs/manual_form_tests.yaml (meta/patterns/conclusions); manifest caveat при усечении. 20 тестов test_site_crawl.py — 20 pass 2026-07-14. |
 | **3.5B** | DONE  | HTTP-обход страниц: _MetaParser (stdlib html.parser), _parse_page_meta, _parse_sitemap_xml, fetch_sitemap, crawl_pages, write_pages_parquet, _resolve_base_url (crawl.base_url → webmaster.host_id). Выход pages.parquet по схеме PAGES_SCHEMA (url, http_status, redirect_chain, final_url, canonical_url, robots_directive, in_sitemap, title, description, h1, crawled_at). Фикстурный мини-сайт через MockSession/MockResponse без сетевых запросов. 37 тестов test_site_crawl_pages.py — 37 pass 2026-07-14. |
@@ -1460,3 +1460,569 @@ tests/test_methodology_goals_requires.py` — **84 passed**, 1 failed
 tests/test_analyze_draft_findings_llm.py tests/test_analyze_validate_findings.py
 tests/test_orchestrator_error_logging.py tests/test_smoke.py` — **59 passed**.
 Blocker: нет.
+
+**AUDIT-report-wiring** — аудит, без правок кода — 2026-07-29.
+`run_report` (`src/pipeline/orchestrator.py:567-574`) НЕ вызывает
+`build_report.build()`. Тело функции — только проверка гейта
+(`approved_findings_present`), `mkdir` для `report/` и одна строка лога:
+`"report: заглушка — src/report/build_report.py не реализован."`
+(orchestrator.py:573). Эта строка лога фактически неверна — `build_report.py`
+полностью реализован (задачи 7A–7D: `build()`, вердикт, план действий,
+находки, приложение, CSV-таблицы, повестка звонка — все на месте,
+`src/report/build_report.py:694-735`), но `run_report` его не импортирует и
+не вызывает.
+
+Проверено запуском: временная находка в
+`clients/pognali.rent/findings/approved/F-AUDIT-01.yaml` (гейт открыт) +
+`python run.py pognali.rent --stage report` → exit code 0, в лог выведена
+только строка-заглушка, `report/diagnostic_report.md` не создан,
+`report/` остался с одним `.gitkeep`. Тот же результат уже был
+зафиксирован раньше в этот же день в
+`clients/pognali.rent/logs/report_20260729_210140.log` и
+`report_20260729_210201.log` (идентичная строка-заглушка) — судя по всему,
+кто-то уже гонял этот же сценарий ранее сегодня и убрал фикстуру, не
+починив вызов. Фикстура и логи прогона удалены после проверки.
+
+Blocker: `run_report` не подключён к `build_report.build()` — `--stage report`
+и `--stage all` завершаются «успешно» (код 0, лог без ошибки) на клиенте с
+непустым `findings/approved/`, но `diagnostic_report.md` не создаётся.
+Требуется отдельная задача на исправление (эта задача — только фиксация факта).
+
+**AUDIT-wordstat-canonical** — аудит, без правок кода — 2026-07-29.
+Подтверждено: путь `raw wordstat -> canonical -> compute` обрывается на шаге
+transform. `build_wordstat()` в `src/transform/build_canonical.py` не
+существует (grep по файлу даёт ровно 2 упоминания "wordstat" — оба в
+докстринге модуля, строки 34-35: "wordstat.parquet вне контракта этой задачи
+(схема не задана) — сырьё data/raw/wordstat/ пока не трансформируется").
+`data/canonical/wordstat.parquet` нигде не пишется.
+
+Сырьё реально существует и не пусто: `src/extract/wordstat.py` пишет
+`data/raw/wordstat/wordstat_weekly.parquet` и `wordstat_core_queries.parquet`
+(подтверждено на диске: `clients/pognali.rent/data/raw/wordstat/`), объявляет
+`CANONICAL_TABLES = ["wordstat"]` в манифесте — но это имя будущей
+canonical-таблицы, для которой transform не реализован (сам модуль это
+явно фиксирует в докстринге, строки 104-106).
+
+`src/compute/block4_seo.py` целиком согласован с этим разрывом (свой
+докстринг, "Структурные разрывы задачи 5bA", п.1, строки 46-59, и "5bC",
+п.13, строки 201-209) — не расхождение, а задокументированное состояние:
+- `_run_s07` (requires=[wordstat, seo_queries], строки 1141-1163) и `_run_s26`
+  (requires=[wordstat, seo_queries], строки 2625-2647) проверяют
+  `"wordstat" in canonical and _table_nonempty(canonical["wordstat"])` —
+  условие всегда False, т.к. ключ "wordstat" никогда не появляется в
+  словаре `canonical` (нет файла на диске) — обе проверки ВСЕГДА пишут
+  `status: "unavailable"`, независимо от `runnable_ids`/`confidence_cap`
+  (тот же прецедент, что A07/A16/A25 в `block1.py`).
+- `_run_s06` (optional=[wordstat], строки 1071-1137) остаётся runnable по
+  одному `seo_queries` — но каждая строка несёт `wordstat_available: false`,
+  а финальный `finding: "seasonality_reconciliation"` жёстко капается на
+  `confidence: LOW` с `verdict: "cannot_determine_without_wordstat"`
+  (каталог §11, "Что Claude не должен утверждать", п.9).
+
+Недостающий шаг: `build_wordstat()` в `src/transform/build_canonical.py` —
+читает `wordstat_weekly.parquet`/`wordstat_core_queries.parquet` из
+`data/raw/wordstat/`, пишет `data/canonical/wordstat.parquet` по
+задокументированной схеме, регистрирует таблицу в `build()`/manifest. Без
+этого шага S07/S26 структурно недоступны навсегда, а S06 не может подняться
+выше LOW — это ограничение transform-слоя, не compute (`block4_seo.py` в
+`allowed_files` этой задачи не входил и не менялся).
+
+---
+
+**AUDIT-pre-existing-failures** — аудит, без правок кода — 2026-07-29.
+`pytest tests/ -q --continue-on-collection-errors` на текущем дереве:
+**14 failed, 714 passed, 2 collection errors**. Задача 5A (строка ~698
+этого файла) уже фиксировала через `git stash`-сравнение ровно **13**
+пре-существующих провалов на момент 2026-07-28 (до 5A). Из 14 текущих
+провалов + 2 ошибок сборки 13 совпадают с тем списком 1:1; расхождение —
+`scipy` (см. ниже).
+
+| test_id | файл | вероятная причина | задача-источник |
+|---|---|---|---|
+| `test_query_report_dimensions` | `tests/test_direct_2b_patch.py` | `cost_normalized` == `None` вместо ожидаемого рубля — `build_direct_queries` для direct_queries по задокументированному правилу (см. `src/compute/block1.py` докстринг, `build_canonical.py:1131`) намеренно оставляет `cost_normalized` пустым до отдельного апдейта Q01 для direct_queries/geo; тест написан на будущий (ещё не реализованный) контракт | Q01-apply-to-direct-queries-geo (не создана) |
+| `test_geo_report_schema` | `tests/test_direct_2b_patch.py` | то же самое (`cost_normalized` для `build_direct_geo`), тот же незакрытый Q01-гэп | Q01-apply-to-direct-queries-geo (не создана) |
+| `test_metrika_logs_negotiation_isolates_unsupported_fields` | `tests/test_extract_smoke.py` | `dropped_fields` пуст вместо `{'ym:s:lastSignhasGCLID'}` — поле теперь в статическом списке заведомо-пустых/предфильтруемых полей (`src/extract/metrika_logs.py:48`) и до вызова `evaluate` в тело запроса не попадает, поэтому симулируемый негативный ответ API в тесте никогда не срабатывает; тест и код разошлись после того, как поле перевели в статический список | не установлена (последнее касание файла — `d047032 save before reset`) |
+| `test_metrika_logs_backfill_preserves_old_files` | `tests/test_extract_smoke.py` | тот же корень: `entry["dropped_fields"]` пуст по той же причине | не установлена (тот же коммит) |
+| `test_gsc_manual_validates_and_writes_same_contract` | `tests/test_extract_smoke.py` | `SourceUnavailable: нет папок YYYY-MM` — тестовый фикстур-хелпер `_write_gsc_manual` пишет файл не в том расположении/формате, который сейчас ожидает `gsc_manual.py` (нужны подпапки `YYYY-MM`); контракт ручной выгрузки разошёлся с тестом | не установлена |
+| `test_gsc_manual_total_clicks_ui_mismatch_becomes_caveat` | `tests/test_extract_smoke.py` | то же самое | не установлена |
+| `test_gsc_manual_missing_device_column_flags_month` | `tests/test_extract_smoke.py` | то же самое | не установлена |
+| `test_webmaster_manual_aggregates_to_popular_contract` | `tests/test_extract_smoke.py` | `SourceUnavailable: файл выгрузки не найден` — аналогичное расхождение фикстуры `_write_wm_manual` с текущим контрактом `webmaster_manual.py` (`_export_path`) | не установлена |
+| `test_webmaster_manual_records_no_page_device_breakdown` | `tests/test_extract_smoke.py` | то же самое | не установлена |
+| `test_wordstat_queue_cycle_writes_raw_and_manifest` | `tests/test_extract_smoke.py` | `SourceUnavailable: не задан sources.wordstat.folder_id` — задача **wordstat-folder-id-config** (2026-07-22, см. выше) сделала `folder_id` обязательным с fail-fast в `_folder_id()`; фикстура `CONFIG_WS` в этом тестовом файле с тех пор не обновлена и `folder_id` не передаёт | wordstat-folder-id-config (2026-07-22) |
+| `test_wordstat_dead_token_raises` | `tests/test_extract_smoke.py` | тот же самый fail-fast до HTTP-вызова из-за отсутствующего `folder_id` в фикстуре — тест не может дойти до проверки dead-token сценария | wordstat-folder-id-config (2026-07-22) |
+| `test_lookback_visits_excluded_from_build_visits_aggregation` | `tests/test_metrika_logs_lookback.py` | `assert 2 == 1` — `build_visits` агрегирует визит из `lookback/`-подкаталога вместе с обычным, хотя тест ожидает исключения lookback-файлов из агрегации по `visit_id` | не установлена |
+| `test_build_ad_texts_inline_logic_keeps_raw_intact_and_splits_correctly` | `tests/test_transform_direct_normalize.py` | `FileNotFoundError: data/canonical/ad_texts.json` — тест (и его докстринг, см. `tests/test_transform_direct_normalize.py:1-13`) ожидает, что инлайн-код `build()` пишет `canonical/ad_texts.json` + `ad_texts_archived.json`; реальный код (`build_canonical.py:1983-1997`) пишет `ad_texts.parquet`/`ad_texts_archived.parquet` — расхождение JSON vs parquet между докстрингом задачи 4X-direct-cleanup и фактической реализацией | 4X-direct-cleanup |
+| — (не тест, ошибка сборки) `ERROR tests/test_block1.py` | `src/compute/block1.py:154` | `ModuleNotFoundError: No module named 'scipy'` — `scipy>=1.11` объявлен в `requirements.txt` с исходного чекпоинта (`ebb44e8`), но не установлен в текущем venv | окружение, не код |
+| — (не тест, ошибка сборки) `ERROR tests/test_block3.py` | `src/compute/block3.py` | то же самое — `from scipy import stats` | окружение, не код |
+| `test_dispatch_blocks_runs_money_frame_by_default` | `tests/test_money_frame.py` | `ModuleNotFoundError: No module named 'scipy'` — `dispatch_blocks` импортирует `block1`, который падает на импорте `scipy`; это НЕ входит в зафиксированные 13 (задача 5A), появляется только в окружении без установленного `scipy` | окружение, не код |
+
+Итог: **13 из 14** провалов совпадают 1:1 с уже зафиксированным в задаче
+5A списком (`test_direct_2b_patch.py` ×2, `test_extract_smoke.py` ×9,
+`test_metrika_logs_lookback.py` ×1, `test_transform_direct_normalize.py`
+×1) — эти 13 подтверждаются как «известно и приемлемо» (доп. код этой
+задачей не менялся, поведение не изменилось со времени 5A). 14-й провал
+(`test_money_frame.py`) и 2 ошибки сборки (`test_block1.py`,
+`test_block3.py`) — новый пункт, но root cause один и тот же: отсутствие
+`scipy` в этом venv, а не регрессия кода; исчезают после `pip install
+scipy` (или `pip install -r requirements.txt`).
+
+«Требует задачи» (не «известно и приемлемо», т.к. причина — расхождение
+теста и кода, не задокументированный гэп): негоциация metrika_logs
+dropped_fields (2 теста), контракт ручных выгрузок gsc/webmaster (5
+тестов), lookback-агрегация build_visits (1 тест), ad_texts.json vs
+.parquet (1 тест) — итого 9 тестов, где «источник» не установлен из
+git-истории и нужен отдельный аудит/задача на каждый файл. `Q01`-гэп по
+cost_normalized (2 теста) и wordstat folder_id (2 теста) — уже
+задокументированные, ожидаемые гэпы с известным следующим шагом.
+
+---
+
+**AUDIT-live-verification-status** — аудит, без правок кода — 2026-07-29.
+Сведены все пункты, помеченные `CODE DONE, live run pending`/mocked-only, и
+проверено, закрыты ли они реальным прогоном на pognali.rent с реальными
+ключами с тех пор. Источники: `docs/implementation_status.md` (весь файл),
+`clients/pognali.rent/.env` (проверено только наличие/непустота переменных,
+значения не читались), `clients/pognali.rent/data/raw/manifest.json`,
+`clients/pognali.rent/config.yaml`, все `clients/pognali.rent/logs/extract_*.log`
+и `compute_*.log`. Самый свежий `extract_*` лог в клиенте —
+`extract_20260722_202250.log` (2026-07-22 20:22–20:28); после этой даты
+живых `extract`-прогонов не было (последующие задачи 2026-07-23/29 —
+диагностика/аудит без новых вызовов внешних API). `.env` содержит непустые
+значения для всех шести ключей (`METRIKA_TOKEN`, `DIRECT_TOKEN`,
+`GSC_CREDENTIALS_PATH`, `WEBMASTER_TOKEN`, `WORDSTAT_API_KEY`,
+`CRUX_API_KEY`).
+
+| Пункт | Было в доке | Найдено | Вердикт |
+|---|---|---|---|
+| Direct Strategy/BiddingStrategy shape | 2A-direct-strategy: `CODE DONE, live run pending` — «реальный прогон... не выполнен» | `data/raw/manifest.json` → `sources.direct.strategy_field_present=true`, `strategy_field_samples` — 3 реальных объекта (`BiddingStrategyType`: `WB_MAXIMUM_CLICKS`, `HIGHEST_POSITION` ×2), `fetched_at=2026-07-22T17:23:25Z`, тот же прогон, что и `extract_20260722_202250.log`. Фикс из **2A-direct-strategy-fix** (запрос `TextCampaignFieldNames: ["BiddingStrategy"]`) отработал на боевом аккаунте без error 8000. `statistics_field_scope` по-прежнему `"unknown"` — это НЕ проверялось (нужен отдельный экспериментальный вызов, как и указано в исходной записи) и остаётся живым blocker'ом только в этой части. | **Подтверждено живым прогоном** (форма `BiddingStrategy`); `statistics_field_scope` — по-прежнему открыт |
+| CrUX real key | 3C-patch: `CODE DONE, live run pending` — «реального `CRUX_API_KEY` в этой сессии нет» | `.env` содержит непустой `CRUX_API_KEY` (mtime 2026-07-22 18:37); `clients/pognali.rent/data/raw/crux/crux.json` создан 2026-07-22 20:23; `manifest.json` → `sources.crux.cwv_field_data_available=true`, `field_data_available_by_target` — 3 из 4 URL с данными, без `error`; лог `extract_20260722_202250.log:95-102` — «crux: готово — cwv_field_data_available=True, записей 4». | **Подтверждено живым прогоном** |
+| Wordstat live extraction после dynamics-фикса (WS-2, cloud v2) | wordstat-folder-id-config: реальный `folder_id` не был получен от оператора в той сессии («ответ не получен») | Тот же прогон: `manifest.json` → `sources.wordstat.api_version_used="cloud_search_v2"`, `folder_id="b1ggocts4bcj79ds932l"`, `core_query_rows=39`, `wordstat_calls_made=42`; лог — «wordstat: готово — 39 фраз, 2535 недельных точек, вызовов API: 42», без ошибок/квоты. **Расхождение:** в записи `wordstat-folder-id-config` этого файла указан другой `folder_id` — `ajebnohb0odjms4dgq25` (полученный «от оператора тем же днём») — он НЕ совпадает ни с `clients/pognali.rent/config.yaml` (`folder_id: "b1ggocts4bcj79ds932l"`), ни с манифестом живого прогона. Т.е. либо запись в доке зафиксировала неверное/промежуточное значение, либо `folder_id` был исправлен ещё раз позже без отдельной записи в этом файле — источник расхождения не установлен этим аудитом (только чтение, `config.yaml`/`wordstat.py` вне `allowed_files` этой задачи). | **Подтверждено живым прогоном** (extraction работает), но текстовое значение `folder_id` в записи `wordstat-folder-id-config` этого файла — стale/неверное, требует отдельной проверки у оператора |
+| Metrika regionArea негоциация | 2A-patch: уже описано как подтверждённое «после боевого прогона» (2026-07-22) | `manifest.json` → `sources.metrika_logs.region_field="ym:s:regionArea"`, `region_field_verified=true`, `region_field_error=None`, `fetched_at=2026-07-21T22:43:10Z` — совпадает с тем, что уже зафиксировано в записи 2A-patch. | Уже верно задокументировано, обновление не требуется |
+| Direct campaigns/geo/queries непустые после TSV-фикса | direct-tsv-report-header-fix: уже помечено `DONE`, с конкретными non-empty счётчиками (1377/1377, 21681/21681, 15253/15253) по реальному сырью клиента | raw-выгрузка того же дня (`extract_20260722_202250.log`): campaigns 1407 строк, queries 15265 строк, geo (через CUSTOM_REPORT) — все 15 месяцев без ошибок. Разница 1407−1377=30 и 15265−15253=12 соответствует ровно количеству отброшенных header/footer-строк (15 файлов×2 и 6 файлов×2) — согласуется с фиксом. | Уже верно задокументировано, обновление не требуется |
+
+**Итог:** 3 из 5 пунктов (`Direct BiddingStrategy shape`, `CrUX`, `Wordstat
+dynamics live`) фактически подтверждены реальным прогоном 2026-07-22, но
+статус в таблице/тексте этого файла на момент начала этого аудита ещё
+показывал `CODE DONE, live run pending`/blocker — обновлено выше (строки
+статус-таблицы 2B-patch-2, 3C-patch) и в этой записи. 2 пункта (`regionArea`,
+`Direct TSV non-empty`) уже были верно задокументированы как подтверждённые.
+Открытые вопросы, не закрытые этим аудитом: (a) `statistics_field_scope`
+Direct остаётся `"unknown"`; (b) расхождение `folder_id` Wordstat в записи
+`wordstat-folder-id-config` vs фактический `config.yaml`/manifest.
+
+---
+
+**AUDIT-spec-vs-code-drift** — аудит, без правок кода/спеки — 2026-07-29.
+Построчная сверка `data-export-spec-v2.md` (единственный формальный контракт
+выгрузки) с фактическим `src/extract/*.py` и `src/transform/build_canonical.py`.
+Ни спека, ни код не редактировались. `legacy_id`/`config/methodology.yaml` вне
+скоупа (не читались специально, только источники a/b по CLAUDE.md §5).
+
+| # | Раздел спеки | Спека говорит | Код фактически делает | Вердикт |
+|---|---|---|---|---|
+| 1 | §A, `ym:s:screenResolution`/`physicalScreenResolution` | Поле для C21 | `metrika_logs.py`: такого поля не существует (подтверждено API), используются `ym:s:screenWidth`+`ym:s:screenHeight`, собранные в `screen_resolution` в transform | **Код прав, спека устарела** — имена полей в §A не обновлены (в отличие от других полей раздела) |
+| 2 | §A, `<clickID полей yclid/gclid если есть>` | Нужен для связки визита с кампанией Директа | `metrika_logs.py`: `yclid` не запрашивается вовсе; `gclid`/`hasGCLID` запрошены и убраны насовсем (100% пусто, нет Google Ads трафика); связка идёт только через `ym:s:lastSignDirectClickOrder` | **Код прав по факту** (эмпирически пусто), но спека всё ещё перечисляет оба поля как желаемые без пометки — стоит уточнить в спеке |
+| 3 | §A, `ym:s:ipAddress` | «снят с рассмотрения по решению клиента... не только из-за приватности» (ред. 2, v2-формулировка) | `metrika_logs.py` комментарий: «по-прежнему не запрашивается (приватность важнее, см. **data-export-spec-v1.md**, раздел A)» — ссылается на v1, не v2, и даёт только причину приватности | Расхождение в обосновании (код цитирует устаревшую версию спеки), эффект (поле не запрашивается) совпадает — **синхронизировать комментарий с v2** |
+| 4 | §B, goals list: «дата создания/последнего изменения» | Нужно для D02/D03 | `build_canonical.build_goals()`: `created_at`/`updated_at` всегда `None` — «в реальной выгрузке счётчика этих полей нет вовсе (подтверждено на фактическом goals_list.json Pognali)», зафиксировано в `flags["goals_missing_fields"]` | **Код прав, спека устарела** — полей не существует в API; расхождение хотя бы честно всплывает в canonical-манифесте |
+| 5 | §C, `campaigns.get`: `StatisticsStartDate, StatisticsEndDate` | Поля таблицы для D08/A01-A03 | `direct.py` `CAMPAIGNS_FIELD_NAMES_ENUM` (дословно взят из текста error 8000 боевого прогона) вообще не содержит таких имён — их нет в валидном enum `campaigns.get` | **Код прав, спека устарела** — поля, видимо, унаследованы из v1/UI-терминологии и не существуют в JSON API v5 |
+| 6 | §C, `SEARCH_QUERY_PERFORMANCE_REPORT`: окно не ограничено (весь период 12 мес, как и остальные отчёты) | Подразумевается тем же 12-месячным окном, что и остальные проверки блока 1 | `direct.py` `REPORT_WINDOW_LIMIT_DAYS["SEARCH_QUERY_PERFORMANCE_REPORT"] = 180` — окно обрезается до 180 дней от `today` (API error 4001 на более ранних датах), caveat пишется в `manifest.query_window_caveat`, но **в спеке это ограничение нигде не упомянуто** | **Код прав (эмпирическое ограничение API), спека неполна** — A09-A11/A18 не могут получить полные 12 мес query-уровня независимо от `data_window`, это стоит отразить в §C |
+| 7 | §C, «Отчёт по площадкам»: `Placement/AppId, CampaignId, Cost, Clicks, конверсии` | `AppId` как поле | `direct.py` `PLACEMENT_FIELDS = [Placement, AdNetworkType, CampaignId, Cost, Clicks, Conversions]` — нет `AppId`, вместо него `AdNetworkType` (различает сеть/поиск), без комментария о причине замены | Не установлено, кто прав — расхождение **не задокументировано в коде** (в отличие от других полевых замен в этом же файле), нужна проверка на живом аккаунте |
+| 8 | §C, «Тексты объявлений + расширения»: `... извлечения (цена/акция/наличие)` | Ожидаются extensions типа price/promotion/availability | `direct.py` `_fetch_ad_texts`: `adextensions.get` запрашивает только `CalloutFieldNames: ["CalloutText"]` (текстовые уточнения) — никаких Price/Promotion/Availability-полей не запрашивается и это нигде не отмечено как ограничение | **Код отклонился от спеки без документирования** — A21-A24 не получают данные о цене/акции/наличии через extensions, хотя спека их требует |
+| 9 | §C, «Тексты объявлений»: `... дата последнего изменения` | Нужно поле последнего изменения объявления | `direct.py` `_fetch_ad_texts`: `FieldNames=[Id, CampaignId, AdGroupId, Type, State, Status]`, `TextAdFieldNames=[Title, Title2, Text, Href, DisplayUrlPath]` — поля даты изменения нет вовсе, и нет notes/manifest-флага об этом (в отличие от `Strategy`/`Statistics`, которые получили открытые вопросы) | **Код отклонился от спеки без документирования** — тихий гэп, не как остальные (задокументированные) гэпы этого файла |
+| 10 | §C, «Товарный фид»: `offer_id, price, availability, url, дата синхронизации` | Ожидается хотя бы метаданные + путь получения построчных офферов | Докстринг модуля (строка 42-43) утверждает `feeds.get` вызывается («если фида нет — файл не создаётся»), но фактическая `_fetch_feed()` **никогда не вызывает `feeds.get`** — сразу возвращает `[]` с note «требует Ids, список фидов клиента не может быть получен без него» | **Внутреннее противоречие кода** (докстринг модуля обещает то, что реализация не делает) + расхождение со спекой: A25 сейчас не проверяем через этот пайплайн вообще, `feed_used` всегда `False` |
+| 11 | §C, ред. 3 «Открытый gap»: `direct_placements` использует старое поле `cost_normalized` в валютном смысле, «требует отдельного патча» | Утверждает расхождение ещё не устранено | `build_direct_placements()` уже пишет `cost_raw`/`cost_rub`/`cost_normalized=None`/`vat_basis_applied=False` — тот же контракт, что у campaigns/queries/geo | **Спека устарела** — gap уже закрыт в коде, ред. 3 не актуализирована |
+| 12 | §C, «Ключевые фразы + типы соответствия»: `KeywordId, Phrase, MatchType` | Подразумевает `MatchType` как поле API | `direct.py` `_fetch_keywords`: `keywords.get` не отдаёт `MatchType` полем вовсе — тип соответствия выводится эвристически по операторам в самой фразе (`_keyword_match_type`), задокументировано в коде, но не в спеке | **Код прав по факту**, спека вводит в заблуждение, представляя `MatchType` как прямое поле API |
+| 13 | §D, «Популярные запросы... query, page, impressions, clicks, position, ctr, demand» | `page` — обычное поле выгрузки | `webmaster_api.py`: `_fetch_popular` не передаёт никакого page-параметра; докстринг модуля прямо говорит: «отчёт... отдаёт только query-уровень... БЕЗ разбивки по page/device — это ограничение метода» | **Код прав (структурное ограничение API), спека устарела** — §D перечисляет `page` без оговорки для API-режима |
+| 14 | §D, то же (внутренняя сверка) | `webmaster_api.py` докстринг утверждает: «То же ограничение зафиксировано в `webmaster_manual.py`» | `webmaster_manual.py` фактически пишет `has_page_column: True`, `page_device_breakdown: True` — ручной формат (`Query|Url|...`) **умеет** page, в отличие от API | **Внутреннее противоречие двух экстракторов одного источника** — докстринг `webmaster_api.py` неверно описывает `webmaster_manual.py` |
+| 15 | §D, «demand» (ред. 2 объясняет поле подробно) | `demand` — часть обычной выгрузки популярных запросов | `webmaster_api.py` `QUERY_INDICATORS = [TOTAL_SHOWS, TOTAL_CLICKS, AVG_SHOW_POSITION, AVG_CLICK_POSITION]` — `DEMAND` не запрашивается вовсе в API-режиме; `build_seo_queries_webmaster` читает `indicators.get("DEMAND")`, который для API-режима всегда будет отсутствовать, без caveat об этом | **Код отклонился от спеки без документирования** (для `mode: api`); для `mode: manual` demand поддержан корректно |
+| 16 | §F, Wordstat: «частотность по маске и сезонность (**помесячно** за 12 мес, если доступно)», «жёсткие rate limits — очередь с паузами» | Ожидается месячная гранулярность и специфичный quota-цикл с паузами | `wordstat.py` (WS-2, миграция на Cloud Search API v2): весь транспорт v1 (REST, Bearer) заменён на v2 (Api-Key); данные о сезонности — **недельная** (`PERIOD_WEEKLY`) `dynamics`, не месячная; докстринг явно говорит «Отдельного 503-цикла квоты... больше нет» — общий backoff `C.http_request`, не выделенный quota-цикл с паузами | **Код прав (v1 API отключён Яндексом безвозвратно, подтверждено поддержкой)**, но **§F спеки вообще не получил ред.-пометки** о миграции — в отличие от §A/§C/§D/§E/§G1, где реальные расхождения аккуратно зафиксированы «Ред. 2» — это единственный раздел спеки, полностью разошедшийся с кодом без единой пометки |
+| 17 | §G1, ред. 2: «список обязан включать все URL с трафиком/расходом из C+D+E за период, покрытие проверяется, а не предполагается» | Полный union без пред-усечения по источнику | `site_crawl.build_url_priority_list()`: каждый источник (`top_spend`, `top_organic_gsc`, `top_organic_webmaster`, `keyword_match`) **предварительно** обрезается до `top_n_each_source=20` **до** объединения и до `max_urls`-усечения; caveat (`result["caveat"]`) фиксирует только финальное `max_urls`-усечение, не это предварительное | **Код отклонился от спеки без разрешения** — для сайтов с >20 URL трафика/расхода на источник объединённый список тихо не совпадает с полным union, и это не видно как caveat (только явное чтение `top_n_each_source` в коде это раскрывает) |
+| 18 | §G1, ред. 2: «`robots_directive`... проверять на URL с заведомо известной директивой... `js_content_diff`... проверять на URL с заведомо JS-зависимым контентом... пустое значение чаще признак, что поле не заполняется» | Требуется валидация на known-example перед доверием к пустому значению | `site_crawl.py`: для `js_content_diff` есть эвристика-предупреждение (`attempted>0 and populated==0` → лог), но она глобальная, не «известный JS-URL»; для `robots_directive` **вообще нет** проверки/предупреждения ни на каком уровне | **Требование спеки не реализовано в коде** — обе проверки остаются полностью ручными (аналитик должен делать это сам, что противоречит духу «проверяется, а не предполагается») |
+
+**Итог:** 18 расхождений. Код прав (спека устарела/неточна): #1, 4, 5, 6, 11,
+12, 13, 16. Спека права, код тихо отклонился без документирования: #8, 9, 14
+(внутреннее противоречие), 15, 17, 18. Не установлено, чья сторона верна
+(нужна проверка на живом аккаунте): #7. Формальность без эффекта (комментарий
+ссылается не на ту версию спеки): #3, 2 (частично). Ничего не исправлялось —
+только сверка, как и требует `task_id AUDIT-spec-vs-code-drift`.
+
+---
+
+**AUDIT-lookback-aggregation-regression** — аудит, без правок кода — 2026-07-29.
+Вопрос: `pytest tests/test_metrika_logs_lookback.py::test_lookback_visits_excluded_from_build_visits_aggregation`
+падает (`assert 2 == 1`) — это регрессия фильтрации lookback-визитов в
+`build()`, или тест не обновлён под контракт «filter-at-write»?
+
+**Вердикт: тест устарел, регрессии в коде нет.**
+
+Изолированный прогон (`pytest tests/test_metrika_logs_lookback.py -v`):
+6 passed, 1 failed — падает только эта проверка. Traceback показывает, что
+`assert len(df) == 1` (`tests/test_metrika_logs_lookback.py:289`) проверяет
+**прямой возврат `bc.build_visits()`** (df до записи в parquet), а не
+содержимое `visits.parquet`.
+
+Текущий контракт `build_visits()` (докстринг, `src/transform/build_canonical.py:964-979`,
+и явное решение по фильтрации в записи `4X-lookback-canonical-flag`,
+`docs/implementation_status.md:55`): функция **намеренно возвращает
+объединённый df** (основное окно + lookback, с флагом `is_lookback_only`) —
+лукбэк нужен внутри для carry-forward (`resolve_traffic_source`,
+T02/T03) и намеренно не фильтруется самой функцией «для тестируемости
+эффекта». Фактическую фильтрацию `is_lookback_only == True` перед записью
+`visits.parquet` выполняет `build()` (`src/transform/build_canonical.py:1906-1908`,
+`report_visits_df = visits_df[visits_df["is_lookback_only"] == False]`) —
+эта строка проверена, работает корректно, лукбэк-строки в parquet не
+попадают.
+
+`git log` подтверждает порядок событий: `tests/test_metrika_logs_lookback.py`
+целиком создан в единственном коммите `d047032` («save before reset»,
+2026-07-22 13:14:26) — **до** коммита `17ea03f` (2026-07-22 14:47:25),
+который ввёл `is_lookback_only` и контракт filter-at-write. После
+`17ea03f` файл `test_metrika_logs_lookback.py` больше не редактировался
+(в `670d2e0` тоже не тронут) — тест написан под более старый расчёт
+(«build_visits агрегирует лукбэк наружу = баг»,
+названия теста — `..._excluded_from_build_visits_aggregation`), который
+контракт `4X-lookback-canonical-flag` сознательно заменил на
+filter-at-write.
+
+Запись `4X-lookback-canonical-flag` (`docs/implementation_status.md:55`)
+прямо называет тесты старого контракта как blocker и перечисляет, что
+именно требует обновления — но это **только `tests/test_lookback_wiring_check.py`**
+(два теста: `test_build_visits_does_not_see_lookback_subdir_rows`,
+`test_force_lookback_backfill_does_not_change_existing_canonical_output`).
+Их закрыла последующая задача `4X-lookback-canonical-flag-tests`
+(`docs/implementation_status.md:56`). `tests/test_metrika_logs_lookback.py`
+— другой файл, в объём той задачи не входил и был пропущен при переходе
+на новый контракт.
+
+**Тест-долг, не баг.** Ничего не исправлялось (задание — только диагноз).
+Нужна отдельная задача с `tests/test_metrika_logs_lookback.py` в
+`allowed_files`, чтобы обновить `test_lookback_visits_excluded_from_build_visits_aggregation`
+под контракт filter-at-write (аналогично тому, как `4X-lookback-canonical-flag-tests`
+уже сделала для `test_lookback_wiring_check.py`) — либо переименовать/
+переписать проверку на `len(df[df["is_lookback_only"] == False]) == 1`,
+либо перенести assertion на результат `build()` (записанный `visits.parquet`).
+
+---
+
+**AUDIT-manual-export-contract-drift** — аудит, без правок кода — 2026-07-29.
+Вопрос: соответствует ли контракт `gsc_manual.py`/`webmaster_manual.py`
+(пути, имена файлов, структура папок) `docs/gsc_export_instructions.md` —
+или инструкция устарела и живой клиент получит `SourceUnavailable` при
+точном следовании ей.
+
+**Вердикт: инструкция и код синхронны; устарели тесты, не инструкция.**
+На реальных данных pognali.rent оба ручных источника отрабатывают успешно.
+
+1. `docs/gsc_export_instructions.md` описывает ровно то, что читает
+   `gsc_manual.py`: `manual_export_dir/YYYY-MM/` с обязательными
+   `Запросы.csv`+`Диаграмма.csv` (+`Страницы.csv`, кроме комбинированного
+   contract 3A), опциональными `Устройства.csv`/`Страны.csv`/`Фильтры.csv`,
+   и той же логикой определения комбинированного формата по заголовкам
+   `column_map["page"]`/`column_map["device"]` в `Запросы.csv`
+   (`gsc_manual.py:357-361` ↔ `gsc_export_instructions.md:57-63`). Расхождений
+   не найдено.
+2. Для Вебмастера отдельного файла-инструкции **нет** (`docs/` содержит
+   только `gsc_export_instructions.md` и `implementation_status.md`) — не
+   «устарела», а просто отсутствует; контракт `webmaster_manual.py`
+   (один wide-файл `manual_export_file`, по умолчанию `webmaster_export.csv`,
+   колонки `Query`/`Url` + `YYYY-MM_shows/_clicks/_position/_demand`)
+   нигде не задокументирован для оператора вне докстринга модуля.
+3. Реальные загруженные выгрузки клиента pognali.rent подтверждают контракт
+   кода, не какой-то другой:
+   - `clients/pognali.rent/data/raw/gsc/YYYY-MM/` — 16 папок (2025-04…2026-07),
+     каждая содержит `Диаграмма.csv`+`Запросы.csv`+`Страницы.csv`+
+     `Устройства.csv`+`Страны.csv`+`Фильтры.csv` (+`Вид в поиске.csv`, не
+     из `_FILE_MAP`, игнорируется парсером без вреда). `config.yaml`:
+     `sources.gsc.manual_export_dir: "data/raw/gsc"` — то же место, что и
+     `out_dir` (комментарий в `gsc_manual.py:132-133` явно предусматривает
+     это совпадение). `validation_report.json`: `accepted=6813`,
+     `rejected=0`, все 16 месяцев обработаны, `source_mode=manual` — реальный
+     прогон успешен, деградации до `SourceUnavailable` нет.
+   - `clients/pognali.rent/data/raw/webmaster/webmaster_export.csv` — ровно
+     то имя файла, что и дефолт `_export_path()`. `validation_report.json`:
+     `accepted=421`, `rejected=0`, 18 месяцев, `has_page_column=true`,
+     `has_demand_column=true` — тоже успешный прогон.
+   - Данные о качестве (не о контракте): у GSC `incomplete_dimensions=true`
+     для **всех** 16 месяцев (контракт 3A ни разу не достигнут в проде —
+     клиент экспортирует раздельно, page/device везде `unknown`/`""`) и
+     `clicks_diagram_vs_queries_mismatch` с отклонением 40–100% почти
+     каждый месяц. Не баг парсера — это то, для чего существуют caveat'ы;
+     находки S08-S10/S20 для pognali.rent должны оставаться MED/LOW, как и
+     предписывает инструкция (`gsc_export_instructions.md:76`).
+4. `tests/test_extract_smoke.py` — 5 упавших фикстур (`_write_gsc_manual` →
+   `test_gsc_manual_validates_and_writes_same_contract`,
+   `test_gsc_manual_total_clicks_ui_mismatch_becomes_caveat`,
+   `test_gsc_manual_missing_device_column_flags_month`; `_write_wm_manual` →
+   `test_webmaster_manual_aggregates_to_popular_contract`,
+   `test_webmaster_manual_records_no_page_device_breakdown`) пишут
+   **другой, более старый контракт**, никак не связанный с текущим кодом:
+   - `_write_gsc_manual` (`tests/test_extract_smoke.py:985-991`) кладёт
+     ОДИН плоский файл `gsc_YYYY-MM.csv` с англ. заголовками
+     `query,page,device,clicks,impressions,ctr,position` прямо в
+     `manual_export_dir` — без папки `YYYY-MM/`, без `Диаграмма.csv`/
+     `Страницы.csv`. Текущий `_month_folders()` ищет **директории** с именем
+     `^\d{4}-\d{2}$`; такой директории тест не создаёт вовсе, поэтому
+     `extract()` падает на `SourceUnavailable("нет папок YYYY-MM")` до того,
+     как дойти до проверяемых assert'ов. Тест также ожидает `meta.yaml` с
+     `total_clicks_ui` и `result["clicks_ui_caveats"][0]["total_clicks_ui"]`
+     — текущий код такого поля не знает вообще; сверка кликов реализована
+     как `_clicks_caveat()` (Диаграмма.csv vs Запросы.csv), а не через
+     `meta.yaml`.
+   - `_write_wm_manual` (`tests/test_extract_smoke.py:1081-1084`) кладёт по
+     ОДНОМУ long-формат файлу на месяц (`webmaster_YYYY-MM.csv`, колонки
+     `query,impressions,clicks,position,month`). Текущий `_export_path()`
+     ищет ровно один файл с именем `manual_export_file`
+     (дефолт `webmaster_export.csv`) в wide-формате — этого имени тест не
+     создаёт, поэтому `extract()` падает на
+     `SourceUnavailable("файл выгрузки не найден")` до assert'ов.
+   - `test_gsc_manual_no_exports_raises_source_unavailable` и
+     `test_webmaster_manual_no_exports_raises` (без фикстур, сразу ожидают
+     `SourceUnavailable`) проходят и сегодня — совпадение поведения
+     случайное, а не признак согласованности контрактов.
+5. Не чинилось: код и `docs/gsc_export_instructions.md` не редактировались
+   (вне скоупа задачи и не требуется — расхождения не найдено). Тесты не
+   редактировались. Нужна отдельная задача с `tests/test_extract_smoke.py`
+   в `allowed_files`, чтобы переписать `_write_gsc_manual`/`_write_wm_manual`
+   и все 5 зависимых тестов под текущий контракт (папки `YYYY-MM/` с
+   срезовыми CSV для GSC; один wide-файл для Webmaster) — по образцу
+   реальных файлов pognali.rent, перечисленных в п.3.
+
+---
+
+**FIX-report-wiring** — 2026-07-29.
+Закрыт blocker из AUDIT-report-wiring (строка ~1486 этого файла): `run_report`
+(`src/pipeline/orchestrator.py`) после гейта `approved_findings_present`
+теперь реально вызывает `build_report.build(paths, config, defaults)` с
+путями/конфигом клиента вместо строки-заглушки. Ошибка `build()` логируется
+(`"report: ОШИБКА сборки отчёта — ..."`) и пробрасывается исключением дальше
+(не подменяется на `ok=True`/exit code 0) — `--stage report`/`--stage all`
+больше не могут завершиться «успешно» без файла отчёта. `build_report.py` и
+его тесты (задачи 7A–7D) не менялись.
+
+Тесты: новый `tests/test_orchestrator_report_wiring.py` (3 теста) —
+`run_report` с непустым `findings/approved/` реально создаёт
+`diagnostic_report.md` (с содержимым находки), `oral_review_agenda.md` и
+`appendix_tables/skipped_checks.csv`; гейт на пустом `approved/` по-прежнему
+блокирует (регрессия не допущена); ошибка `build_report.build` пробрасывается
+как исключение, а не проглатывается.
+`pytest tests/test_orchestrator_report_wiring.py tests/test_orchestrator_analyze_gate.py
+tests/test_orchestrator_error_logging.py` — **10 passed**.
+Blocker: нет.
+
+---
+
+**FIX-wordstat-canonical** — 2026-07-29.
+Замкнут разрыв raw wordstat -> canonical из AUDIT-wordstat-canonical (строка
+~1491 этого файла): `build_wordstat()` в `src/transform/build_canonical.py`
+читает `data/raw/wordstat/{wordstat_weekly,wordstat_core_queries}.parquet` и
+пишет `data/canonical/wordstat.parquet` (LEFT JOIN по `normalized_phrase`;
+`month` — вычисляемая колонка из `date`, тот же приём, что `build_direct_geo`;
+`purpose` — comma-joined строка вместо list, тот же приём, что
+`conditions_raw`). Таблица зарегистрирована в `SCHEMAS` и в `build()`
+(строится, если `"wordstat"` есть в `data/raw/manifest.json.sources`).
+
+Blocker (не устранён — вне `allowed_files` этой задачи, `src/compute/
+block4_seo.py` не менялся): проверено запуском `block4_seo.run()` с реальным
+непустым `wordstat.parquet` в canonical — `_run_s07`/`_run_s26`
+(`block4_seo.py:1148`/`2632`) при `"wordstat" in canonical and
+_table_nonempty(...)` всё равно пишут `status: "unavailable"` (у обеих
+проверок это захардкожено в ОБЕИХ ветках if/else, независимо от таблицы) —
+S07/S26 структурно недоступны, даже когда canonical-таблица уже существует.
+`_run_s06` (`block4_seo.py:1134`) при том же условии верно поднимает
+`wordstat_available` в `True`, но `confidence` строки
+`seasonality_reconciliation` захардкожен в `_cap("LOW", confidence_cap)` вне
+зависимости от `wordstat_available` — S06 не может подняться выше LOW без
+правки этой строки. Требуется отдельная задача с `src/compute/block4_seo.py`
+в `allowed_files`, которая реально прочитает колонки новой таблицы (сейчас
+там нет ни одного обращения к её содержимому, только проверка на
+существование/непустоту) и уберёт оба хардкода.
+
+Тесты: `tests/test_build_canonical.py` — 8 новых (`test_build_wordstat_*`,
+`test_build_writes_wordstat_via_orchestrator`,
+`test_build_skips_wordstat_when_source_absent`); существующие
+`test_s06_reports_trend_and_wordstat_unavailable`,
+`test_s07_always_unavailable_wordstat_missing`,
+`test_s26_always_unavailable_wordstat_missing` в `tests/test_block4_seo.py`
+не менялись и остаются зелёными (они проверяют сценарий «wordstat
+отсутствует» — новый transform его не затрагивает).
+`pytest tests/test_build_canonical.py` — **136 passed**.
+`pytest tests/test_block4_seo.py -k "s06 or s07 or s26"` — **3 passed**.
+
+---
+
+**FIX-block4-seo-wordstat-consumption** — 2026-07-29.
+Закрыт blocker из FIX-wordstat-canonical (строка ~1824 этого файла):
+`src/compute/block4_seo.py` теперь реально читает колонки `data/canonical/
+wordstat.parquet` вместо хардкода.
+
+- `_run_s07`/`_run_s26`: без `canonical["wordstat"]` — по-прежнему
+  `unavailable` (данных нет). С таблицей — реальный расчёт через новый общий
+  `_gap_demand_candidates()`: кластер спроса = `wordstat` строки
+  `scope='gap-specific'` (реальный коммерческий спрос за вычетом junk/general
+  — та же классификация, что уже делает extract), материальность —
+  `SUM(count) >= _S07_MIN_DEMAND_COUNT` (20, тот же порядок величины, что
+  `_MIN_SHOWS_FOR_OPPORTUNITY`); "есть посадочная" — `normalize(phrase)`
+  (`src/extract/wordstat_config.normalize`, та же функция, что использует сам
+  extract — не задублирована) буквально совпадает с `normalize()` какого-то
+  `seo_queries.query`. Несовпадение при материальном спросе -> находка.
+  `_run_s26` вызывает ту же функцию (данных для отдельного гео-разреза в
+  canonical wordstat нет — регион задаётся на всю выгрузку целиком в
+  config, а этот модуль client config не читает, см. его собственный
+  контракт) — помечает каждую строку `geo_dimension_available: false`,
+  чтобы не выдавать совпадение с S07 за географический анализ.
+- `_run_s06`: новая `_reconcile_seasonality()` реально сверяет
+  месяцы-аномалии показов `seo_queries` с помесячным `SUM(count)` `wordstat`
+  строк `purpose LIKE '%seasonality%'` (единственные фразы, которые extract
+  специально отбирает для сезонной кривой). Если Wordstat подтверждает то же
+  направление отклонения в том же месяце — `confidence` поднимается до
+  `MED` (`verdict: seasonality_explains_anomaly` или
+  `anomaly_not_fully_explained_by_seasonality`, тоже MED — сверка состоялась,
+  это уже не гипотеза). Без Wordstat — прежнее поведение (`LOW`,
+  `cannot_determine_without_wordstat`) не тронуто.
+
+`run()` (диспетчер блока) — `_run_s07`/`_run_s26` теперь принимают `paths`
+(нужен для `common.open_duckdb`), сигнатуры и оба call site обновлены.
+`build_wordstat()`/`build_canonical.py` не менялись (вне allowed_files).
+
+Тесты (`tests/test_block4_seo.py`): 3 существующих (`test_s06_reports_trend_
+and_wordstat_unavailable`, `test_s07_always_unavailable_wordstat_missing`,
+`test_s26_always_unavailable_wordstat_missing`) не менялись, остаются
+зелёными (сценарий «wordstat отсутствует» не тронут). 5 новых:
+`test_s06_confidence_rises_to_med_when_seasonality_confirmed`,
+`test_s06_confidence_rises_to_med_when_seasonality_not_confirmed`,
+`test_s07_reports_gap_candidates_when_wordstat_available`,
+`test_s07_below_min_demand_threshold_not_a_candidate`,
+`test_s26_reports_geo_candidates_when_wordstat_available`.
+`pytest tests/test_block4_seo.py` — **50 passed**.
+`pytest --ignore=tests/test_block1.py --ignore=tests/test_block3.py` (эти два
+не собираются в этом окружении, `ModuleNotFoundError: scipy` — не связано с
+этой задачей, воспроизводится и на чистом `master`) — **727 passed, 14
+failed**. Список этих 14 идентичен `git stash` (полный откат правок этой
+задачи) — та же дорожка `test_direct_2b_patch.py` (2), `test_extract_smoke.py`
+(8), `test_metrika_logs_lookback.py` (1), `test_money_frame.py` (1),
+`test_transform_direct_normalize.py` (1) — предсуществующие падения
+окружения, не связанные с этой задачей; регрессий не внесено.
+Blocker: нет.
+
+---
+
+**AUDIT-s07-s26-formula-match** — аудит, без правок кода — 2026-07-29.
+
+**Вопрос:** реализуют ли `_run_s07`/`_run_s26`/`_gap_demand_candentats`
+(`src/compute/block4_seo.py`, добавлены задачей
+FIX-block4-seo-wordstat-consumption) формулу каталога v2, или считают другую
+метрику.
+
+**Вердикт: считают другую, смежную метрику. Формуле каталога реализация НЕ
+соответствует.**
+
+1. **`site_pages` не читается вообще — не "источник не готов", а "формула
+   его не использует".** Каталог v2 (`catalog-proveryaemyh-marketingovyh-
+   ugroz-v2.md`, блок 4): S07 — "Сопоставить кластеры Wordstat/GSC **с картой
+   страниц**", источник — "Wordstat + GSC + **сайт**"; S26 — "Сопоставить
+   гео-спрос, **страницы**, позиции и фактическую зону обслуживания",
+   источник — "Wordstat + GSC/Вебмастер + **сайт**". `data-export-spec-v2.md`
+   (раздел "Матрица: блок угроз → источники и таблицы") называет это явно:
+   `S07, S26 | F (Wordstat) + D/E + G1 (карта страниц) | query cluster` —
+   т.е. ТРЕТИЙ обязательный источник, G1 = `site_pages`/`site_crawl`.
+   Проверено grep'ом по всему телу `_run_s07` (`block4_seo.py:1314-1361`),
+   `_run_s26` (`2823-2872`) и `_gap_demand_candidates`/`_wordstat_gap_demand`/
+   `_seo_known_query_set` (`1264-1311`): ни одного упоминания `site_pages`
+   или `canonical["site_pages"]` во всех пяти функциях — при том, что та же
+   каноническая таблица уже реально используется в этом же файле десятком
+   строк выше и ниже (`_load_site_pages_full`, S11-S19/S27,
+   `block4_seo.py:602-650`, `1656+`, `2876+`) — то есть таблица доступна и
+   используемый паттерн доступа к ней в модуле уже есть, её просто не
+   вызвали для S07/S26. Это не деградация "site_crawl не выполнен" (для неё
+   в модуле есть отдельный, уже используемый паттерн unavailable/caveat) —
+   формула физически не ссылается на карту страниц.
+   Фактически вычисляемое условие "релевантной посадочной нет" подменено на
+   "ни одна строка `seo_queries.query` не совпадает (после `normalize()`) с
+   этой wordstat-фразой" (`_gap_demand_candidates`, `1294-1311`) — то есть
+   "эта фраза ни разу не зафиксирована как запрос в отчётах GSC/Вебмастер",
+   а НЕ "на сайте нет страницы, релевантной этому спросу". Это разные
+   утверждения: страница может существовать и быть вполне релевантной, но
+   не ранжироваться ни по одному запросу этого кластера (тогда каталог хочет
+   именно эту находку — "спрос есть, посадочная либо есть, но не
+   ранжируется, либо её нет вовсе" — сопоставление с G1 позволило бы это
+   различить), а собственный код называет свой результат полем
+   `has_matching_page` (`_gap_demand_candidates:1309`) — это имя утверждает
+   про существование СТРАНИЦЫ то, что функция физически не проверяла (она
+   проверяла только текстовое совпадение запроса в отчётах). Для S26
+   расхождение больше: каталог явно требует ещё и "позиции" — `_run_s26`
+   их не использует вовсе (переиспользует `_gap_demand_candidates` "как
+   есть", ноль дополнительной логики сверх `geo_dimension_available: False`,
+   уже честно продекларированного в задаче FIX-block4-seo-wordstat-
+   consumption).
+
+2. **Порог `SUM(count) >= 20` — нигде вне `block4_seo.py`.**
+   `config/defaults.yaml` (полностью прочитан) не содержит ни блока `block4`,
+   ни ключа, похожего на демандовый порог для S07/S26 — только
+   `data_window_months`, `utm_undefined_threshold`, `significance_alpha`,
+   `min_sample_visits`, `goal_inflation_warning`, `currency_round`,
+   `manual_source_confidence_cap`, `crux_min_field_data`,
+   `transform.traffic_resolve_lookback_days`,
+   `transform.seo_queries_min_total_shows`. `_S07_MIN_DEMAND_COUNT = 20`
+   (`block4_seo.py:1261`) — захардкоженная константа модуля, обоснованная в
+   комментарии рядом только ссылкой "тот же порядок величины, что
+   `_MIN_SHOWS_FOR_OPPORTUNITY`" (тоже локальная константа этого же файла,
+   `= 20`, строка ~263) — т.е. число не выведено ни из каталога (там числа
+   вообще нет ни для одной S-проверки), ни из data-export-spec, ни из
+   методологии, ни из конфига — оно скопировано с другого хардкода того же
+   модуля "для порядка величины". Важная оговорка: это НЕ уникальное
+   отклонение S07/S26 — весь модуль `block4_seo.py` последовательно устроен
+   так (собственный докстринг файла, "Пороги-эвристики": "каталог не даёт
+   точных чисел... обоснование у каждой константы", ни один из ~30 порогов
+   S01-S27 не читается из `config/defaults.yaml`). Так что хардкод сам по
+   себе — установленная конвенция файла, а не отдельный дефект именно этой
+   реализации; но фиксируется как факт по прямому запросу задачи: число
+   нигде не задокументировано как производное от бизнес-требования, это
+   произвольная эвристика автора кода.
+
+**Итог:** `_run_s07`/`_run_s26` реализуют реальный, работающий, но ДРУГОЙ
+показатель — "коммерческая Wordstat-фраza без единой сопоставимой строки в
+seo_queries.query" (query-coverage gap на пересечении Wordstat×GSC/Вебмастер),
+а не заявленный каталогом v2 показатель "коммерческий/гео-спрос, для которого
+на сайте нет релевантной страницы" (это требует G1/`site_pages`, а для S26 —
+ещё и позиций и гео-зоны обслуживания). Поле `has_matching_page` называет
+результат этой query-coverage проверки так, будто было подтверждено наличие
+страницы — это тоже вводит в заблуждение читателя находки, а не только
+пробел в источниках. Не чинилось (вне allowed_files этого аудита) — нужна
+отдельная задача с `src/compute/block4_seo.py` в `allowed_files`, которая
+добавит реальное сопоставление с `canonical["site_pages"]` (и для S26 —
+позиции/гео) либо явно переименует/переопределит находку как
+query-coverage-gap, если решено оставить текущую метрику как временный
+суррогат.
+
+---
+
+**FIX-s07-site-pages-join** — 2026-07-29. Устраняет пробел, зафиксированный
+AUDIT-s07-s26-formula-match (выше), только для S07 (S26 — отдельная задача,
+требует ещё позиций/гео). `src/compute/block4_seo.py`: `_gap_demand_candidates`
+переименовала поле `has_matching_page` -> `has_matching_query` (честное имя —
+функция проверяет только совпадение с seo_queries.query, не существование
+страницы; S26 использует ту же функцию, поведение/значения S26 не изменились —
+рефакторинг чисто внутри функции, поле нигде не сериализуется у S26). `_run_s07`
+получил второй независимый сигнал `has_matching_page` — на любой странице
+`canonical["site_pages"]` все слова кластера (после `normalize()`) встречаются
+в title, h1 или URL-пути (`_phrase_matches_site_page`/`_site_page_word_sets`,
+простое пересечение множеств слов — каталог `catalog-proveryaemyh-
+marketingovyh-ugroz-v2.md:263` не даёт более точной формулы). Находка
+`commercial_demand_without_landing_page` теперь требует отсутствия совпадения
+ПО ОБОИМ сигналам; кластер без query, но с реальной релевантной страницей —
+больше не находка (ключевое отличие от прежней реализации). Без
+`canonical["site_pages"]` (не только без `wordstat`, как раньше) — S07 явно
+`unavailable` с caveat "нет карты страниц" (тот же паттерн, что S11/S18/S19/S27),
+тихого fallback на старую query-only логику не осталось. Порог `SUM(count) >=
+20` вынесен из хардкода `_S07_MIN_DEMAND_COUNT` в `config/defaults.yaml:
+block4_seo.s07_min_demand_count` (с комментарием, ссылка на каталог строка 263);
+модульная константа осталась фолбэком на случай отсутствия ключа, S26
+по-прежнему читает старый хардкод напрямую (вне scope). `run()`: `_run_s07`
+получил параметр `defaults` (S26 не тронут). Тесты — `tests/test_block4_seo.py`:
+обновлены 2 существующих S07-теста (добавлена фикстура `site_pages` — контракт
+изменился, деградация без неё была бы новым тихим unavailable) + 3 новых:
+`test_s07_unavailable_without_site_pages`,
+`test_s07_reports_gap_candidates_without_query_or_page_match` (ни query, ни
+страница -> находка), `test_s07_page_match_without_query_match_is_not_a_finding`
+(страница без query -> НЕ находка, ключевой сценарий промта) —
+`pytest tests/test_block4_seo.py` — **52 passed**, 0 failed. Blocker: нет.

@@ -569,6 +569,18 @@ def run_report(paths: ClientPaths, log: StageLogger) -> bool:
     if not approved_findings_present(paths):
         log(report_gate_message(paths))
         return False
+
+    from ..report import build_report
+
     paths.report.mkdir(parents=True, exist_ok=True)
-    log("report: заглушка — src/report/build_report.py не реализован.")
+    config = load_client_config(paths)
+    defaults = load_defaults()
+
+    try:
+        out_path = build_report.build(paths, config, defaults)
+    except Exception as exc:
+        log(f"report: ОШИБКА сборки отчёта — {type(exc).__name__}: {exc}")
+        raise
+
+    log(f"report: собран -> {out_path}")
     return True

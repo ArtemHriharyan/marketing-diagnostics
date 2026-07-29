@@ -45,18 +45,39 @@
 
 ── Структурные разрывы задачи 5bA (S01-S10, НЕ устраняются здесь — вне allowed_files) ───────────
 
-1. wordstat: src/extract/wordstat.py объявляет CANONICAL_TABLES=["wordstat"],
-   но build_canonical.py НЕ строит data/canonical/wordstat.parquet ("схема не
-   задана" — см. docstring transform-модуля) — тот же класс разрыва, что CrUX
-   в block3.py (canonical_tables заявлен в манифесте экстрактора, физического
-   parquet нет). S07 (requires=[wordstat, seo_queries]) поэтому ВСЕГДА пишет
-   unavailable в текущем состоянии пайплайна — придумывать проверку без данных
-   нельзя (CLAUDE.md, протокол микрозадач п.5), тот же принцип, что A07/A16/A25
-   в block1.py. S06 (optional=[wordstat]) остаётся runnable по seo_queries
-   одному, но каждая строка отдельно помечает wordstat_available=false — без
-   Wordstat нельзя утверждать, что падение вызвано сезонностью, а не SEO
-   (каталог §11, "Что Claude не должен утверждать", п.9) — итоговый вердикт
-   S06 остаётся LOW (гипотеза), даже при большом объёме данных seo_queries.
+1. wordstat (ИСТОРИЯ, закрыто задачами FIX-wordstat-canonical +
+   FIX-block4-seo-wordstat-consumption, уточнено FIX-s07-site-pages-join):
+   src/transform/build_canonical.py строит data/canonical/wordstat.parquet
+   (LEFT JOIN wordstat_weekly + wordstat_core_queries по normalized_phrase).
+   S07 (requires=[wordstat, seo_queries], optional=[site_crawl]) сопоставляет
+   кластеры спроса (scope=='gap-specific', т.е. коммерческий спрос за
+   вычетом junk/general) с картой страниц ДВУМЯ независимыми сигналами
+   (AUDIT-s07-s26-formula-match, 2026-07-29 — query-only сопоставление не
+   соответствует формуле каталога §9 строка 263, "Сопоставить кластеры
+   Wordstat/GSC с картой страниц", источник — "Wordstat + GSC + сайт"):
+   has_matching_query — normalize(phrase) буквально совпадает с каким-то
+   query из seo_queries (старая логика, единственная до этого фикса);
+   has_matching_page — на какой-то странице canonical["site_pages"] все
+   слова фразы встречаются в title/h1/URL-пути (простое текстовое
+   пересечение множеств слов, см. _phrase_matches_site_page — каталог не
+   даёт и не требует более сложной формулы). Находка — материальный кластер
+   без совпадения ни по одному из двух сигналов. Без canonical["wordstat"]
+   ИЛИ без canonical["site_pages"] проверка пишет unavailable (данных нет —
+   не придумываем, CLAUDE.md протокол микрозадач п.5); до FIX-s07-site-
+   pages-join отсутствие site_pages не проверялось вовсе. S26 (requires=
+   [wordstat, seo_queries]) сознательно НЕ получил site_pages-сопоставление
+   этим фиксом — та же query-only логика, что и раньше
+   (geo_dimension_available=false); каталог требует для S26 ещё и позиции/
+   зону обслуживания — отдельная задача вне scope FIX-s07-site-pages-join.
+   S06 (optional=[wordstat]) сверяет месяцы-аномалии показов
+   seo_queries с недельным спросом Wordstat (фразы purpose="seasonality" —
+   единственные, которые extract специально отбирает для отслеживания
+   сезонной кривой, см. src/extract/wordstat.py:_merge_seasonality_candidates):
+   при wordstat_available=True и наличии данных за аномальный месяц итоговая
+   confidence поднимается до MED (реальная сверка, не гипотеза — каталог §11,
+   "Что Claude не должен утверждать", п.9 требует именно ПРОВЕРКИ сезонности,
+   а не констатации невозможности); без Wordstat вердикт остаётся прежним
+   (LOW, cannot_determine_without_wordstat).
 
 2. month-гранулярность seo_queries: build_seo_queries_gsc агрегирует по
    (query, page, device, month) — по одной строке на месяц, как и нужно для
@@ -199,14 +220,22 @@ S01-S07 (не требуют device по промту этой задачи) dev
     true` — находка остаётся кандидатом на ручную проверку, не вердиктом.
 
 13. **S26** ("географический/локальный спрос не покрыт отдельными
-    релевантными страницами") — requires=[wordstat, seo_queries]; тот же
-    структурный разрыв, что S07 (разрыв 1 выше): `wordstat.parquet` не
-    строится в canonical-слое ни при каких условиях в текущем состоянии
-    transform. S26 поэтому ВСЕГДА пишет unavailable, независимо от
-    runnable_ids/manifest — тот же прецедент, что S07/A07/A16/A25. Причина
-    сформулирована явно как "ядро не посчитано: источник wordstat не готов"
-    (промт задачи 5bC: не оформлять отсутствие ядра как
-    optional/upsell-примечание).
+    релевантными страницами") — requires=[wordstat, seo_queries]; закрыто
+    задачей FIX-block4-seo-wordstat-consumption той же механикой, что S07
+    (разрыв 1 выше): кластер спроса Wordstat (scope=='gap-specific') без
+    совпадения в карте страниц seo_queries.query. Без canonical["wordstat"]
+    по-прежнему пишет unavailable ("ядро не посчитано: источник wordstat не
+    готов", тот же прецедент, что S07/A07/A16/A25). **Ограничение, не
+    устранённое этой задачей:** canonical wordstat не несёт гео-поля на
+    строку — `config.sources.wordstat.regions` задаёт единый регион(ы) для
+    ВСЕЙ выгрузки целиком, а не per-фразовую гео-метку, а этот
+    compute-модуль контракт client config не читает (см. докстринг модуля,
+    "config клиента НЕ читается"). Поэтому S26 механически равен S07
+    (никакой отдельной гео-фильтрации), каждая строка несёт
+    `geo_dimension_available: false` — не выдаём совпадение с S07 за
+    географический анализ. Отдельный гео-разрез потребовал бы правки
+    build_wordstat()/wordstat.py (per-регион экстракция или колонка региона),
+    что вне allowed_files этой задачи.
 
 14. **S27** ("JS-контент или ссылки недоступны поисковому роботу") —
     реализует компонент, зарезервированный в разрыве 6 выше (`js_content_diff`
@@ -238,6 +267,7 @@ S01-S07 (не требуют device по промту этой задачи) dev
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -245,6 +275,7 @@ from urllib.parse import urlsplit
 import pyarrow.parquet as pq
 
 from . import common
+from ..extract import wordstat_config as WC
 from ..pipeline import degradation as degradation_mod
 
 # ── Пороги-эвристики (каталог не даёт точных чисел — тот же принцип, что
@@ -1068,17 +1099,133 @@ def _run_s05(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
 
 
 # ── S06 — сезонность vs падение/рост SEO (легаси 5.5) ───────────────────────
+def _wordstat_monthly_demand(con: Any) -> dict[str, int]:
+    """{month: суммарный wordstat count} по фразам с purpose, включающим
+
+    "seasonality" — единственные фразы, которые src/extract/wordstat.py
+    специально подбирает для отслеживания сезонной кривой спроса
+    (_merge_seasonality_candidates: seed-маска безусловно + топ по частоте,
+    фильтр только junk — в отличие от gap_candidates для S07/S26, которые
+    дополнительно исключают general). purpose хранится как comma-joined
+    строка (см. build_wordstat в build_canonical.py) — "seasonality" ищется
+    подстрокой, других значений с таким токеном как подстрокой не бывает.
+    """
+    rows = con.execute(
+        "SELECT month, SUM(count) FROM wordstat "
+        "WHERE purpose LIKE '%seasonality%' AND month IS NOT NULL "
+        "GROUP BY month"
+    ).fetchall()
+    return {m: int(c or 0) for m, c in rows if m}
+
+
+def _reconcile_seasonality(
+    anomalies: list[dict[str, Any]],
+    wordstat_monthly: dict[str, int],
+    wordstat_available: bool,
+    confidence_cap: str,
+) -> dict[str, Any]:
+    """Сверить месяцы-аномалии показов seo_queries с недельным спросом Wordstat.
+
+    Если Wordstat подтверждает то же направление отклонения в том же месяце
+    (рыночный спрос тоже вырос/упал) — аномалию объясняет сезонность, а не
+    SEO-проблема; это РЕАЛЬНАЯ проверка (каталог §11, "Что Claude не должен
+    утверждать", п.9 запрещает утверждать SEO-проблему БЕЗ проверки
+    сезонности — здесь сезонность именно проверяется), поэтому confidence
+    поднимается до MED. Без Wordstat (wordstat_available=False) поведение не
+    меняется — LOW/cannot_determine_without_wordstat, как и раньше.
+    """
+    base: dict[str, Any] = {
+        "check_id": "S06",
+        "finding": "seasonality_reconciliation",
+        "wordstat_available": wordstat_available,
+    }
+    if not wordstat_available:
+        base.update({
+            "limitation": (
+                "wordstat.parquet не строится в canonical-слое в текущем состоянии "
+                "transform (см. AUDIT-wordstat-canonical, docs/implementation_status.md). "
+                "Без сопоставления с Wordstat нельзя утверждать, что колебания показов "
+                "вызваны сезонностью, а не реальной SEO-проблемой (каталог §11, «Что "
+                "Claude не должен утверждать», п.9) — вердикт остаётся гипотезой."
+            ),
+            "verdict": "cannot_determine_without_wordstat",
+            "confidence": _cap("LOW", confidence_cap),
+        })
+        return base
+
+    if not anomalies:
+        base.update({
+            "limitation": "аномалий показов seo_queries не найдено — сверять с Wordstat нечего.",
+            "verdict": "no_anomaly_to_reconcile",
+            "confidence": _cap("MED", confidence_cap),
+        })
+        return base
+
+    per_month: list[dict[str, Any]] = []
+    all_confirmed = True
+    any_checked = False
+    for anomaly in anomalies:
+        month = anomaly["month"]
+        demand = wordstat_monthly.get(month)
+        if demand is None:
+            per_month.append({
+                "month": month, "anomaly_type": anomaly["type"],
+                "wordstat_demand": None, "seasonality_confirmed": None,
+            })
+            all_confirmed = False
+            continue
+        any_checked = True
+        other_months = [v for m, v in wordstat_monthly.items() if m != month]
+        baseline = _median(other_months) if other_months else None
+        ratio = (demand / baseline) if baseline else None
+        if anomaly["type"] == "spike":
+            confirmed = ratio is not None and ratio >= _S06_SPIKE_RATIO
+        else:
+            confirmed = ratio is not None and ratio <= _S06_DROP_RATIO
+        if not confirmed:
+            all_confirmed = False
+        per_month.append({
+            "month": month,
+            "anomaly_type": anomaly["type"],
+            "wordstat_demand": demand,
+            "wordstat_baseline": round(baseline, 2) if baseline is not None else None,
+            "wordstat_ratio_to_baseline": round(ratio, 3) if ratio is not None else None,
+            "seasonality_confirmed": confirmed,
+        })
+
+    if not any_checked:
+        base.update({
+            "limitation": "у Wordstat нет данных за месяцы аномалий seo_queries — сверить нечем.",
+            "verdict": "no_wordstat_data_for_anomaly_months",
+            "months": per_month,
+            "confidence": _cap("MED", confidence_cap),
+        })
+        return base
+
+    verdict = (
+        "seasonality_explains_anomaly" if all_confirmed
+        else "anomaly_not_fully_explained_by_seasonality"
+    )
+    base.update({
+        "months": per_month,
+        "verdict": verdict,
+        "confidence": _cap("MED", confidence_cap),
+    })
+    return base
+
+
 def _run_s06(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    wordstat_available = "wordstat" in canonical and _table_nonempty(canonical["wordstat"])
+
     con = common.open_duckdb(paths)
     try:
         by_month = con.execute(
             "SELECT month, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
             "GROUP BY month ORDER BY month"
         ).fetchall()
+        wordstat_monthly = _wordstat_monthly_demand(con) if wordstat_available else {}
     finally:
         con.close()
-
-    wordstat_available = "wordstat" in canonical and _table_nonempty(canonical["wordstat"])
 
     months = [(m, int(s or 0), int(c or 0)) for m, s, c in by_month]
     rows: list[dict[str, Any]] = [{
@@ -1090,6 +1237,7 @@ def _run_s06(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
         "confidence": _cap("MED", confidence_cap),
     }]
 
+    anomalies: list[dict[str, Any]] = []
     if len(months) >= _S06_MIN_MONTHS_FOR_TREND:
         shows_series = [s for _, s, _ in months]
         med = _median(shows_series)
@@ -1099,6 +1247,8 @@ def _run_s06(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             is_drop = ratio is not None and ratio <= _S06_DROP_RATIO
             if not (is_spike or is_drop):
                 continue
+            anomaly_type = "spike" if is_spike else "drop"
+            anomalies.append({"month": m, "type": anomaly_type})
             rows.append({
                 "check_id": "S06",
                 "finding": "monthly_shows_anomaly",
@@ -1107,60 +1257,239 @@ def _run_s06(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
                 "total_clicks": c,
                 "baseline_median_shows": round(med, 2) if med is not None else None,
                 "ratio_to_baseline": round(ratio, 3) if ratio is not None else None,
-                "anomaly_type": "spike" if is_spike else "drop",
+                "anomaly_type": anomaly_type,
                 "spike_ratio_threshold": _S06_SPIKE_RATIO,
                 "drop_ratio_threshold": _S06_DROP_RATIO,
                 "confidence": _cap("MED", confidence_cap),
             })
 
-    rows.append({
-        "check_id": "S06",
-        "finding": "seasonality_reconciliation",
-        "wordstat_available": wordstat_available,
-        "limitation": (
-            "wordstat.parquet не строится в canonical-слое в текущем состоянии "
-            "transform (src/extract/wordstat.py объявляет canonical_tables, но "
-            "build_canonical.py эту таблицу не собирает — расширение схемы вне "
-            "allowed_files этой задачи). Без сопоставления с Wordstat нельзя "
-            "утверждать, что колебания показов вызваны сезонностью, а не "
-            "реальной SEO-проблемой (каталог §11, «Что Claude не должен "
-            "утверждать», п.9) — вердикт остаётся гипотезой."
-        ) if not wordstat_available else (
-            "wordstat доступен в canonical, но у extract/wordstat.py нет "
-            "задокументированной схемы столбцов — сопоставление не "
-            "реализовано в этой задаче, не выдумываем поля."
-        ),
-        "verdict": "cannot_determine_without_wordstat",
-        "confidence": _cap("LOW", confidence_cap),
-    })
+    rows.append(_reconcile_seasonality(anomalies, wordstat_monthly, wordstat_available, confidence_cap))
 
     common.write_metric_artifact(metrics_dir, "s06", rows, confidence_cap=confidence_cap)
 
 
 # ── S07 — коммерческий спрос без релевантной посадочной ─────────────────────
-def _run_s07(canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
-    """requires=[wordstat, seo_queries] — wordstat структурно недоступен (см.
+# Материальность кластера спроса — суммарный wordstat.count фразы за весь
+# период (не единичные показы недели); тот же порядок величины, что
+# _MIN_SHOWS_FOR_OPPORTUNITY (общий принцип модуля, независимая константа —
+# блоки/проверки этого файла не делят пороги между собой).
+# Порог для S07 читается из config/defaults.yaml (block4_seo.s07_min_demand_count) —
+# эта константа остаётся только фолбэком, если ключ не задан (FIX-s07-site-
+# pages-join, п.3 промта: "не оставлять магическим числом в block4_seo.py").
+# S26 переиспользует эту же константу напрямую (не через defaults) — S26 вне
+# scope этого фикса, поведение/источник порога для S26 не менялся.
+_S07_MIN_DEMAND_COUNT = 20
 
-    докстринг модуля, разрыв 1), поэтому проверка всегда пишет unavailable в
-    текущем состоянии пайплайна, независимо от confidence_cap/runnable_ids
-    (тот же прецедент, что A07/A16/A25 в block1.py).
+
+def _wordstat_gap_demand(con: Any) -> list[dict[str, Any]]:
+    """[{normalized_phrase, phrase, demand_total}, ...] по фразам scope=='gap-specific'.
+
+    scope=='gap-specific' — реальный коммерческий спрос за вычетом junk и
+    general (классификация уже выполнена в extract, см. src/extract/
+    wordstat.py:_add_candidate/_merge_gap_candidates — комментарий там прямо
+    называет этот отбор "S07"). demand_total — сумма wordstat.count по всем
+    неделям окна на фразу (MIN(phrase) — детерминированный представитель
+    написания фразы для группы, все строки группы делят один normalized_phrase).
     """
-    if "wordstat" in canonical and _table_nonempty(canonical["wordstat"]):
+    rows = con.execute(
+        "SELECT normalized_phrase, MIN(phrase), SUM(count) FROM wordstat "
+        "WHERE scope = 'gap-specific' GROUP BY normalized_phrase"
+    ).fetchall()
+    return [
+        {"normalized_phrase": np, "phrase": ph, "demand_total": int(dt or 0)}
+        for np, ph, dt in rows
+    ]
+
+
+def _seo_known_query_set(con: Any) -> set[str]:
+    """Множество seo_queries.query, нормализованных тем же normalize(), что и
+
+    wordstat.normalized_phrase (src/extract/wordstat_config.normalize —
+    единая точка сравнения текста запросов, не дублируем правило второй копией).
+    """
+    rows = con.execute("SELECT DISTINCT query FROM seo_queries").fetchall()
+    return {WC.normalize(q) for (q,) in rows if q}
+
+
+def _gap_demand_candidates(
+    con: Any, min_demand: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(все материальные кластеры, кластеры без совпадения в seo_queries.query).
+
+    "Совпадение" здесь — ТОЛЬКО текстовое: normalize(phrase) кластера
+    буквально равен normalize() какого-то query из seo_queries (объединённый
+    GSC+Вебмастер, см. _aggregate_query_page). Поле называется
+    has_matching_query, а не has_matching_page (см. AUDIT-s07-s26-formula-
+    match, 2026-07-29: старое имя has_matching_page утверждало про
+    существование релевантной страницы то, чего эта функция не проверяет —
+    только совпадение с уже проранжированным запросом). Проверку "есть ли
+    РЕЛЕВАНТНАЯ СТРАНИЦА" через canonical["site_pages"] делает вызывающая
+    сторона (см. _run_s07/_phrase_matches_site_page) — S26 её сознательно не
+    делает (geo_dimension_available=false, отдельная задача вне этого фикса).
+    """
+    demand = _wordstat_gap_demand(con)
+    known_queries = _seo_known_query_set(con)
+    clusters = [c for c in demand if c["demand_total"] >= min_demand]
+    for c in clusters:
+        c["has_matching_query"] = c["normalized_phrase"] in known_queries
+    gap_candidates = [c for c in clusters if not c["has_matching_query"]]
+    return clusters, gap_candidates
+
+
+# ── S07: сопоставление кластера с картой страниц (canonical["site_pages"]) ──
+def _normalize_words(text: str | None) -> set[str]:
+    """normalize(text) -> множество слов (WC.normalize схлопывает регистр и
+
+    пробелы, split() токенизирует) — единица сравнения для текстового
+    пересечения S07 (см. _phrase_matches_site_page).
+    """
+    if not text:
+        return set()
+    return set(WC.normalize(text).split())
+
+
+def _url_path_word_source(path: str) -> str:
+    """URL-путь -> текст со словами вместо разделителей slug (/, -, _), чтобы
+
+    сегменты вида "/arenda-avto/" участвовали в текстовом пересечении наравне
+    с title/h1.
+    """
+    return re.sub(r"[/_-]+", " ", path or "")
+
+
+def _site_page_word_sets(canonical: dict[str, Path], paths: Any) -> list[set[str]]:
+    """[{слова title+h1+url-путь}, ...] — один набор слов на страницу site_pages.
+
+    Переиспользует _load_site_titles (тот же паттерн доступа к title/h1, что
+    уже используется в модуле для S08/S25) — не дублируем чтение site_pages
+    второй SQL-выборкой.
+    """
+    titles = _load_site_titles(canonical, paths)
+    out: list[set[str]] = []
+    for path, info in titles.items():
+        words = (
+            _normalize_words(info.get("title"))
+            | _normalize_words(info.get("h1"))
+            | _normalize_words(_url_path_word_source(path))
+        )
+        out.append(words)
+    return out
+
+
+def _phrase_matches_site_page(normalized_phrase: str, page_word_sets: list[set[str]]) -> bool:
+    """True, если ВСЕ слова кластера встречаются на какой-то одной странице
+
+    (title, h1 или URL-путь) — простое текстовое пересечение множеств слов,
+    без учёта порядка слов и без словоформ/семантики (каталог v2, строка 263,
+    не даёт более точной формулы сопоставления — не придумываем сверх
+    "простого текстового пересечения", промт задачи FIX-s07-site-pages-join).
+    """
+    phrase_words = set(normalized_phrase.split()) if normalized_phrase else set()
+    if not phrase_words:
+        return False
+    return any(phrase_words <= words for words in page_word_sets if words)
+
+
+_S07_SITE_PAGES_UNAVAILABLE_REASON = (
+    "ядро не посчитано: нет карты страниц — canonical[\"site_pages\"] "
+    "недоступна или пуста (site_crawl не выполнен) — формула S07 (каталог "
+    "v2 §9, строка 263: \"Сопоставить кластеры Wordstat/GSC с картой "
+    "страниц\", источник \"Wordstat + GSC + сайт\") требует сайт как третий "
+    "источник, сопоставить коммерческий спрос с реальными страницами нечем"
+)
+
+
+def _run_s07(
+    paths: Any, defaults: dict[str, Any], canonical: dict[str, Path],
+    confidence_cap: str, metrics_dir: Path,
+) -> None:
+    """requires=[wordstat, seo_queries], optional=[site_crawl]. Кластер спроса —
+
+    фраза Wordstat scope=='gap-specific' (реальный коммерческий спрос, не
+    бренд/не мусор). "Релевантная посадочная" проверяется ДВУМЯ независимыми
+    сигналами (AUDIT-s07-s26-formula-match, 2026-07-29 — прежняя query-only
+    логика не соответствовала формуле каталога "сопоставить с картой
+    страниц"):
+      1) has_matching_query — фраза (после normalize()) буквально совпадает с
+         каким-то query из seo_queries (_gap_demand_candidates, старая логика);
+      2) has_matching_page — на какой-то странице canonical["site_pages"] ВСЕ
+         слова фразы встречаются в title, h1 или URL-пути (простое текстовое
+         пересечение множеств слов, см. _phrase_matches_site_page).
+    Находка (commercial_demand_without_landing_page) — материальный кластер
+    (SUM(count) >= min_demand) без совпадения НИ ПО ОДНОМУ из двух сигналов.
+    Кластер, у которого есть страница (has_matching_page), но нет query
+    (страница существует, но не ранжируется ни по одному запросу кластера) —
+    НЕ находка этой проверки: страница релевантна намерению, каталог просит
+    искать именно ОТСУТСТВИЕ страницы, а не проблему ранжирования уже
+    существующей (та проблема — предмет S02/S03/S09).
+    Материальность SUM(count) — config/defaults.yaml: block4_seo.
+    s07_min_demand_count (см. комментарий там же, ссылка на каталог, строка
+    263); _S07_MIN_DEMAND_COUNT остаётся фолбэком, если ключ не задан.
+    Без canonical["wordstat"] ИЛИ без canonical["site_pages"] — unavailable,
+    данных нет, не придумываем (CLAUDE.md, протокол микрозадач п.5).
+    """
+    if not ("wordstat" in canonical and _table_nonempty(canonical["wordstat"])):
         _write_unavailable(
             metrics_dir, "S07",
-            "wordstat доступен в canonical, но у extract/wordstat.py нет "
-            "задокументированной схемы столбцов (see docstring transform) — "
-            "сопоставление спроса с картой страниц не реализовано в этой "
-            "задаче, не выдумываем поля",
+            "ядро не посчитано: источник wordstat не готов — wordstat.parquet "
+            "не строится в canonical-слое (src/extract/wordstat.py объявляет "
+            "canonical_tables=['wordstat'], но build_canonical.py эту таблицу "
+            "не собирает) — сопоставить коммерческий спрос с картой страниц нечем",
         )
         return
-    _write_unavailable(
-        metrics_dir, "S07",
-        "wordstat.parquet не строится в canonical-слое (src/extract/wordstat.py "
-        "объявляет canonical_tables=['wordstat'], но build_canonical.py не "
-        "собирает эту таблицу — 'схема не задана', расширение вне allowed_files "
-        "этой задачи) — сопоставить коммерческий спрос с картой страниц нечем",
+
+    if not ("site_pages" in canonical and _table_nonempty(canonical["site_pages"])):
+        _write_unavailable(metrics_dir, "S07", _S07_SITE_PAGES_UNAVAILABLE_REASON)
+        return
+
+    min_demand = int(
+        ((defaults or {}).get("block4_seo") or {}).get(
+            "s07_min_demand_count", _S07_MIN_DEMAND_COUNT
+        )
     )
+    page_word_sets = _site_page_word_sets(canonical, paths)
+
+    con = common.open_duckdb(paths)
+    try:
+        clusters, query_gap_candidates = _gap_demand_candidates(con, min_demand)
+    finally:
+        con.close()
+
+    gap_candidates: list[dict[str, Any]] = []
+    for c in query_gap_candidates:
+        c["has_matching_page"] = _phrase_matches_site_page(c["normalized_phrase"], page_word_sets)
+        if not c["has_matching_page"]:
+            gap_candidates.append(c)
+
+    rows: list[dict[str, Any]] = [{
+        "check_id": "S07",
+        "finding": "summary",
+        "clusters_evaluated": len(clusters),
+        "query_gap_candidate_count": len(query_gap_candidates),
+        "gap_candidate_count": len(gap_candidates),
+        "min_demand_threshold": min_demand,
+        "match_method": (
+            "has_matching_query: normalize(phrase) exact match against "
+            "seo_queries.query; has_matching_page: all normalize()d phrase "
+            "words present in some site_pages title/h1/url-path (word-set "
+            "intersection)"
+        ),
+        "confidence": _cap("MED", confidence_cap),
+    }]
+    for c in sorted(gap_candidates, key=lambda x: -x["demand_total"]):
+        rows.append({
+            "check_id": "S07",
+            "finding": "commercial_demand_without_landing_page",
+            "phrase": c["phrase"],
+            "normalized_phrase": c["normalized_phrase"],
+            "demand_total": c["demand_total"],
+            "min_demand_threshold": min_demand,
+            "has_matching_query": c["has_matching_query"],
+            "has_matching_page": c["has_matching_page"],
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "s07", rows, confidence_cap=confidence_cap)
 
 
 # ── S08 — страница не соответствует намерению запроса ───────────────────────
@@ -2622,29 +2951,56 @@ def _run_s25(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
 
 
 # ── S26 — геоспрос не покрыт отдельными релевантными страницами ────────────
-def _run_s26(canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
-    """requires=[wordstat, seo_queries] — wordstat структурно недоступен (тот
+def _run_s26(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
+    """requires=[wordstat, seo_queries]. Та же механика кластер-спрос-vs-
 
-    же прецедент, что S07 в этом же модуле, см. докстринг модуля, разрыв 1 и
-    13), поэтому проверка всегда пишет "ядро не посчитано", независимо от
-    confidence_cap/runnable_ids.
+    карта-страниц, что S07 (см. _gap_demand_candidates) — canonical wordstat
+    не несёт отдельного гео-поля на строку (config.sources.wordstat.regions
+    задаёт регион для ВСЕЙ выгрузки целиком, а не per-фразовую метку, а этот
+    compute-модуль client config не читает вовсе, см. докстринг модуля,
+    "config клиента НЕ читается"), поэтому geo_dimension_available=false в
+    каждой строке — не выдаём совпадение с S07 за географический анализ.
+    Без canonical["wordstat"] — unavailable, как и раньше.
     """
-    if "wordstat" in canonical and _table_nonempty(canonical["wordstat"]):
+    if not ("wordstat" in canonical and _table_nonempty(canonical["wordstat"])):
         _write_unavailable(
             metrics_dir, "S26",
-            "ядро не посчитано: источник wordstat не готов — wordstat "
-            "доступен в canonical, но у extract/wordstat.py нет "
-            "задокументированной схемы столбцов (см. докстринг transform) — "
-            "сопоставить гео-спрос с картой страниц нечем",
+            "ядро не посчитано: источник wordstat не готов — wordstat.parquet не "
+            "строится в canonical-слое (src/extract/wordstat.py объявляет "
+            "canonical_tables=['wordstat'], но build_canonical.py эту таблицу не "
+            "собирает) — гео-спрос сопоставить с картой страниц нечем",
         )
         return
-    _write_unavailable(
-        metrics_dir, "S26",
-        "ядро не посчитано: источник wordstat не готов — wordstat.parquet не "
-        "строится в canonical-слое (src/extract/wordstat.py объявляет "
-        "canonical_tables=['wordstat'], но build_canonical.py эту таблицу не "
-        "собирает) — гео-спрос сопоставить с картой страниц нечем",
-    )
+
+    con = common.open_duckdb(paths)
+    try:
+        clusters, gap_candidates = _gap_demand_candidates(con, _S07_MIN_DEMAND_COUNT)
+    finally:
+        con.close()
+
+    rows: list[dict[str, Any]] = [{
+        "check_id": "S26",
+        "finding": "summary",
+        "clusters_evaluated": len(clusters),
+        "gap_candidate_count": len(gap_candidates),
+        "min_demand_threshold": _S07_MIN_DEMAND_COUNT,
+        "match_method": "normalize(phrase) exact match against seo_queries.query",
+        "geo_dimension_available": False,
+        "confidence": _cap("MED", confidence_cap),
+    }]
+    for c in sorted(gap_candidates, key=lambda x: -x["demand_total"]):
+        rows.append({
+            "check_id": "S26",
+            "finding": "geo_demand_without_landing_page",
+            "phrase": c["phrase"],
+            "normalized_phrase": c["normalized_phrase"],
+            "demand_total": c["demand_total"],
+            "min_demand_threshold": _S07_MIN_DEMAND_COUNT,
+            "geo_dimension_available": False,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    common.write_metric_artifact(metrics_dir, "s26", rows, confidence_cap=confidence_cap)
 
 
 # ── S27 — JS-контент или ссылки недоступны поисковому роботу ───────────────
@@ -2796,7 +3152,7 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         artifacts.append("s06")
 
     if "S07" in runnable_ids and has_seo:
-        _run_s07(canonical, caps.get("S07", "HIGH"), metrics_dir)
+        _run_s07(paths, defaults, canonical, caps.get("S07", "HIGH"), metrics_dir)
         artifacts.append("s07")
 
     if "S08" in runnable_ids and has_seo and has_visits:
@@ -2874,7 +3230,7 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         artifacts.append("s25")
 
     if "S26" in runnable_ids and has_seo:
-        _run_s26(canonical, caps.get("S26", "HIGH"), metrics_dir)
+        _run_s26(paths, canonical, caps.get("S26", "HIGH"), metrics_dir)
         artifacts.append("s26")
 
     if "S27" in runnable_ids and has_seo:
