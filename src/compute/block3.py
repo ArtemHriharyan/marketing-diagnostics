@@ -1,8 +1,10 @@
-"""Блок 3 — CRO, сайт и воронка до обращения (каталог v2 §8, C01–C12).
+"""Блок 3 — CRO, сайт и воронка до обращения (каталог v2 §8, C01–C25).
 
-Задача 5G реализует ПЕРВУЮ часть блока: C01–C12 (скорость/техника, форма
-open->submit, качественные причины отвала первого порядка). C13–C25 — вне
-скоупа этой задачи, не реализованы (нет диспетчеризации ниже).
+Задача 5G реализовала C01–C12 (скорость/техника, форма open->submit,
+качественные причины отвала первого порядка). Задача 5H (текущая) добавляет
+C13–C25 (поздние условия, доверие, CTA, навигация/поиск, попапы,
+browser/OS-специфика, корзина/бронирование, наличие, контент без пути к
+деньгам) — C01–C12 при этом не переписываются.
 
 Проверки (config/methodology.yaml, catalog-proveryaemyh-marketingovyh-ugroz-v2.md §8):
     C01  медленная загрузка на мобильных                    [crux] (+visits)
@@ -17,16 +19,29 @@ open->submit, качественные причины отвала первог�
     C10  нет понятного подтверждения успешной отправки        [visits] (+webvisor_findings)
     C11  submit фиксируется, но данные фактически не доставлены [site_crawl]
     C12  на первом экране непонятно, что предлагает компания  [visits] (+webvisor_findings)
+    C13  цена/условия/следующий шаг раскрываются поздно       [visits] (+webvisor_findings)
+    C14  недостаточно доверия (гарантии/реквизиты/отзывы)     [site_crawl] (+webvisor_findings)
+    C15  основной CTA незаметен/неоднозначен                  [visits] (+site_crawl)
+    C16  слишком много конкурирующих действий на странице     [visits]
+    C17  нет альтернативы основной форме (звонок/мессенджер)  [site_crawl]
+    C18  навигация/категории/фильтры/поиск не помогают        [visits]
+    C19  внутренний поиск часто даёт ноль результатов         [visits]
+    C20  попап/чат/cookie-баннер перекрывает контент и CTA    [visits] (+webvisor_findings)
+    C21  проблема в конкретном браузере/ОС/разрешении         [visits]
+    C22  корзина/запись/бронирование теряют на конкретном шаге [visits]
+    C23  платёжный/бронирующий модуль выдаёт ошибки           [site_crawl] (+visits)
+    C24  реклама/SEO ведут на отсутствующий товар/услугу      [visits] (+site_crawl)
+    C25  информационные страницы не ведут к коммерции          [visits]
 
 Контракт:
     Читает   — data/canonical/{visits,site_pages}.parquet, data/raw/crux/crux.json
                (НАПРЯМУЮ, не через canonical — у CrUX нет канонической таблицы,
                см. src/extract/crux.py: "canonical_tables: []"), inputs/{manual_cwv,
-               manual_form_tests,webvisor_findings}.yaml, data/metrics/d01.json
-               (только C10 — сверка с переотработкой цели form_submit, тот же
+               manual_form_tests,webvisor_findings,client_answers}.yaml, data/metrics/
+               d01.json (только C10 — сверка с переотработкой цели form_submit, тот же
                прецедент, что A03 в block1.py читает d01/d03), data/metrics/
                degradation_report.json (confidence_cap на проверку).
-    Пишет    — data/metrics/{c01..c12}.csv/.json. БЕЗ LLM.
+    Пишет    — data/metrics/{c01..c25}.csv/.json. БЕЗ LLM.
 
 Не реализует: A01/A03 уже считают легаси-метрику "платный трафик vs весь сайт"
 (1.2) в block1.py — здесь она НЕ пересчитывается (см. CLAUDE.md принцип 2 и
@@ -67,7 +82,15 @@ docstring block1.py — один источник правды на одну ц�
    check_id должен быть runnable), а не тем, какие файлы блок вправе прочитать
    — блок читает inputs/manual_form_tests.yaml напрямую для C03/C08/C11 (и как
    необязательное обогащение C10), тот же приём, что T06/T09 в block2.py читают
-   inputs/client_answers.yaml напрямую.
+   inputs/client_answers.yaml напрямую. Задача 5H (C13–C25) расширяет тот же
+   приём дальше: inputs/manual_form_tests.yaml (его собственный докстринг прямо
+   говорит "Используется в проверках C01–C25") читается напрямую также для
+   C14/C17/C23 (полностью ручные, по аналогии с C03/C08/C11) и как fallback
+   для C15/C16/C18/C25 (см. разрыв 9); inputs/client_answers.yaml читается
+   напрямую для C13/C24 — ни один из этих ID не несёт client_answers в
+   requires/optional методологии, но тот же принцип "requires управляет только
+   диспетчеризацией" применяется к нему так же, как уже применялся к
+   manual_form_tests.yaml здесь и к client_answers.yaml в block2.py.
 
 4. C09/C10 в прозе методологии v2 §6 попадают в один список с C03/C08/C11
    ("не автоматизируются в принципе"), но их type_default в methodology.yaml —
@@ -88,6 +111,62 @@ docstring block1.py — один источник правды на одну ц�
    final_url — сохранность UTM-параметров через цепочку редиректов проверить
    нельзя (только факт наличия и длину цепочки). Помечено полем
    utm_preservation_verifiable=false.
+
+── Структурные разрывы задачи 5H (C13–C25) — тот же класс, что 1–6 выше ──────
+
+7. Внутренний поиск по сайту (C18, C19) НЕ выгружается ни одним модулем
+   src/extract/ и не имеет канонической таблицы вовсе (grep по репозиторию —
+   ни "site_search", ни "internal_search", ни отчёт Метрики "Поиск по сайту"
+   нигде не упоминаются). C19 (type_default="A", requires=[visits],
+   optional=[]) объявлен методологией как ПОЛНОСТЬЮ автоматический — при этом
+   реальных данных для него нет и взяться неоткуда без отдельной задачи с
+   extract/transform в allowed_files. Решение здесь: C19 всегда пишется как
+   unavailable с явной причиной, а НЕ имитируется по visits/site_pages
+   (CLAUDE.md, протокол микрозадач п.5: "не симулировать по косвенным
+   данным"). C18 (A+B, requires=[visits]) тем же разрывом лишён авто-части —
+   у него есть валидный B-фолбэк через inputs/manual_form_tests.yaml (разрыв 9).
+
+8. Пошаговая воронка корзины/записи/бронирования (C22, type_default="A",
+   requires=[visits]) невосстановима: goal_flags()/config.goals
+   (src/transform/build_canonical.py) знает только 4 плоские группы целей
+   (form_open/form_submit/call_click/messenger_click) без промежуточных шагов
+   — тот же класс ограничения, что уже задокументирован для C06 (разрыв 5
+   выше), только здесь степень серьёзнее: у C06 хотя бы есть двухступенчатая
+   open->submit воронка как приближение легаси 1.1, а для корзины/бронирования
+   в config.goals нет вообще отдельной группы "cart_step"/"booking_step" —
+   приближать нечем. C22 всегда пишется как unavailable.
+
+9. CTA-элементы, вторичные (конкурирующие) элементы страницы, попапы/чат/
+   cookie-баннеры, признаки наличия товара/услуги и классификация страниц на
+   контентные/коммерческие — ни одна из этих сущностей не хранится в
+   канонической схеме (`site_pages`: url/http_status/redirect_chain/final_url/
+   canonical_url/robots_directive/in_sitemap/title/description/h1/crawled_at/
+   js_content_diff — ни поля разметки кнопок, ни категории страницы; `visits`:
+   только 4 группы целей, browser/os/device/screen, без кликов по конкретным
+   элементам). Затрагивает C15, C16, C18, C20, C25 (все A+B/A, requires=
+   [visits], без содержательной авто-части в текущей схеме). Решение здесь —
+   не имитировать: единственный источник вывода для C15/C16/C18/C25 —
+   inputs/manual_form_tests.yaml (общий ручной аудит, см. разрыв 3), с явным
+   `automatic_component: "unavailable"` и `limitation` в каждой строке, чтобы
+   A+B-проверка без авто-сигнала не выглядела "забытой", а честно называла
+   структурную причину. C20 использует inputs/webvisor_findings.yaml (его
+   optional по methodology.yaml) тем же принципом; unavailable-причина C20
+   отдельно указывает аналитику свериться с device-конверсией C09, не
+   пересчитывая те же числа под другим check_id (см. C09/C21 ниже, разрыв 10).
+
+10. C21 ("проблема в конкретном браузере/ОС/разрешении") — единственная
+    проверка среди C13–C25 с содержательной авто-частью: `visits` хранит
+    browser/os/screen_resolution (backfill-патч, см. _BACKFILL_COLUMNS) и
+    form_submit, поэтому конверсия по сегменту сравнима с базовым (самым
+    массовым) значением того же измерения. Дименшн device сознательно
+    ИСКЛЮЧЁН из C21 (хотя каталог перечисляет device в списке измерений) —
+    он уже полностью посчитан в C09 под собственной причинной рамкой
+    ("мобильные элементы неудобны"); пересчитывать те же числа под C21 с
+    другой рамкой ("технический баг в конкретном сегменте") нарушило бы
+    "один источник правды на одну цифру" (CLAUDE.md принцип 2, тот же
+    прецедент, что A01/A03 vs C06 для легаси 1.2). Аналитик обязан
+    сопоставить оба вывода вручную на этапе analyze, а не читать их как два
+    независимых подтверждения.
 
 ── Ручные наблюдения — контракт честности (CLAUDE.md, прямое требование промта) ──
 Патерны/выводы из inputs/manual_cwv.yaml, inputs/manual_form_tests.yaml,
@@ -146,6 +225,13 @@ _C09_MIN_VISITS_FOR_COMPARISON = 30
 # считается кандидатом на непонятный оффер (эвристика, каталог числа не даёт).
 _C12_MIN_VISITS_FOR_CHECK = 30
 _C12_HIGH_ZERO_ENGAGEMENT_SHARE = 0.85
+
+# C21: измерения технической сегментации (device сознательно исключён — см.
+# докстринг модуля, разрыв 10, число уже полностью принадлежит C09) и минимум
+# визитов в сегменте/базовом значении, чтобы вообще сравнивать конверсию (тот
+# же принцип материальности, что _C09_MIN_VISITS_FOR_COMPARISON).
+_C21_SEGMENT_DIMENSIONS: tuple[str, ...] = ("browser", "os", "screen_resolution")
+_C21_MIN_VISITS_FOR_COMPARISON = 30
 
 
 # ── Общие хелперы (дублируют паттерн block0/1/2.py — блоки compute не делят
@@ -918,12 +1004,261 @@ def _run_c12(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
     common.write_metric_artifact(metrics_dir, "c12", rows, confidence_cap=confidence_cap)
 
 
+# ═══════════════════════ Задача 5H: C13–C25 ═════════════════════════════════
+# ── C13 — цена/условия/следующий шаг раскрываются поздно ───────────────────
+def _run_c13(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
+    """Единственный содержательный сигнал — client_facts из inputs/client_answers.yaml
+
+    (site_and_form.price_shown_before_submit/deposit, ответы на вопросы
+    установочного созвона, см. docstring client_answers.yaml) — client-HIGH,
+    без потолка источника (CLAUDE.md, «Уверенность находок»). `visits` сам по
+    себе не несёт события «пользователь увидел цену/условие» — момент
+    раскрытия из одних визитов не восстановим (тот же класс разрыва, что
+    описан для C15/C16/C18/C25 в докстринге модуля, разрыв 9 — только у C13
+    есть выход через client_answers, поэтому в список разрыва 9 он не входит).
+    """
+    inputs = common.load_inputs(paths)
+    client = inputs.get("client_answers") or {}
+    site_and_form = client.get("site_and_form") or {}
+    deposit = site_and_form.get("deposit") or {}
+
+    rows: list[dict[str, Any]] = []
+    price_shown = site_and_form.get("price_shown_before_submit")
+    if price_shown is not None:
+        rows.append({
+            "check_id": "C13", "finding": "client_fact_price_disclosure",
+            "price_shown_before_submit": bool(price_shown),
+            "source": "client_answers", "confidence": "client-HIGH",
+        })
+    if deposit.get("exists") is not None:
+        rows.append({
+            "check_id": "C13", "finding": "client_fact_deposit",
+            "deposit_exists": bool(deposit.get("exists")),
+            "deposit_amount_rub": deposit.get("amount_rub"),
+            "source": "client_answers", "confidence": "client-HIGH",
+        })
+
+    webvisor = inputs.get("webvisor_findings")
+    if _yaml_populated(webvisor, ("date", "sessions_reviewed")):
+        rows.extend(_manual_pattern_rows("C13", webvisor, confidence_cap, "MED"))
+        rows.extend(_manual_conclusions_rows("C13", webvisor, confidence_cap, "MED"))
+
+    if not rows:
+        _write_unavailable(
+            metrics_dir, "C13",
+            "нет ни ответа клиента (inputs/client_answers.yaml: "
+            "site_and_form.price_shown_before_submit/deposit не заполнены), ни "
+            "наблюдений Вебвизора (inputs/webvisor_findings.yaml) — момент "
+            "раскрытия цены/условий не восстановим из одних visits (нет "
+            "события просмотра цены в канонической схеме)",
+        )
+        return
+
+    common.write_metric_artifact(metrics_dir, "c13", rows, confidence_cap=confidence_cap)
+
+
+# ── C20 — попап/чат/cookie-баннер перекрывает контент и CTA ────────────────
+def _run_c20(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
+    """Нет данных о наложении элементов в канонической схеме (см. докстринг
+
+    модуля, разрыв 9) — единственный источник вывода inputs/webvisor_findings.yaml
+    (optional по methodology.yaml). Device-конверсия (потенциальный косвенный
+    сигнал "мобильный сегмент теряет конверсию") уже полностью посчитана в C09
+    под своей причинной рамкой — здесь НЕ пересчитывается (разрыв 10), только
+    упоминается как пойнтер для аналитика.
+    """
+    inputs = common.load_inputs(paths)
+    webvisor = inputs.get("webvisor_findings")
+    if not _yaml_populated(webvisor, ("date", "sessions_reviewed")):
+        _write_unavailable(
+            metrics_dir, "C20",
+            "inputs/webvisor_findings.yaml не заполнен (meta.date/"
+            "sessions_reviewed пусты) — попап/чат/cookie-баннер не "
+            "детектируются автоматически, в канонической схеме нет данных о "
+            "наложении элементов; при заполнении сверить с device-конверсией "
+            "C09 вручную (не пересчитывается повторно под C20)",
+        )
+        return
+
+    rows = _manual_pattern_rows("C20", webvisor, confidence_cap, "MED")
+    rows.extend(_manual_conclusions_rows("C20", webvisor, confidence_cap, "MED"))
+    common.write_metric_artifact(metrics_dir, "c20", rows, confidence_cap=confidence_cap)
+
+
+# ── C21 — проблема в конкретном браузере/ОС/разрешении ──────────────────────
+def _run_c21(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_dir: Path) -> None:
+    """Конверсия по browser/os/screen_resolution против самого массового
+
+    значения того же измерения (баланс — как в C09, но измерения другие;
+    device сознательно не входит, см. докстринг модуля, разрыв 10).
+    """
+    min_sample = int(defaults.get("min_sample_visits", 500))
+    alpha = float(defaults.get("significance_alpha", 0.05))
+
+    con = common.open_duckdb(paths)
+    try:
+        segment_data = {
+            dim: con.execute(
+                f'SELECT COALESCE("{dim}", \'unknown\') AS seg, COUNT(*), '
+                f'COUNT(*) FILTER (WHERE form_submit) FROM visits GROUP BY seg'
+            ).fetchall()
+            for dim in _C21_SEGMENT_DIMENSIONS
+        }
+    finally:
+        con.close()
+
+    rows: list[dict[str, Any]] = []
+    for dim, seg_rows in segment_data.items():
+        stats_by_value = {value: (int(cnt or 0), int(sub or 0)) for value, cnt, sub in seg_rows}
+        if not stats_by_value:
+            continue
+        baseline_value = max(stats_by_value, key=lambda v: stats_by_value[v][0])
+        baseline_cnt, baseline_sub = stats_by_value[baseline_value]
+        baseline_rate = (baseline_sub / baseline_cnt) if baseline_cnt else None
+
+        for value, (cnt, sub) in sorted(stats_by_value.items()):
+            rate = (sub / cnt) if cnt else None
+            p_value = None
+            underperforms = False
+            if (
+                value != baseline_value
+                and baseline_cnt >= _C21_MIN_VISITS_FOR_COMPARISON
+                and cnt >= _C21_MIN_VISITS_FOR_COMPARISON
+            ):
+                p_value = _two_proportion_p_value(baseline_sub, baseline_cnt, sub, cnt)
+                underperforms = bool(
+                    p_value is not None and p_value < alpha
+                    and rate is not None and baseline_rate is not None and rate < baseline_rate
+                )
+            rows.append({
+                "check_id": "C21",
+                "finding": "segment_conversion",
+                "segment_dimension": dim,
+                "segment_value": value,
+                "is_baseline": value == baseline_value,
+                "baseline_value": baseline_value,
+                "visit_count": cnt,
+                "form_submit_count": sub,
+                "form_submit_rate": round(rate, 4) if rate is not None else None,
+                "baseline_form_submit_rate": round(baseline_rate, 4) if baseline_rate is not None else None,
+                "p_value": round(p_value, 6) if p_value is not None else None,
+                "significance_alpha": alpha,
+                "min_visits_for_comparison": _C21_MIN_VISITS_FOR_COMPARISON,
+                "segment_underperforms_baseline": underperforms,
+                "confidence": _cap(
+                    _sample_confidence(cnt, min_sample) if cnt > 0 else "LOW", confidence_cap,
+                ),
+            })
+
+    common.write_metric_artifact(metrics_dir, "c21", rows, confidence_cap=confidence_cap)
+
+
+# ── C24 — реклама/SEO ведут на отсутствующий товар/недоступную услугу ──────
+def _run_c24(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
+    """client_facts (Q04 capacity_limits) — единственный источник: site_pages
+
+    не хранит наличие/доступность (нет поля stock/availability в схеме, см.
+    докстринг модуля, разрыв 9), а C04 отдельно уже покрывает чисто битые
+    (4xx/5xx) посадочные — здесь нужен именно случай "страница отвечает 200,
+    но услуга/товар недоступны", который без клиентского факта не восстановить.
+    """
+    inputs = common.load_inputs(paths)
+    client = inputs.get("client_answers") or {}
+    capacity_limits = client.get("capacity_limits") or []
+
+    rows: list[dict[str, Any]] = []
+    for limit in capacity_limits:
+        if not isinstance(limit, dict):
+            continue
+        text = (limit.get("limit") or "").strip()
+        if not text:
+            continue
+        rows.append({
+            "check_id": "C24", "finding": "client_fact_capacity_limit",
+            "limit": text, "period": limit.get("period"),
+            "source": "client_answers", "confidence": "client-HIGH",
+        })
+
+    if not rows:
+        _write_unavailable(
+            metrics_dir, "C24",
+            "inputs/client_answers.yaml: capacity_limits (Q04) не заполнен — "
+            "наличие/доступность товара или услуги не выгружается ни в "
+            "site_pages (нет поля stock/availability в канонической схеме), "
+            "ни в visits; C04 отдельно уже покрывает чисто битые (4xx/5xx) "
+            "посадочные, здесь нужен именно случай \"страница отвечает 200, "
+            "но услуга недоступна\", который без клиентского факта не "
+            "восстановить",
+        )
+        return
+
+    common.write_metric_artifact(metrics_dir, "c24", rows, confidence_cap=confidence_cap)
+
+
+# ── C14 — недостаточно доверия (гарантии/реквизиты/кейсы/отзывы) ───────────
+# Тип B (полностью ручная, как C03/C08/C11), плюс optional webvisor_findings
+# по methodology.yaml — единственная из manual-only проверок 5H с обогащением.
+def _run_c14(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
+    inputs = common.load_inputs(paths)
+    manual = inputs.get("manual_form_tests")
+    webvisor = inputs.get("webvisor_findings")
+    manual_ok = _yaml_populated(manual, ("tested_at",))
+    webvisor_ok = _yaml_populated(webvisor, ("date", "sessions_reviewed"))
+
+    if not manual_ok and not webvisor_ok:
+        _write_unavailable(
+            metrics_dir, "C14",
+            "ни inputs/manual_form_tests.yaml (meta.tested_at пуст), ни "
+            "inputs/webvisor_findings.yaml (meta.date/sessions_reviewed пусты) "
+            "не заполнены — элементы доверия (гарантии, реквизиты, кейсы, "
+            "отзывы, процесс) не автоматизируются, site_pages не хранит их "
+            "присутствие/расположение (см. докстринг модуля, разрыв 9)",
+        )
+        return
+
+    rows: list[dict[str, Any]] = []
+    if manual_ok:
+        rows.extend(_manual_pattern_rows("C14", manual, confidence_cap, "MED"))
+        rows.extend(_manual_conclusions_rows("C14", manual, confidence_cap, "MED"))
+    if webvisor_ok:
+        rows.extend(_manual_pattern_rows("C14", webvisor, confidence_cap, "MED"))
+        rows.extend(_manual_conclusions_rows("C14", webvisor, confidence_cap, "MED"))
+    common.write_metric_artifact(metrics_dir, "c14", rows, confidence_cap=confidence_cap)
+
+
+# ── C15/C16/C18/C25 — A+B без применимой авто-части (см. разрыв 9) ─────────
+def _run_manual_form_tests_fallback(
+    check_id: str, paths: Any, confidence_cap: str, metrics_dir: Path, gap_note: str,
+) -> None:
+    """A+B-проверка, чья автоматическая половина структурно недоступна в
+
+    текущей канонической схеме (см. докстринг модуля, разрыв 9) — единственный
+    источник вывода inputs/manual_form_tests.yaml (общий ручной аудит C01-C25,
+    см. его собственный докстринг). ``gap_note`` объясняет отсутствие авто-части
+    и в reason unavailable, и в limitation каждой ручной строки — проверка не
+    выглядит "забытой", а честно называет структурную причину.
+    """
+    inputs = common.load_inputs(paths)
+    doc = inputs.get("manual_form_tests")
+    if not _yaml_populated(doc, ("tested_at",)):
+        _write_unavailable(
+            metrics_dir, check_id,
+            f"inputs/manual_form_tests.yaml не заполнен (meta.tested_at пуст); "
+            f"{gap_note}",
+        )
+        return
+
+    rows = _manual_pattern_rows(check_id, doc, confidence_cap, "MED")
+    rows.extend(_manual_conclusions_rows(check_id, doc, confidence_cap, "MED"))
+    for row in rows:
+        row["automatic_component"] = "unavailable"
+        row["limitation"] = gap_note
+    common.write_metric_artifact(metrics_dir, check_id.lower(), rows, confidence_cap=confidence_cap)
+
+
 # ── Диспетчер блока ──────────────────────────────────────────────────────────
 def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[str]:
-    """Выполнить C01–C12 из числа доступных; вернуть имена записанных артефактов.
-
-    C13–C25 — вне скоупа задачи 5G, не диспетчеризуются.
-    """
+    """Выполнить C01–C25 из числа доступных; вернуть имена записанных артефактов."""
     canonical = common.load_canonical(paths)
     caps = _confidence_caps(paths)
     metrics_dir = Path(paths.metrics)
@@ -981,5 +1316,94 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
     if "C12" in runnable_ids and "visits" in canonical:
         _run_c12(paths, defaults, caps.get("C12", "HIGH"), metrics_dir)
         artifacts.append("c12")
+
+    # ── Задача 5H: C13–C25 ───────────────────────────────────────────────────
+    if "C13" in runnable_ids and "visits" in canonical:
+        _run_c13(paths, caps.get("C13", "HIGH"), metrics_dir)
+        artifacts.append("c13")
+
+    if "C14" in runnable_ids and "site_pages" in canonical:
+        _run_c14(paths, caps.get("C14", "HIGH"), metrics_dir)
+        artifacts.append("c14")
+
+    if "C15" in runnable_ids and "visits" in canonical:
+        _run_manual_form_tests_fallback(
+            "C15", paths, caps.get("C15", "HIGH"), metrics_dir,
+            "нет данных о видимости/CTR CTA-элементов в канонической схеме "
+            "(site_pages не хранит разметку кнопок, visits не трекает клики "
+            "по элементам вне 4 групп целей) — см. докстринг модуля, разрыв 9",
+        )
+        artifacts.append("c15")
+
+    if "C16" in runnable_ids and "visits" in canonical:
+        _run_manual_form_tests_fallback(
+            "C16", paths, caps.get("C16", "HIGH"), metrics_dir,
+            "нет данных о кликах по вторичным (конкурирующим) элементам "
+            "страницы — visits трекает только 4 группы целей (форма/звонок/"
+            "мессенджер) — см. докстринг модуля, разрыв 9",
+        )
+        artifacts.append("c16")
+
+    if "C17" in runnable_ids and "site_pages" in canonical:
+        _run_manual_only_check("C17", paths, caps.get("C17", "HIGH"), metrics_dir)
+        artifacts.append("c17")
+
+    if "C18" in runnable_ids and "visits" in canonical:
+        _run_manual_form_tests_fallback(
+            "C18", paths, caps.get("C18", "HIGH"), metrics_dir,
+            "внутренний поиск/фильтры не выгружаются ни одним источником в "
+            "pipeline — тот же класс разрыва, что и C19 (см. докстринг "
+            "модуля, разрыв 7)",
+        )
+        artifacts.append("c18")
+
+    if "C19" in runnable_ids and "visits" in canonical:
+        _write_unavailable(
+            metrics_dir, "C19",
+            "внутренний поиск по сайту не выгружается ни одним источником в "
+            "pipeline (нет модуля extract для отчёта \"Поиск по сайту\"/аналога "
+            "search-query лога, нет канонической таблицы) — частоту нулевой "
+            "выдачи посчитать нечем; не симулируется по косвенным данным "
+            "(CLAUDE.md, протокол микрозадач п.5; см. докстринг модуля, разрыв 7)",
+        )
+        artifacts.append("c19")
+
+    if "C20" in runnable_ids and "visits" in canonical:
+        _run_c20(paths, caps.get("C20", "HIGH"), metrics_dir)
+        artifacts.append("c20")
+
+    if "C21" in runnable_ids and "visits" in canonical:
+        _run_c21(paths, defaults, caps.get("C21", "HIGH"), metrics_dir)
+        artifacts.append("c21")
+
+    if "C22" in runnable_ids and "visits" in canonical:
+        _write_unavailable(
+            metrics_dir, "C22",
+            "пошаговая воронка корзины/записи/бронирования не восстановима: "
+            "goal_flags()/config.goals (src/transform/build_canonical.py) знает "
+            "только 4 плоские группы целей (form_open/form_submit/call_click/"
+            "messenger_click) без пошагового признака — тот же структурный "
+            "разрыв, что и в C06 (см. докстринг модуля, разрывы 5 и 8), только "
+            "здесь без даже двухступенчатого приближения: отдельной группы "
+            "\"cart_step\"/\"booking_step\" в config.goals нет вовсе",
+        )
+        artifacts.append("c22")
+
+    if "C23" in runnable_ids and "site_pages" in canonical:
+        _run_manual_only_check("C23", paths, caps.get("C23", "HIGH"), metrics_dir)
+        artifacts.append("c23")
+
+    if "C24" in runnable_ids and "visits" in canonical:
+        _run_c24(paths, caps.get("C24", "HIGH"), metrics_dir)
+        artifacts.append("c24")
+
+    if "C25" in runnable_ids and "visits" in canonical:
+        _run_manual_form_tests_fallback(
+            "C25", paths, caps.get("C25", "HIGH"), metrics_dir,
+            "нет классификации страниц на контентные/коммерческие ни в "
+            "config, ни в канонической схеме (site_pages не хранит категорию "
+            "страницы) — см. докстринг модуля, разрыв 9",
+        )
+        artifacts.append("c25")
 
     return artifacts

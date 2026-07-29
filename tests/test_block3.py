@@ -1,9 +1,14 @@
-"""Тесты блока 3 compute (задача 5G): C01–C12 (CRO, сайт, воронка до обращения).
+"""Тесты блока 3 compute: C01–C25 (CRO, сайт, воронка до обращения).
 
-Обязательные сценарии из промта задачи: воронка по сегментам (C06), CrUX
-отсутствует -> ручной лабораторный замер с confidence MED (C01), ручной input
-отсутствует -> unavailable (C03). Плюс минимум один сценарий на остальные
-проверки C02/C04/C05/C07/C08/C09/C10/C11/C12.
+Задача 5G (C01–C12): обязательные сценарии из промта — воронка по сегментам
+(C06), CrUX отсутствует -> ручной лабораторный замер с confidence MED (C01),
+ручной input отсутствует -> unavailable (C03). Плюс минимум один сценарий на
+остальные проверки C02/C04/C05/C07/C08/C09/C10/C11/C12.
+
+Задача 5H (C13–C25): минимум один сценарий на каждую проверку — client_facts
+(C13/C24), полностью ручные (C14/C17/C23), A+B без авто-части (C15/C16/C18/
+C25), всегда-unavailable по структурному разрыву (C19/C22), device-конверсия
+для попапов (C20), browser/os/screen сегментация (C21).
 """
 
 from __future__ import annotations
@@ -500,12 +505,252 @@ def test_confidence_cap_from_degradation_report_applied(tmp_path):
     assert summary["confidence"] == "MED"
 
 
-def test_run_does_not_dispatch_c13_and_beyond(tmp_path):
-    """C13-C25 вне скоупа задачи 5G — не должны появляться в артефактах."""
+def _write_client_answers(paths: _Paths, data: dict) -> None:
+    _write_input_yaml(paths, "client_answers", data)
+
+
+# ── C13 — цена/условия раскрываются поздно (client_facts) ──────────────────
+def test_c13_client_answers_price_and_deposit_facts(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+    _write_client_answers(paths, {
+        "site_and_form": {
+            "price_shown_before_submit": False,
+            "deposit": {"exists": True, "amount_rub": 2000},
+        },
+    })
+
+    artifacts = block3.run(paths, DEFAULTS, {"C13"})
+
+    assert "c13" in artifacts
+    rows = _read_metric(paths, "c13")
+    price_row = next(r for r in rows if r["finding"] == "client_fact_price_disclosure")
+    assert price_row["price_shown_before_submit"] is False
+    assert price_row["confidence"] == "client-HIGH"
+    deposit_row = next(r for r in rows if r["finding"] == "client_fact_deposit")
+    assert deposit_row["deposit_amount_rub"] == 2000
+
+
+def test_c13_unavailable_without_any_source(tmp_path):
     paths = _Paths(tmp_path)
     _write_visits(paths, [_base_visit()])
 
-    artifacts = block3.run(paths, DEFAULTS, {"C01", "C06", "C13", "C17"})
+    artifacts = block3.run(paths, DEFAULTS, {"C13"})
 
-    assert "c13" not in artifacts
+    assert "c13" in artifacts
+    rows = _read_metric(paths, "c13")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── C14 — недостаточно доверия (manual_form_tests + optional webvisor) ─────
+def test_c14_manual_present(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [{"url": "https://example.com/", "http_status": 200,
+                               "redirect_chain": "[]", "final_url": "https://example.com/"}])
+    _write_input_yaml(paths, "manual_form_tests", {
+        "meta": {"tested_at": "2026-07-20"},
+        "patterns": [{"step": "первый экран", "issue": "нет ни одного отзыва или кейса"}],
+    })
+
+    artifacts = block3.run(paths, DEFAULTS, {"C14"})
+
+    assert "c14" in artifacts
+    rows = _read_metric(paths, "c14")
+    assert any(r.get("finding") == "manual_pattern" for r in rows)
+
+
+def test_c14_unavailable_without_manual_or_webvisor(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [{"url": "https://example.com/", "http_status": 200,
+                               "redirect_chain": "[]", "final_url": "https://example.com/"}])
+
+    artifacts = block3.run(paths, DEFAULTS, {"C14"})
+
+    assert "c14" in artifacts
+    rows = _read_metric(paths, "c14")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── C15/C16/C18/C25 — A+B без применимой авто-части ─────────────────────────
+def test_c15_manual_fallback_present(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+    _write_input_yaml(paths, "manual_form_tests", {
+        "meta": {"tested_at": "2026-07-20"},
+        "patterns": [{"step": "главная", "issue": "кнопка CTA меняет текст между страницами"}],
+    })
+
+    artifacts = block3.run(paths, DEFAULTS, {"C15"})
+
+    assert "c15" in artifacts
+    rows = _read_metric(paths, "c15")
+    pattern_row = next(r for r in rows if r["finding"] == "manual_pattern")
+    assert pattern_row["automatic_component"] == "unavailable"
+    assert "limitation" in pattern_row
+
+
+def test_c16_unavailable_without_manual(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+
+    artifacts = block3.run(paths, DEFAULTS, {"C16"})
+
+    assert "c16" in artifacts
+    rows = _read_metric(paths, "c16")
+    assert rows[0]["status"] == "unavailable"
+
+
+def test_c18_unavailable_without_manual(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+
+    artifacts = block3.run(paths, DEFAULTS, {"C18"})
+
+    assert "c18" in artifacts
+    rows = _read_metric(paths, "c18")
+    assert rows[0]["status"] == "unavailable"
+
+
+def test_c25_manual_fallback_present(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+    _write_input_yaml(paths, "manual_form_tests", {
+        "meta": {"tested_at": "2026-07-20"},
+        "conclusions": [{"conclusion": "блог не ведёт в каталог", "confidence": "MED"}],
+    })
+
+    artifacts = block3.run(paths, DEFAULTS, {"C25"})
+
+    assert "c25" in artifacts
+    rows = _read_metric(paths, "c25")
+    assert any(r.get("finding") == "manual_conclusion" for r in rows)
+
+
+# ── C17/C23 — полностью ручные (тип B, как C03/C08/C11) ─────────────────────
+def test_c17_without_site_pages_not_dispatched(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_input_yaml(paths, "manual_form_tests", {"meta": {"tested_at": "2026-07-20"}})
+
+    artifacts = block3.run(paths, DEFAULTS, {"C17"})
+
     assert "c17" not in artifacts
+    assert not (paths.metrics / "c17.json").exists()
+
+
+def test_c23_manual_present(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [{"url": "https://example.com/", "http_status": 200,
+                               "redirect_chain": "[]", "final_url": "https://example.com/"}])
+    _write_input_yaml(paths, "manual_form_tests", {
+        "meta": {"tested_at": "2026-07-20"},
+        "patterns": [{"step": "оплата", "issue": "ошибка 500 при подтверждении брони"}],
+    })
+
+    artifacts = block3.run(paths, DEFAULTS, {"C23"})
+
+    assert "c23" in artifacts
+    rows = _read_metric(paths, "c23")
+    assert any(r.get("finding") == "manual_pattern" for r in rows)
+
+
+# ── C19/C22 — всегда unavailable (структурный разрыв, нет источника) ───────
+def test_c19_always_unavailable(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+
+    artifacts = block3.run(paths, DEFAULTS, {"C19"})
+
+    assert "c19" in artifacts
+    rows = _read_metric(paths, "c19")
+    assert rows[0]["status"] == "unavailable"
+
+
+def test_c22_always_unavailable(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+
+    artifacts = block3.run(paths, DEFAULTS, {"C22"})
+
+    assert "c22" in artifacts
+    rows = _read_metric(paths, "c22")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── C20 — попап/чат/cookie-баннер (webvisor optional) ───────────────────────
+def test_c20_webvisor_present(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+    _write_input_yaml(paths, "webvisor_findings", {
+        "meta": {"sessions_reviewed": 5, "date": "2026-07-20", "filter": "мобильные"},
+        "patterns": [{"pattern": "cookie-баннер перекрывает форму на мобильных", "count": 4}],
+    })
+
+    artifacts = block3.run(paths, DEFAULTS, {"C20"})
+
+    assert "c20" in artifacts
+    rows = _read_metric(paths, "c20")
+    assert any(r.get("finding") == "manual_pattern" for r in rows)
+
+
+def test_c20_unavailable_without_webvisor(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+
+    artifacts = block3.run(paths, DEFAULTS, {"C20"})
+
+    assert "c20" in artifacts
+    rows = _read_metric(paths, "c20")
+    assert rows[0]["status"] == "unavailable"
+
+
+# ── C21 — browser/os/screen сегментация конверсии ────────────────────────────
+def test_c21_browser_segment_underperforms(tmp_path):
+    paths = _Paths(tmp_path)
+    # os/screen_resolution заполнены одинаково для всех строк — иначе pandas
+    # вообще не создаст эти колонки (в реальном visits.parquet они есть всегда,
+    # см. _parse_visit_row в build_canonical.py, даже когда backfill не пришёл).
+    common_fields = {"os": "windows", "screen_resolution": "1920x1080"}
+    visits = (
+        [_base_visit(browser="chrome", form_submit=True, **common_fields) for _ in range(200)]
+        + [_base_visit(browser="chrome", form_submit=False, **common_fields) for _ in range(100)]
+        + [_base_visit(browser="safari", form_submit=True, **common_fields) for _ in range(5)]
+        + [_base_visit(browser="safari", form_submit=False, **common_fields) for _ in range(95)]
+    )
+    _write_visits(paths, visits)
+
+    artifacts = block3.run(paths, DEFAULTS, {"C21"})
+
+    assert "c21" in artifacts
+    rows = _read_metric(paths, "c21")
+    browser_rows = [r for r in rows if r["segment_dimension"] == "browser"]
+    chrome_row = next(r for r in browser_rows if r["segment_value"] == "chrome")
+    safari_row = next(r for r in browser_rows if r["segment_value"] == "safari")
+    assert chrome_row["is_baseline"] is True
+    assert safari_row["segment_underperforms_baseline"] is True
+
+
+# ── C24 — реклама/SEO ведут на недоступный товар/услугу (client_facts) ──────
+def test_c24_client_capacity_limit_fact(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+    _write_client_answers(paths, {
+        "capacity_limits": [{"limit": "нет свободных слотов на выходные", "period": "2026-08"}],
+    })
+
+    artifacts = block3.run(paths, DEFAULTS, {"C24"})
+
+    assert "c24" in artifacts
+    rows = _read_metric(paths, "c24")
+    fact_row = next(r for r in rows if r["finding"] == "client_fact_capacity_limit")
+    assert fact_row["confidence"] == "client-HIGH"
+
+
+def test_c24_unavailable_without_client_answers(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+
+    artifacts = block3.run(paths, DEFAULTS, {"C24"})
+
+    assert "c24" in artifacts
+    rows = _read_metric(paths, "c24")
+    assert rows[0]["status"] == "unavailable"

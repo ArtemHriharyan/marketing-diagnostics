@@ -1112,3 +1112,51 @@ degradation_report. `pytest tests/test_block3.py` — **22 passed**. Регре�
 `pytest tests/test_block0.py tests/test_block1.py tests/test_block2.py
 tests/test_block3.py tests/test_compute_common.py tests/test_degradation.py
 tests/test_smoke.py` — **154 passed**, 0 failed.
+
+---
+
+**5H** DONE — 2026-07-29. Бизнес-логика C13–C25 в `src/compute/block3.py`
+(та же вторая половина блока 3 — каталог v2 §8), диспетчер `run()` расширен;
+C01–C12 не переписаны.
+
+Из 13 проверок только C21 (browser/os/screen сегментация конверсии) несёт
+полноценную автоматическую часть — visits хранит browser/os/screen_resolution
+(backfill-патч) и form_submit, сравнение сегмента с самым массовым значением
+того же измерения тем же двухвыборочным z-тестом, что уже использует C09;
+device намеренно исключён из C21 (число уже полностью принадлежит C09 под
+своей причинной рамкой — не дублируется под другим check_id). C13/C24 несут
+единственный содержательный автоматический сигнал через client_facts —
+`inputs/client_answers.yaml` читается напрямую (не входит в requires/optional
+ни одного из них в methodology.yaml, тот же приём "requires управляет только
+диспетчеризацией", что уже применялся к `manual_form_tests.yaml` в 5G):
+C13 — `site_and_form.price_shown_before_submit`/`deposit`, C24 —
+`capacity_limits` (Q04). C14/C17/C23 — полностью ручные (тип B, как
+C03/C08/C11), гейт `site_pages` в canonical; C14 дополнительно принимает
+optional `webvisor_findings`. C20 — только optional `webvisor_findings`
+(автоматического сигнала о попапах/баннерах в схеме нет).
+
+Четыре новых структурных разрыва задокументированы в докстринге модуля (не
+устранены — extract/transform/config вне `allowed_files` этой задачи):
+(7) внутренний поиск по сайту (C18/C19) не выгружается ни одним модулем
+`src/extract/` и не имеет канонической таблицы — C19 (type_default="A", по
+методологии полностью автоматическая) всегда пишется `unavailable`, не
+имитируется по косвенным данным; (8) пошаговая воронка корзины/бронирования
+(C22, type_default="A") невосстановима — `goal_flags()`/`config.goals` знает
+только 4 плоские группы целей без промежуточных шагов и без отдельной группы
+"cart_step"/"booking_step" — C22 всегда `unavailable`; (9) CTA-элементы,
+вторичные элементы страницы, попапы/баннеры, наличие товара/услуги и
+классификация страниц контент/коммерция не хранятся ни в `site_pages`, ни в
+`visits` — C15/C16/C18/C25 (A+B без применимой авто-части) сведены к общему
+хелперу `_run_manual_form_tests_fallback` (fallback на
+`inputs/manual_form_tests.yaml`, явные поля `automatic_component`/
+`limitation` в каждой ручной строке, чтобы проверка не выглядела "забытой");
+(10) C21 сознательно не пересчитывает device-конверсию, уже посчитанную в C09
+(«один источник правды на одну цифру», тот же прецедент, что A01/A03 vs C06
+для легаси 1.2 в 5G).
+
+Тесты `tests/test_block3.py` — минимум 1 сценарий на каждую из C13–C25
+(present/unavailable там, где ветвление есть: C13/C14/C16/C18/C20/C24, плюс
+C15/C25 fallback, C17/C23 manual-only, C19/C22 always-unavailable, C21
+browser-сегментация). `pytest tests/test_block3.py` — **38 passed**
+(venv `marketing-diagnostics/.venv` — системный Python без `scipy`/`duckdb`
+не годится для этого модуля).
