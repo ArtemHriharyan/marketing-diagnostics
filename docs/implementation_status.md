@@ -1214,3 +1214,45 @@ unavailable-статус), confidence≤cap, findings_registry skeleton (заг�
 tests/test_block1.py tests/test_block3.py tests/test_money_frame.py` —
 **120 passed**, 0 failed (venv `marketing-diagnostics/.venv` — системный
 Python без `scipy`/`duckdb` не годится для этого модуля).
+
+---
+
+**5J** CHECKPOINT — 2026-07-29. Интеграционная регрессия ядра (D/A/T/C/money)
+без SEO, только запуск существующего кода — производственный код не менялся.
+
+1. `pytest tests/test_block0.py tests/test_block1.py tests/test_block2.py
+   tests/test_block3.py tests/test_money_frame.py tests/test_degradation.py`
+   — **151 passed**, 0 failed.
+2. Синтетическая фикстура 2400 визитов (ad-hoc скрипт вне репозитория,
+   `clients/_synth5j/` создавался и удалялся временно — каталог `clients/`
+   целиком в `.gitignore`, в репозитории не остался): `dispatch_blocks` ->
+   `{block0: ok, block1: ok, block2: ok, block3: ok, money_frame: ok}`,
+   `block_errors` пуст. D01 переотработка детектируется корректно на этом
+   объёме (form_submit achievements_per_visit=3.03, form_open=1.95,
+   `overtrigger=true` у обоих) — прогон подтверждает, что бизнес-логика (не
+   только dispatch-каркас) не падает и не рассинхронизируется на объёме
+   >=2000 визитов.
+3. **Pognali regression** (реальные канонические данные
+   `clients/pognali.rent/`, 34227 визитов, окно 2025-04-07..2026-06-30,
+   `python run.py pognali.rent --stage compute`, 80/100 проверок runnable):
+
+   | ожидалось (отчёт v2) | получено | check_id | вероятный слой ошибки |
+   |---|---|---|---|
+   | переотработка ×2.5–3.9 | **MATCH**: form_submit achievements_per_visit=3.099, form_open=2.787 (оба `overtrigger=true`) | D01 | — совпадает, регрессия зелёная |
+   | воронка 20.9% | не воспроизведено; ближайший веб-аналоговый показатель — C06 `open_to_submit_rate`=0.5528 (form_open→submit), а не 20.9% | C06 (legacy 1.1) | вероятно, 20.9% в отчёте v2 — CRM-метрика (лид→сделка), не веб-метрика; `clients/pognali.rent/inputs/crm_export.csv` — **0 строк** (только заголовки), `sources.crm_csv.enabled: false` в config.yaml. Разрыв в extract/данных клиента, не в compute |
+   | реклама 17.2% | не воспроизведено; веб-прокси (visit-level macro-goal конверсия по source_group=ad) = 2.37%, per-user = 2.96% | A01/A05 (нет прямого check_id на этот показатель) | та же причина — вероятно top-of-funnel показатель либо CRM-based ad-attributed rate; без CRM не проверить |
+   | полный CPA ~3440 ₽ | не воспроизведено; веб-прокси: `cost_rub` сумма Директа = 492 661.4 ₽ (сверено по 3 независимым канонич. таблицам — campaigns/geo/placements совпадают); / macro-goal ad-конверсии (456) = 1080 ₽; / `conversions_all` из отчётов Директа (2126) = 232 ₽ | A05 (unavailable: macro_goals не настроен в config.yaml) + M (money_frame) | оба веб-прокси на порядок ниже 3440 ₽ — согласуется с гипотезой "полный CPA" = cost/deals (CRM), а не cost/clicks-или-форм; A05 к тому же сейчас `unavailable` (macro_goals пуст в client config), что само по себе отдельный, второй разрыв |
+
+   Итог: единственная числовая проверка с чистым воспроизведением — переотработка
+   (D01). Три остальных упираются в один и тот же корень — `crm_export.csv`
+   пуст/отключён — это не подгонялось и не чинилось (вне `allowed_files`
+   задачи; правка требует `sources.crm_csv.enabled: true` + реальный экспорт
+   в `clients/pognali.rent/inputs/crm_export.csv`, отдельная задача).
+4. Direct-профиль (та же синтетическая фикстура из п.2, но `sources.direct`
+   не объявлен в манифесте): все 26 A-проверок уходят в degradation (0
+   runnable), при этом D (7 runnable), T (7 runnable), C (17 runnable) не
+   затронуты — "допустимые агрегаты считаются, недоступные проверки явно
+   уходят в degradation" подтверждено. То же самое видно и на реальном
+   Pognali-прогоне частично: A01/A02/A03 (`campaign_strategies` не в
+   манифесте) — skipped с явной причиной, остальные A-проверки (costs+visits
+   есть) — ok.
