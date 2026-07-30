@@ -22,6 +22,7 @@ import pyarrow.parquet as pq
 import yaml
 
 from src.compute import block0  # noqa: E402
+from src.transform import build_canonical as bc  # noqa: E402
 
 
 class _Paths:
@@ -29,6 +30,7 @@ class _Paths:
 
     def __init__(self, root: Path):
         self.root = root
+        self.raw = root / "data" / "raw"
         self.canonical = root / "data" / "canonical"
         self.metrics = root / "data" / "metrics"
         self.inputs = root / "inputs"
@@ -731,3 +733,24 @@ def test_confidence_is_capped_to_degradation_report_ceiling(tmp_path):
     rows = _read_metric(paths, "d01")
     fs = next(r for r in rows if r["goal_group"] == "form_submit")
     assert fs["confidence"] == "MED"  # не HIGH, несмотря на большую выборку
+
+
+def test_d06_q01_answer_is_applied_by_transform(tmp_path):
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True)
+    config = {
+        "costs_manual": {"agency_fee_rub_month": 12000},
+        "data_window": {"date_from": "2026-01-01", "date_to": "2026-01-01"},
+    }
+    client_answers = {"finance": {"vat_basis_by_source": [
+        {"source": "agency_fee", "vat_included": True, "evidence": "invoice"},
+    ]}}
+    bc.build(paths, config, DEFAULTS, client_answers=client_answers)
+    _write_client_answers(paths, client_answers)
+
+    block0.run(paths, DEFAULTS, {"D06"})
+    row = _read_metric(paths, "d06")[0]
+
+    assert row["actual_cost_status"] == "gross"
+    assert row["expected_cost_status"] == "gross"
+    assert row["answer_not_applied"] is False

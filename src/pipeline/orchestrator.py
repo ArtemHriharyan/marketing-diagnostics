@@ -530,7 +530,9 @@ def run_transform(paths: ClientPaths, log: StageLogger) -> None:
     config = load_client_config(paths)
     defaults = load_defaults()
 
-    built = build_canonical.build(paths, config, defaults)
+    client_answers_path = paths.inputs / "client_answers.yaml"
+    client_answers = load_yaml(client_answers_path) if client_answers_path.exists() else {}
+    built = build_canonical.build(paths, config, defaults, client_answers=client_answers)
     if built:
         log(f"transform: построено {len(built)} таблиц -> {', '.join(built)}")
     else:

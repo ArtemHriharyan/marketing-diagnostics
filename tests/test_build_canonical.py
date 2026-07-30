@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.extract.metrika_logs import LOOKBACK_SUBDIR, VISIT_FIELDS, VISIT_FIELDS_BASE  # noqa: E402
 from src.pipeline import manifest as manifest_mod  # noqa: E402
 from src.transform import build_canonical as bc  # noqa: E402
+from src.pipeline import orchestrator  # noqa: E402
 
 
 # ═════════════════════════════ dedupe_visits ═════════════════════════════
@@ -294,6 +295,7 @@ def test_normalize_crm_source_lowercases_and_strips():
 class _Paths:
     def __init__(self, root: Path):
         self.root = root
+        self.inputs = root / "inputs"
         self.raw = root / "data" / "raw"
         self.canonical = root / "data" / "canonical"
 
@@ -1620,6 +1622,51 @@ def test_costs_vat_basis_unknown_when_no_finance_config(tmp_path):
     costs = pd.read_parquet(paths.canonical / "costs.parquet")
     assert (costs["cost_status"] == "vat_basis_unknown").all()
     assert costs["cost_normalized"].isna().all()
+
+
+@pytest.mark.parametrize(
+    ("vat_included", "expected_status"),
+    [(True, "gross"), (False, "net"), (None, "vat_basis_unknown")],
+)
+def test_costs_vat_q01_answers_control_normalization(tmp_path, vat_included, expected_status):
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    config = {
+        "costs_manual": {"agency_fee_rub_month": 12000},
+        "data_window": {"date_from": "2026-07-01", "date_to": "2026-07-01"},
+    }
+    client_answers = {"finance": {"vat_basis_by_source": [
+        {"source": "agency_fee", "vat_included": vat_included},
+    ]}}
+
+    bc.build(paths, config, {"utm_undefined_threshold": 0.25}, client_answers=client_answers)
+    row = pd.read_parquet(paths.canonical / "costs.parquet").iloc[0]
+
+    assert row["cost_status"] == expected_status
+    if vat_included is True:
+        assert row["cost_normalized"] == pytest.approx(row["cost_raw"] / 1.2)
+    elif vat_included is False:
+        assert row["cost_normalized"] == pytest.approx(row["cost_raw"])
+    else:
+        assert pd.isna(row["cost_normalized"])
+
+
+def test_run_transform_loads_q01_from_client_answers(tmp_path, monkeypatch):
+    paths = _Paths(tmp_path)
+    paths.inputs.mkdir(parents=True)
+    (paths.inputs / "client_answers.yaml").write_text(
+        "finance:\n  vat_basis_by_source:\n    - source: direct\n      vat_included: true\n", encoding="utf-8"
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(orchestrator, "load_client_config", lambda _: {})
+    monkeypatch.setattr(orchestrator, "load_defaults", lambda: {})
+    monkeypatch.setattr(bc, "build", lambda *args, **kwargs: captured.update(kwargs) or [])
+
+    orchestrator.run_transform(paths, lambda _: None)
+
+    assert captured["client_answers"] == {"finance": {"vat_basis_by_source": [
+        {"source": "direct", "vat_included": True},
+    ]}}
 
 
 def test_costs_vat_mixed_sources(tmp_path):

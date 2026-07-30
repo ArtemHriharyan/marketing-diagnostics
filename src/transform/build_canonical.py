@@ -1972,7 +1972,12 @@ def _write_canonical_manifest(canonical_dir: Path, tables: list[str], flags: dic
 
 
 # ═════════════════════════════ Оркестрация ══════════════════════════════════
-def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[str]:
+def build(
+    paths: Any,
+    config: dict[str, Any],
+    defaults: dict[str, Any],
+    client_answers: dict[str, Any] | None = None,
+) -> list[str]:
     """Построить все возможные канонические таблицы; вернуть список их имён.
 
     Доступность источника — по data/raw/manifest.json (не по config.yaml):
@@ -2031,7 +2036,11 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> list[
 
     direct_dir = raw_dir / "direct" if "direct" in sources else None
     direct_entry = sources.get("direct")
-    finance_cfg = config.get("finance") or {}
+    finance_cfg = (
+        (client_answers or {}).get("finance") or {}
+        if client_answers is not None
+        else config.get("finance") or {}
+    )
     vat_basis = finance_cfg.get("vat_basis_by_source") or []
     costs_df = build_costs(direct_dir, direct_entry, config, defaults, vat_basis)
     if not costs_df.empty:
