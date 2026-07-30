@@ -91,7 +91,8 @@ class StageLogger:
         return self
 
     def __call__(self, message: str = "") -> None:
-        print(message)
+        encoding = sys.stdout.encoding or "utf-8"
+        print(message.encode(encoding, errors="replace").decode(encoding))
         if self._fh:
             self._fh.write(message + "\n")
             self._fh.flush()

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import io
 import sys
 import types
 from pathlib import Path
@@ -93,3 +94,16 @@ def test_auth_error_log_also_separates_internal_code(monkeypatch, paths):
     line = unavailable_lines[0]
     assert "внутренний код оркестратора 3" in line
     assert "(код 3)" not in line
+
+
+def test_stage_logger_preserves_unicode_in_file_when_stdout_is_cp1251(monkeypatch, paths):
+    """UTF-8 file preserves the original message with a cp1251 console."""
+    message = "multiplication: \u00d7"
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1251")
+    monkeypatch.setattr(sys, "stdout", stdout)
+
+    with orchestrator.StageLogger(paths, "extract") as log:
+        log(message)
+
+    log_file, = paths.logs.glob("extract_*.log")
+    assert log_file.read_text(encoding="utf-8") == message + "\n"
