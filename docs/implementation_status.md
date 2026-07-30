@@ -3148,3 +3148,241 @@ site_link_graph.parquet` существует (21771 байт, прогон 2026
 исправления задачи `FIX-site-crawl-canonical-tables-rename` (см. выше), не
 повтор прежнего бага. S18/S19 разблокированы под этим именем реально, не
 только на бумаге. Blocker: нет.
+
+---
+
+## task CHECKPOINT-full-pipeline-e2e (2026-07-30)
+
+Сквозная проверка всего конвейера на pognali.rent после серии P0/P1/P2 задач.
+Диагностика и живой прогон на боевых данных клиента (не scratch-копия —
+идемпотентная перезапись собственного слоя каждой стадией допустима
+принципом 2, а часть цели проверки — подтвердить факт работы на реальных
+данных, не на фикстурах).
+
+### Часть 1 — регрессия
+
+`pytest tests/ -q --continue-on-collection-errors` — **4 failed, 862 passed**.
+Совпадает с задокументированным baseline (`AUDIT-pre-existing-failures` +
+все P2-фиксы этой сессии): `tests/test_extract_smoke.py::
+test_metrika_logs_negotiation_isolates_unsupported_fields`,
+`::test_metrika_logs_backfill_preserves_old_files`,
+`::test_wordstat_queue_cycle_writes_raw_and_manifest`,
+`::test_wordstat_dead_token_raises`. `test_direct_2b_patch.py` ×2 из
+прежнего baseline теперь зелёные (`FIX-block1-cost-normalization` уже
+прогнан ранее). Новых незадокументированных падений нет.
+
+### Часть 2 — живой прогон
+
+**intake** — OK. Предупреждение `data_window не содержит поля mode`
+ожидаемо (флат-формат `clients/pognali.rent/config.yaml`, обратная
+совместимость по CLAUDE.md).
+
+**extract** — при первом прогоне **упал целиком** (не деградация одного
+источника, а падение всей стадии — именно то, что чек-лист требовал
+расследовать отдельно, не списывать на «предсуществующее»). Корневая
+причина: `StageLogger.__call__` (`src/pipeline/orchestrator.py:93-97`)
+вызывает голый `print(message)`; консоль этой сессии — кодовая страница
+`cp1251` (по умолчанию для RU-локали Windows), а `webmaster_manual.py:115`
+логирует символ `×` (U+00D7, «уникальных пар query×page»), которого нет в
+cp1251 → `UnicodeEncodeError`, необработанный, роняет весь `run_extract`
+после того, как `webmaster_manual` уже успешно посчитал данные (лог
+успевает написать «файлов 421, страниц 18, demand=True» и падает на
+следующей строке). Файл лога (`open(..., encoding="utf-8")`) от бага не
+страдает — ловит его только консольный `print`. Затронуты все источники
+после webmaster в порядке диспетчеризации (gsc/wordstat/crux/crm/
+site_crawl ни разу не были вызваны в упавшем прогоне). Не исправлено —
+`src/pipeline/orchestrator.py` вне `allowed_files` этой задачи; для этого
+прогона использован обходной путь без правки кода:
+`PYTHONIOENCODING=utf-8 PYTHONUTF8=1` перед `python run.py`. Реальный фикс
+(`StageLogger.__call__` → `print(message, file=sys.stdout)` с явной
+UTF-8-обёрткой или `errors="replace"`) — отдельная задача, не входила в
+`allowed_files` чекпоинта. Blocker для документации, не для прогона.
+
+С обходным путём — **extract прошёл полностью**: `выгружено 9, недоступно
+0, пропущено 0` (metrika_reports 148 строк, metrika_logs 34227 строк
+(пропуск повторной выгрузки — patch_date уже закрыт), direct 1407 строк
+(запросы — 0 строк, `SEARCH_QUERY_PERFORMANCE_REPORT` реально вернул
+данные только за один день 2026-01-31 при окне 2025-04-07..2026-06-30 —
+не расследовано, вне скоупа этой задачи, из-за чего `direct_queries.parquet`
+в этом прогоне не перезаписан и в canonical/ остался устаревший файл от
+2026-07-23 — не путать с актуальными таблицами, отдельный вопрос на
+будущее), webmaster_manual 421, gsc_manual 6813, wordstat 2405 (37 фраз,
+40 вызовов API), crux 3 (cwv_field_data_available=true), crm_import 1357,
+site_crawl 21 страница/2989 рёбер графа — с ожидаемым частичным
+вырождением BFS по не-HTML/таймаутящимся ассетам (`skipped_non_html`/
+`ReadTimeout` на картинках — не источник целиком, только отдельные URL,
+это управляемая деградация принципа 4, не падение). Автосверка Logs↔Reports
+— **OK, 30/0/0** (все 15 месяцев по визитам и охвату <0.5% расхождения).
+
+Проверка манифест-флагов из промта — все подтверждены фактом прогона:
+- `input_tables: ["client_answers", "manual_form_tests"]` — фикс
+  `FIX-input-tables-manifest-gate` реально работает на боевых данных, не
+  только в тестах.
+- `sources.crm.crm_attribution_reliable: false` (не top-level поле, как
+  буквально сформулировано в промте, а вложенное в `sources.crm` —
+  расхождение с формулировкой промта, не с фактом; значение и текст
+  причины совпадают с `config.yaml: crm_csv.attribution_unreliable_reason`).
+- `sources.direct.ad_extensions_price_fields_available: false`,
+  `ad_extensions_caveat.affected_checks: ["A24"]` — подтверждено.
+- `sources.site_crawl.source_caveats` — присутствует ровно там, где
+  кандидатов >20: `top_organic_webmaster` (26 кандидатов, оставлено 20,
+  отброшено 6).
+
+**transform** — OK. `построено 14 таблиц`: visits, goals, costs,
+direct_campaigns, direct_geo, direct_placements, campaign_strategies,
+ad_texts, ad_texts_archived, seo_queries, **wordstat**, crm, site_pages,
+site_link_graph. `wordstat.parquet` подтверждён физически (20828 байт,
+свежий таймстамп прогона).
+
+**compute** — при первом прогоне **block4 (SEO, S01-S27) молча не
+считался**: `block4: not_implemented` в выводе стадии, ни одного `s*.json`
+в `data/metrics/` не появилось — не «unavailable по всем строкам», как
+предполагал промт, а полное отсутствие расчёта, ни разу, ни в одном
+реальном прогоне. Корневая причина: `BLOCK_MODULE_NAMES`
+(`src/compute/common.py:229-232`) диспетчеризует модуль `src.compute.
+block4` — это заглушка **старой** нумерации методологии (докстринг «Блок
+4 — атрибуция», проверки 4.1/4.2, `raise NotImplementedError`,
+`src/compute/block4.py`), а не `src/compute/block4_seo.py`, где реально
+реализованы S01-S27 (задачи 5bA/5bB/5bC и все последующие S-фиксы этой
+сессии — `AUDIT-s07-s26-formula-match`, `FIX-site-crawl-canonical-tables-
+rename` и т.д. — были протестированы юнит-тестами напрямую, но никогда не
+проходили через реальный `dispatch_blocks`). Файл `block4.py` — мёртвый
+код той же природы, что `write_ad_texts_archive` в `AUDIT-input-tables-
+blast-radius`, только с более серьёзным следствием: он не просто не
+вызывается — он **вызывается вместо** правильного модуля и глотает
+ошибку через `except NotImplementedError`, поэтому баг ничем не сигналил
+о себе, кроме статуса в логе стадии, который никто не читал построчно.
+
+Правка (по решению аналитика — вне `allowed_files`, подтверждено явно
+перед внесением): `src/compute/common.py` — `BLOCK_MODULE_NAMES`:
+`"block4"` → `"block4_seo"`. Однострочная правка, `block4.py` не удалён
+(вне скоупа, отдельный вопрос — мёртвый файл старой нумерации, может
+пригодиться для будущей атрибуции 4.1/4.2 или подлежит удалению отдельной
+задачей). Регрессия: полный `pytest tests/` после правки — **4 failed,
+862 passed**, те же 4 предсуществующих падения, ни одного нового.
+
+После фикса — **compute: выполнимо 91/100, пропущено 9**,
+`block4_seo: ok`. `s01..s19,s21..s27` (23 файла; `s20` в skipped —
+см. ниже) реально посчитаны на боевых данных. Точечная проверка глубины
+расчёта (не только факт существования файла):
+- `s06.json` — `monthly_shows_trend`/`monthly_shows_anomaly` с реальными
+  помесячными show/click рядами (13 месяцев) и обнаруженными аномалиями
+  (spike/drop против медианы).
+- `s07.json` — `summary` (`clusters_evaluated: 31`,
+  `query_gap_candidate_count: 14`) + построчные
+  `commercial_demand_without_landing_page` с реальным `demand_total` из
+  Wordstat.
+- `s26.json` — `summary` + `geo_demand_without_landing_page` с реальными
+  `demand_total`; `geo_dimension_available: false` — ожидаемое,
+  задокументированное ранее (`AUDIT-s07-s26-formula-match`) структурное
+  ограничение (гео-срез Wordstat недоступен), не баг и не деградация
+  этого прогона.
+
+Итог: `wordstat.parquet` + `block4_seo` + `s07`-site_pages-join реально
+работают вместе на реальных данных клиента, не только на фикстурах —
+именно то, что просил проверить промт, но обнаруженный по пути дефект
+диспетчера был серьёзнее, чем можно было предположить (не «строки
+unavailable», а «весь блок ни разу не считался»).
+
+**Побочное открытие (не в списке промта, не расследовано глубоко, вне
+скоупа):** тем же классом бага, что и `block4`/`write_ad_texts_archive`
+(`AUDIT-input-tables-blast-radius`) — `crux` реально экстрагируется
+(`data/raw/crux/`, `cwv_field_data_available=true`), но
+`src/transform/build_canonical.py` не содержит вообще никакой логики
+построения канонической таблицы `crux` (`grep -c crux` → 0 в этом файле).
+`config/methodology.yaml` требует `requires: [crux]` у C01, C02, S20
+(строки 606, 617, 1091) — эти три проверки структурно недостижимы
+(`runnable=true` никогда), подтверждено `degradation_report.json` этого
+прогона: `C01`/`C02`/`S20` в `skipped`, `missing: ["crux"]`. Не входило в
+`AUDIT-input-tables-blast-radius` (тот аудит покрывал `client_answers`/
+`webvisor_findings`/`crm`/`manual_serp`/`site_crawl`, не `crux`) — четвёртый
+независимый экземпляр того же класса бага, найден только благодаря этому
+чекпоинту. Правок не вносилось (вне `allowed_files` и вне явного решения
+аналитика по этому конкретному пункту — только `block4` был согласован).
+Кандидат на отдельную `FIX`-задачу.
+
+Остальные 6 из 9 skipped — без сюрпризов, ожидаемые ограничения источников
+на этом клиенте: `D02`/`D03` (`missing: [goals]` — цели `count`/`sum`-типа
+Метрики недоступны для сверки, независимо от `_run_d0x`), `A01`/`A02`/`A03`
+(`missing: [campaign_strategies]` — ручная стратегия кампаний не заполнена
+клиентом), `C14` (`missing: [site_crawl]` — осознанное решение
+`AUDIT-c14-requires-decision`, не баг).
+
+**D06/D07 — реальная валидация фикса `FIX-input-tables-manifest-gate` на
+боевых данных, с неожиданным положительным эффектом.** Оба теперь
+`runnable=true` (не в skipped). D06 **поймал** ровно то расхождение,
+которое предсказывал `AUDIT-vat-basis-source-path-critical`:
+`expected_cost_status: "gross"` (из `client_answers.yaml`, Q01 отвечен) vs
+`actual_cost_status: "vat_basis_unknown"` (баг пути `vat_basis_by_source`
+всё ещё не исправлен) → `answer_not_applied: true`. Т.е. система теперь
+корректно детектирует свой собственный незакрытый баг вместо того, чтобы
+молчать о нём (раньше D06 был `skipped` и не мог его увидеть). D07 —
+`possible_double_counted_budget`, `direct_total_rub: 492661.44`,
+`yandex_business_total_rub: 0.0`, `both_present: false` — сдвоенного учёта
+бюджета на этом клиенте нет (Яндекс Бизнес не подключён).
+
+**analyze/report** — по решению аналитика **не запускались** в рамках
+этого чекпоинта: `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` не заданы в
+этой сессии, а `analyze` — реальный платный вызов LLM по ~91 выполнимой
+проверке; запускать вслепую без ключа или молча искать обходной путь не
+стали. `findings/draft/`, `findings/approved/`, `report/` для
+pognali.rent по-прежнему пусты после этого чекпоинта — гейт перед report
+не снят. Требует отдельного прогона с доступным ключом.
+
+### Часть 3 — сверка открытых пунктов
+
+Все заранее известные открытые вопросы подтверждены этим прогоном ровно
+так, как задокументированы, без сюрпризов:
+- **S26** — структурно ограничен (`geo_dimension_available: false`),
+  как и предсказано `AUDIT-s07-s26-formula-match`; численно теперь виден
+  впервые (см. выше), но природа ограничения не изменилась.
+- **cost_normalized-гэп** (`AUDIT-vat-basis-source-path-critical`) —
+  подтверждён на 100% боевых строк: `costs.parquet` (1377 строк) —
+  `cost_status="vat_basis_unknown"` и `cost_normalized IS NULL` во всех
+  без исключения строках. Фикс `FIX-block1-cost-normalization` (отдельный
+  путь через `block1.py`, в обход `build_canonical.build()`) закрывает
+  A09-A15/A17-A19; A04/A05/A06/A08 (прямые читатели `costs.parquet`)
+  по-прежнему получают `None`/деградацию по деньгам — не регрессия этого
+  чекпоинта, тот же задокументированный гэп.
+- **`statistics_field_scope: "unknown"`** (`sources.direct`) —
+  подтверждён как есть, без изменений.
+
+Два пункта, обнаруженных этим чекпоинтом и **не** входивших в список
+известных открытых вопросов промта — оба задокументированы выше:
+диспетчерский баг `block4`/`block4_seo` (исправлен по ходу задачи, с
+явного согласия) и мёртвая логика построения канонической `crux`-таблицы
+(не исправлена, кандидат на отдельную задачу).
+
+### Итоговая таблица
+
+| Этап | Статус | Подтверждено фактом прогона |
+|---|---|---|
+| pytest (полный) | прошёл, baseline без изменений | 4 failed / 862 passed, состав совпадает с baseline |
+| intake | прошёл | таблица источников, warning про data_window ожидаем |
+| extract | упал целиком → починен обходным путём (без правки кода) | `UnicodeEncodeError` в `StageLogger.__call__`/`webmaster_manual.py:115`; с `PYTHONIOENCODING=utf-8` — 9/9 источников, сверка Logs↔Reports OK 30/0/0 |
+| transform | прошёл | 14 таблиц, включая `wordstat.parquet` |
+| compute | деградировал ожидаемо (9/9 известных случаев) + один неожиданный полный провал блока, исправлен | `block4`→`block4_seo` фикс подтверждён: 91/100 runnable, S01-S27 (кроме S20) реально посчитаны с содержательными данными |
+| analyze | не запускался (решение аналитика) | нет `ANTHROPIC_API_KEY` в сессии |
+| report | не запускался (гейт: `findings/approved/` пуст) | ожидаемо — analyze не выполнялся |
+
+### Файлы реального отчёта этого прогона
+
+`report/` пуст — report не собирался (см. выше). Артефакты этого прогона,
+которые можно открыть:
+- `clients/pognali.rent/data/raw/manifest.json`,
+  `clients/pognali.rent/data/raw/reconciliation.json`
+- `clients/pognali.rent/data/canonical/*.parquet` (14 файлов + 2
+  устаревших сироты прошлых схем — `direct_queries.parquet`,
+  `geo.parquet`, не перезаписаны в этом прогоне, см. выше про
+  `SEARCH_QUERY_PERFORMANCE_REPORT`)
+- `clients/pognali.rent/data/metrics/degradation_report.json`,
+  `metrics_summary.json`, `d*.json`/`a*.json`/`t*.json`/`c*.json`/
+  `s*.json` (91 выполнимых проверок)
+- `clients/pognali.rent/logs/*_20260730_*.log` (intake/extract/transform/
+  compute этого прогона)
+
+Blocker: нет для завершённой части (Части 1-2 через compute). Открыт
+явный, согласованный с аналитиком blocker для analyze/report — нужен
+`ANTHROPIC_API_KEY` для продолжения. Изменённый файл вне `allowed_files`:
+`src/compute/common.py` (однострочный фикс диспетчера, внесён по прямому
+согласию аналитика в ходе задачи, не самовольное расширение скоупа).

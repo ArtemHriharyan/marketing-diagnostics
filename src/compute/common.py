@@ -226,8 +226,13 @@ def write_metric_artifact(
 
 
 # ── Dispatch блоков по runnable ─────────────────────────────────────────────
+# CHECKPOINT-full-pipeline-e2e (2026-07-30): "block4" был заглушкой старой
+# нумерации (атрибуция 4.1/4.2, raise NotImplementedError) — реальный SEO-блок
+# (S01-S27) реализован в block4_seo.py и никогда не вызывался диспетчером.
+# S-проверки не считались ни в одном реальном прогоне. block5/block6 пока
+# остаются NotImplementedError-заглушками (вне скоупа этого фикса).
 BLOCK_MODULE_NAMES: tuple[str, ...] = (
-    "block0", "block1", "block2", "block3", "block4", "block5", "block6",
+    "block0", "block1", "block2", "block3", "block4_seo", "block5", "block6",
     "money_frame",
 )
 
