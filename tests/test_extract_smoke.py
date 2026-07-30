@@ -100,9 +100,8 @@ NO_SLEEP = lambda _sec: None
 
 # ── metrika_logs ───────────────────────────────────────────────────────────
 # Синтетический "bad" для проверки алгоритма бинарного деления negotiate.
-# В реальном API все поля патча теперь принимаются; isRobotPro удалён из кандидатов
-# (тариф). Используем lastSignhasGCLID как симулируемое отклонение.
-_METRIKA_BAD_FIELDS = {"ym:s:lastSignhasGCLID"}
+# Используем реально переговоряемое поле из текущего набора кандидатов.
+_METRIKA_BAD_FIELDS = {"ym:s:goalsSerialNumber"}
 
 
 def _evaluate_route(get_session, bad=frozenset()):
@@ -205,7 +204,7 @@ def test_metrika_logs_negotiation_isolates_unsupported_fields(paths):
     entry = manifest_mod.load_manifest(paths.raw)["sources"]["metrika_logs"]
     # Валидные поля остались доступны.
     for good in ("ym:s:lastTrafficSource", "ym:s:browser", "ym:s:screenWidth",
-                 "ym:s:regionCity"):
+                 "ym:s:regionArea"):
         assert good in entry["available_fields"]
     # Причина отклонения записана по каждому dropped-полю.
     for bad in _METRIKA_BAD_FIELDS:
@@ -1258,54 +1257,51 @@ def test_crux_missing_api_key_raises(paths):
 
 
 # ── wordstat ─────────────────────────────────────────────────────────────────
-CONFIG_WS = {"wordstat_seeds": ["аренда авто", "прокат машин"], "wordstat_geo": [10231]}
-ENV_WS = {"WORDSTAT_TOKEN": "fake-ws"}
+CONFIG_WS = {
+    "wordstat_seeds": ["аренда авто", "прокат машин"],
+    "sources": {"wordstat": {"regions": [10231], "folder_id": "test-folder"}},
+}
+ENV_WS = {"WORDSTAT_API_KEY": "fake-ws"}
 
 
 def test_wordstat_queue_cycle_writes_raw_and_manifest(paths):
-    """Очередь Wordstat: create -> list(Done) -> get -> delete -> raw + manifest."""
-    ws_responses = {
-        "CreateNewWordstatReport": {"data": 111},
-        "GetWordstatReportList": {"data": [{"ReportID": 111, "StatusReport": "Done"}]},
-        "GetWordstatReport": {"data": [
-            {"Phrase": "аренда авто", "GeoID": [10231],
-             "SearchedWith": [{"Phrase": "аренда авто", "Shows": 1000}]},
-            {"Phrase": "прокат машин", "GeoID": [10231],
-             "SearchedWith": [{"Phrase": "прокат машин", "Shows": 500}]},
-        ]},
-        "DeleteWordstatReport": {"data": 1},
-    }
+    """Wordstat v2: topRequests -> dynamics -> raw + manifest."""
+    def top_responder(_n):
+        phrase = session.calls[-1][2]["json"]["phrase"]
+        return FakeResponse(json_data={"results": [{"phrase": phrase, "count": "1000"}]})
 
-    def responder(n):
-        # Wordstat шлёт тело как UTF-8 байты (data=), а не json= (квирк v4).
-        method = json.loads(session.calls[-1][2]["data"].decode("utf-8"))["method"]
-        return FakeResponse(json_data=ws_responses[method])
+    def dynamics_responder(_n):
+        return FakeResponse(json_data={"results": [
+            {"date": "2026-06-07T00:00:00Z", "count": "1000", "share": 1.0},
+        ]})
 
-    session = FakeSession([(_contains("/v4/json"), responder)])
+    session = FakeSession([
+        (lambda m, u: m == "POST" and u.endswith("/topRequests"), top_responder),
+        (lambda m, u: m == "POST" and u.endswith("/dynamics"), dynamics_responder),
+    ])
 
     result = wordstat.extract(CONFIG_WS, ENV_WS, paths, session=session, sleeper=NO_SLEEP)
 
-    data = json.loads((paths.raw / "wordstat" / "wordstat.json").read_text("utf-8"))
-    assert [d["Phrase"] for d in data] == ["аренда авто", "прокат машин"]
     assert result["rows"] == 2
-    assert result["geo"] == [10231]
+    assert result["target_queries"] == 2
+    assert len(list((paths.raw / "wordstat" / "topRequests_raw").glob("*.json"))) == 2
 
     entry = manifest_mod.load_manifest(paths.raw)["sources"]["wordstat"]
     assert entry["canonical_tables"] == ["wordstat"]
-    assert entry["geo"] == [10231]
+    assert entry["regions"] == [10231]
+    assert entry["folder_id"] == "test-folder"
+    assert entry["api_version_used"] == "cloud_search_v2"
 
-    # Регрессия: кириллица уходит реальными UTF-8 байтами, а не \uXXXX
-    # (иначе legacy v4 отвечает 501 «Request encoding is not UTF8»).
-    create_body = next(k["data"] for _m, _u, k in session.calls
-                       if b"CreateNewWordstatReport" in k["data"])
-    assert "аренда авто".encode("utf-8") in create_body
-    assert b"\\u0430" not in create_body
+    # folderId обязателен в КАЖДОМ запросе Wordstat v2.
+    for _method, _url, kwargs in session.calls:
+        assert kwargs["json"]["folderId"] == "test-folder"
+        assert kwargs["headers"]["Authorization"] == "Api-Key fake-ws"
 
 
 def test_wordstat_dead_token_raises(paths):
-    """error_code 53 в теле ответа -> AuthError (легаси v4 не отдаёт 401)."""
+    """401 от Yandex Cloud -> AuthError."""
     routes = [(lambda m, u: True,
-               FakeResponse(json_data={"error_code": 53, "error_str": "bad token"}))]
+               FakeResponse(status_code=401, json_data={"message": "bad API key"}))]
     session = FakeSession(routes)
     with pytest.raises(C.AuthError):
         wordstat.extract(CONFIG_WS, ENV_WS, paths, session=session, sleeper=NO_SLEEP)
