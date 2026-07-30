@@ -1650,6 +1650,86 @@ def test_costs_vat_mixed_sources(tmp_path):
     assert seo["cost_normalized"] == pytest.approx(seo["cost_raw"])
 
 
+# ═══════════════ VAT: маппинг Q01 source -> source_tag (FIX-vat-source-tag-mapping) ═══════════════
+
+def test_vat_lookup_maps_seo_alias_to_seo_fee():
+    vat_basis = [{"source": "seo", "vat_included": False}]
+    lk = bc._vat_lookup(vat_basis)
+    assert lk == {"seo_fee": False}
+
+
+def test_vat_lookup_maps_yandex_business_alias():
+    vat_basis = [{"source": "Яндекс Бизнес", "vat_included": True}]
+    lk = bc._vat_lookup(vat_basis)
+    assert lk == {"yandex_business": True}
+
+
+def test_vat_lookup_unmapped_source_stays_as_is():
+    """source_tag, не входящий ни в одну из трёх подтверждённых пар — без маппинга."""
+    vat_basis = [{"source": "rassylka", "vat_included": True}]
+    lk = bc._vat_lookup(vat_basis)
+    assert lk == {"rassylka": True}
+    assert "other" not in lk
+
+
+def test_costs_vat_seo_alias_applies_normalization(tmp_path):
+    """Q01 source='seo' (было бы unknown до фикса) применяется к source_tag='seo_fee'."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    config = {
+        "costs_manual": {"seo_fee_rub_month": 3100},
+        "data_window": {"date_from": "2026-07-01", "date_to": "2026-07-01"},
+        "finance": {"vat_basis_by_source": [
+            {"source": "seo", "vat_included": False},
+        ]},
+    }
+    bc.build(paths, config, {"utm_undefined_threshold": 0.25})
+    costs = pd.read_parquet(paths.canonical / "costs.parquet")
+    row = costs[costs["source_tag"] == "seo_fee"].iloc[0]
+    assert row["cost_status"] == "net"
+    assert row["cost_normalized"] == pytest.approx(row["cost_raw"])
+
+
+def test_costs_vat_yandex_business_alias_applies_normalization(tmp_path):
+    """Q01 source='Яндекс Бизнес' (было бы unknown до фикса) применяется к source_tag='yandex_business'."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    config = {
+        "costs_manual": {"other": [
+            {"source_tag": "yandex_business", "rub_month": 5000},
+        ]},
+        "data_window": {"date_from": "2026-07-01", "date_to": "2026-07-01"},
+        "finance": {"vat_basis_by_source": [
+            {"source": "Яндекс Бизнес", "vat_included": True},
+        ]},
+    }
+    bc.build(paths, config, {"utm_undefined_threshold": 0.25})
+    costs = pd.read_parquet(paths.canonical / "costs.parquet")
+    row = costs[costs["source_tag"] == "yandex_business"].iloc[0]
+    assert row["cost_status"] == "gross"
+    assert row["cost_normalized"] == pytest.approx(row["cost_raw"] / 1.2)
+
+
+def test_costs_vat_source_tag_not_in_alias_pairs_stays_unknown(tmp_path):
+    """source_tag вне трёх подтверждённых пар остаётся unknown, как раньше."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    config = {
+        "costs_manual": {"other": [
+            {"source_tag": "other", "rub_month": 4000},
+        ]},
+        "data_window": {"date_from": "2026-07-01", "date_to": "2026-07-01"},
+        "finance": {"vat_basis_by_source": [
+            {"source": "some_untracked_source", "vat_included": True},
+        ]},
+    }
+    bc.build(paths, config, {"utm_undefined_threshold": 0.25})
+    costs = pd.read_parquet(paths.canonical / "costs.parquet")
+    row = costs[costs["source_tag"] == "other"].iloc[0]
+    assert row["cost_status"] == "vat_basis_unknown"
+    assert pd.isna(row["cost_normalized"])
+
+
 # ═════════════════════════════ normalize_url / dedupe_site_* ═════════════════
 
 @pytest.mark.parametrize("raw,expected", [

@@ -142,6 +142,17 @@ _CAMPAIGN_TYPE_KEYS = (
 
 _VALID_COST_SOURCE_TAGS = {"direct", "agency_fee", "seo_fee", "yandex_business", "other"}
 
+# Q01 (client_answers.yaml: finance.vat_basis_by_source[].source) -> source_tag
+# costs.parquet/direct-таблиц. Ровно три пары, подтверждённые аудитом
+# (AUDIT-block0-client-answers-wiring-and-source-tag-mismatch,
+# docs/implementation_status.md) — НЕ общая нормализация регистра/транслитерации,
+# которая могла бы неверно сработать на будущих source_tag вне этого списка.
+_VAT_SOURCE_TAG_ALIASES: dict[str, str] = {
+    "seo": "seo_fee",
+    "Яндекс Бизнес": "yandex_business",
+    "direct": "direct",
+}
+
 _VALID_CRM_STATUSES = {"new", "in_progress", "won", "lost"}
 
 
@@ -485,6 +496,7 @@ def _vat_lookup(vat_basis_by_source: list[dict[str, Any]]) -> dict[str, bool | N
     out: dict[str, bool | None] = {}
     for entry in (vat_basis_by_source or []):
         src = (entry.get("source") or "").strip()
+        src = _VAT_SOURCE_TAG_ALIASES.get(src, src)
         vat = entry.get("vat_included")
         if src:
             out[src] = None if vat is None else bool(vat)

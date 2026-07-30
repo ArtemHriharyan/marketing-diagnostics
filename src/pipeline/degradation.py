@@ -24,7 +24,11 @@
     }
 
 Правило «LLM не может повышать confidence» получает второй потолок:
-``confidence_cap`` из manual-источников, поверх исходного из compute.
+``confidence_cap`` из manual-источников, поверх исходного из compute. Третий,
+опциональный потолок — ``check.confidence_cap_downgraded`` в methodology.yaml:
+применяется, только если тем же прогоном сработал ``type_downgrade_if`` этой
+проверки (см. A24 — потеря "A"-компоненты типа при недоступности структурных
+полей объявления означает потерю автоматической проверяемости).
 
 LLM здесь не вызывается: чистая детерминированная логика (принцип 3).
 """
@@ -46,6 +50,7 @@ _SOURCE_LABELS: dict[str, str] = {
     "site_crawl": "обход сайта (ручная техническая проверка)",
     "crm": "выгрузка CRM",
     "client_answers": "анкета клиента (inputs/client_answers.yaml)",
+    "manual_form_tests": "ручное тестирование форм (inputs/manual_form_tests.yaml)",
     "webvisor_findings": "наблюдения из Вебвизора (inputs/webvisor_findings.yaml)",
     "campaign_strategies": "стратегии кампаний Директа (Директ не подключён)",
     "degradation_report": "отчёт о деградации",
@@ -68,7 +73,8 @@ _API_TABLES: frozenset[str] = frozenset(
      "wordstat", "crux", "degradation_report"}
 )
 _MANUAL_TABLES: frozenset[str] = frozenset(
-    {"site_crawl", "webvisor_findings", "client_answers", "crm", "manual_serp"}
+    {"site_crawl", "webvisor_findings", "client_answers", "manual_form_tests",
+     "crm", "manual_serp"}
 )
 # Какие ключи config.sources питают seo_queries (единственная таблица с
 # переключаемым режимом). Порядок не важен — достаточно одного manual.
@@ -189,6 +195,13 @@ def evaluate_check(
     type_effective = check.get("type_default", "A")
     if _eval_downgrade(check.get("type_downgrade_if"), flags or {}):
         type_effective = check.get("type_downgraded") or type_effective
+        # Опциональный доп. потолок confidence_cap для тех проверок, у которых
+        # понижение типа означает потерю автоматической проверяемости (не все
+        # type_downgrade_if это подразумевают — поле явно опциональное, см.
+        # config/methodology.yaml).
+        extra_cap = check.get("confidence_cap_downgraded")
+        if extra_cap:
+            confidence_cap = min_confidence(confidence_cap, extra_cap)
 
     reason = None
     if not runnable:

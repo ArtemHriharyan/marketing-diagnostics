@@ -18,6 +18,7 @@ import gzip
 import sys
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +68,7 @@ class Paths:
     def __init__(self, raw: Path, root: Path | None = None):
         self.raw = raw
         self.root = root if root is not None else raw.parent.parent
+        self.canonical = self.root / "data" / "canonical"
 
 
 @pytest.fixture
@@ -262,10 +264,20 @@ def test_lookback_partial_history_reports_covered_depth_honestly(tmp_path):
     assert result["lookback_rows"] == 1
 
 
-# ── Lookback-визиты не попадают в основные agg-метрики (build_visits) ──────
+# ── Контракт filter-at-write: lookback виден build_visits(), но не visits.parquet
 def test_lookback_visits_excluded_from_build_visits_aggregation(paths, tmp_path):
-    """build_visits (canonical transform, не изменялся этой задачей) не видит
-    metrika_logs/lookback/ — визиты оттуда не попадают ни в одну метрику."""
+    """Подтверждённый контракт (см. докстринг build_visits/build() в
+    build_canonical.py:964-983,1986-1991 и AUDIT-lookback-aggregation-regression
+    в docs/implementation_status.md): build_visits() намеренно возвращает
+    ОБЪЕДИНЁННЫЙ df (основное окно + lookback, с флагом is_lookback_only) —
+    лукбэк нужен внутри для carry-forward источника (T02/T03). Фактическую
+    фильтрацию is_lookback_only перед записью в parquet выполняет build().
+
+    Проверяем обе половины контракта:
+    (а) build_visits() видит и main-, и lookback-строки, обе с корректным
+        is_lookback_only;
+    (б) build() пишет в visits.parquet ТОЛЬКО main-строки — lookback туда
+        не попадает."""
     box = {}
     session = FakeSession(_routes(
         box, part_text=(
@@ -283,8 +295,17 @@ def test_lookback_visits_excluded_from_build_visits_aggregation(paths, tmp_path)
     lookback_files = list((src_dir / metrika_logs.LOOKBACK_SUBDIR).glob("*.csv.gz"))
     assert len(lookback_files) == 1
 
+    # (а) build_visits() отдаёт обе группы, лукбэк явно помечен флагом.
     df, _utm, _stats = bc.build_visits(src_dir, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+    assert len(df) == 2
+    assert set(df.loc[~df["is_lookback_only"], "visit_id"]) == {"v1"}
+    assert set(df.loc[df["is_lookback_only"], "visit_id"]) == {"v1"}
 
-    # Ровно 1 визит (из основного окна) — визит(ы) lookback/ не подмешались.
-    assert len(df) == 1
-    assert set(df["visit_id"]) == {"v1"}
+    # (б) build() фильтрует лукбэк перед записью visits.parquet — читаем
+    # реально записанный файл, а не промежуточный df.
+    built = bc.build(paths, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+    assert "visits" in built
+
+    written = pd.read_parquet(paths.canonical / "visits.parquet")
+    assert len(written) == 1
+    assert set(written["visit_id"]) == {"v1"}

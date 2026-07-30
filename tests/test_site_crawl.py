@@ -203,6 +203,61 @@ def test_keyword_match_pages_added(tmp_path):
     assert result["url_sources"]["/arenda-avto"] == "keyword_match"
 
 
+# ── per-source top-N truncation caveat (до объединения) ──────────────────────
+
+def _write_seo(tmp_path, source_value, n_pages):
+    import pandas as pd
+    rows = [
+        {"page": f"/p-{i}", "source": source_value, "total_clicks": n_pages - i}
+        for i in range(n_pages)
+    ]
+    pd.DataFrame(rows).to_parquet(tmp_path / "seo_queries.parquet", index=False)
+
+
+def test_source_caveat_present_when_source_exceeds_top_n(tmp_path):
+    try:
+        import pandas  # noqa: F401
+    except ImportError:
+        pytest.skip("pandas недоступен")
+
+    # 25 GSC-кандидатов, top_n_each_source=20 по умолчанию, max_urls=30 (не
+    # финальное усечение) — изолируем именно промежуточное top-N усечение.
+    _write_seo(tmp_path, "gsc", 25)
+    config = {}
+    result = build_url_priority_list(config, tmp_path)
+
+    assert result["truncated"] is False  # 25 < 30, финального усечения нет
+    assert result["caveat"] is None
+    caveats = result["source_caveats"]
+    assert len(caveats) == 1
+    entry = caveats[0]
+    assert entry["source"] == "top_organic_gsc"
+    assert entry["candidates"] == 25
+    assert entry["kept"] == 20
+    assert entry["dropped"] == 5
+    assert "25" in entry["caveat"]
+    assert "20" in entry["caveat"]
+    assert "5" in entry["caveat"]
+
+
+def test_no_source_caveat_when_within_top_n(tmp_path):
+    try:
+        import pandas  # noqa: F401
+    except ImportError:
+        pytest.skip("pandas недоступен")
+
+    # Ровно 20 кандидатов — граница, усечения нет, ложного срабатывания быть не должно.
+    _write_seo(tmp_path, "gsc", 20)
+    result = build_url_priority_list({}, tmp_path)
+    assert result["source_caveats"] == []
+
+
+def test_source_caveat_absent_without_canonical_data():
+    config = {"crawl_seed_urls": ["/", "/about"]}
+    result = build_url_priority_list(config)
+    assert result["source_caveats"] == []
+
+
 def test_missing_canonical_dir_does_not_crash():
     config = {"crawl_seed_urls": ["/"]}
     result = build_url_priority_list(config, canonical_dir=None)

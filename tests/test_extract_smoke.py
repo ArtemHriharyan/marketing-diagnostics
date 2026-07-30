@@ -546,9 +546,10 @@ def test_direct_archived_campaigns_retrievable_flag_true(paths):
 
 
 def test_direct_feed_used_writes_parquet(paths):
-    """feeds.get требует Ids явно (2B-patch-2, error 8000 на реальном аккаунте) —
-    список фидов клиента нельзя получить без него, поэтому фид всегда
-    graceful-empty: manifest.feed_used=false, product_feed.parquet не пишется.
+    """feeds.get вызывается БЕЗ SelectionCriteria, чтобы получить все фиды
+    аккаунта (Ids обязателен только внутри SelectionCriteria, если он
+    передан). Здесь ответ пуст (фидов у клиента нет) -> graceful-empty:
+    manifest.feed_used=false, product_feed.parquet не пишется.
     """
     box = {}
     session = FakeSession(_direct_routes(box))
@@ -982,23 +983,35 @@ CONFIG_GSC_MANUAL = {
 }
 
 
-def _write_gsc_manual(paths, name, text, meta=None):
-    """Положить ручную выгрузку gsc_YYYY-MM.csv (+ опц. meta.yaml) в inputs/."""
-    manual_dir = paths.root / "inputs" / "manual_exports" / "gsc"
-    manual_dir.mkdir(parents=True, exist_ok=True)
-    (manual_dir / name).write_text(text, encoding="utf-8")
-    if meta is not None:
-        (manual_dir / (Path(name).stem + ".meta.yaml")).write_text(meta, encoding="utf-8")
+def _write_gsc_month(paths, month, files):
+    """Положить папку YYYY-MM/ со срезовыми CSV в inputs/manual_exports/gsc/.
+
+    ``files`` — {"Диаграмма.csv": text, "Запросы.csv": text, ...}, ровно
+    формат, который читает ``gsc_manual._detect_slices`` (см.
+    docs/gsc_export_instructions.md и реальные выгрузки
+    clients/pognali.rent/data/raw/gsc/YYYY-MM/).
+    """
+    month_dir = paths.root / "inputs" / "manual_exports" / "gsc" / month
+    month_dir.mkdir(parents=True, exist_ok=True)
+    for name, text in files.items():
+        (month_dir / name).write_text(text, encoding="utf-8")
 
 
 def test_gsc_manual_validates_and_writes_same_contract(paths):
-    """Норма: ручной CSV -> gsc_YYYY-MM.csv в контракте transform + manifest manual."""
-    _write_gsc_manual(paths, "gsc_2026-05.csv",
-        "query,page,device,clicks,impressions,ctr,position\n"
-        "аренда авто,https://pognali.rent/cars,DESKTOP,10,100,4.2%,3.1\n"
-        "прокат машин,https://pognali.rent/,MOBILE,5,80,,7.0\n"
-        ",https://pognali.rent/x,DESKTOP,1,10,1%,9.0\n",       # пустой query -> reject
-    )
+    """Норма: комбинированный формат (contract 3A) -> gsc_YYYY-MM.csv в контракте API + manifest manual."""
+    clicks = gsc_manual._CLICKS_HEADER
+    _write_gsc_month(paths, "2026-05", {
+        "Диаграмма.csv": (
+            f"Дата,{clicks},Показы,CTR,Позиция\n"
+            "2026-05-01,15,180,5%,4.0\n"
+        ),
+        "Запросы.csv": (
+            f"Популярные запросы,Популярные страницы,Устройство,{clicks},Показы,CTR,Позиция\n"
+            "аренда авто,https://pognali.rent/cars,DESKTOP,10,100,4.2%,3.1\n"
+            "прокат машин,https://pognali.rent/,MOBILE,5,80,,7.0\n"
+            ",https://pognali.rent/x,DESKTOP,1,10,1%,9.0\n"    # пустой query -> reject
+        ),
+    })
 
     result = gsc_manual.extract(CONFIG_GSC_MANUAL, {}, paths)
 
@@ -1008,9 +1021,14 @@ def test_gsc_manual_validates_and_writes_same_contract(paths):
     assert lines[0].startswith("month,query,page,device")   # тот же контракт, что у API
     assert result["accepted"] == 2 and result["rejected"] == 1
     assert result["rejected_reasons"] == {"missing_query": 1}
-    # CTR из процентов приведён к доле; месяц взят из имени файла.
+    # Комбинированный формат (Page+Device в Запросы.csv) -> месяц не деградирует.
+    assert result["device_missing_months"] == []
+    # page/device берутся из строки; CTR из процентов приведён к доле;
+    # месяц взят из имени папки.
     first = lines[1].split(",")
     assert first[0] == "2026-05"
+    assert first[2] == "https://pognali.rent/cars"
+    assert first[3] == "DESKTOP"
     assert first[6] == "0.042"                               # 4.2% -> 0.042
 
     report = json.loads((src_dir / "validation_report.json").read_text("utf-8"))
@@ -1025,35 +1043,54 @@ def test_gsc_manual_validates_and_writes_same_contract(paths):
 
 
 def test_gsc_manual_total_clicks_ui_mismatch_becomes_caveat(paths):
-    """Расхождение суммы clicks с total_clicks_ui > 10% -> caveat в отчёте."""
-    _write_gsc_manual(paths, "gsc_2026-06.csv",
-        "query,page,device,clicks,impressions,ctr,position\n"
-        "аренда авто,https://pognali.rent/cars,DESKTOP,80,1000,8%,3.1\n"
-        "прокат авто,https://pognali.rent/,MOBILE,5,80,6%,7.0\n",   # сумма clicks = 85
-        meta="total_clicks_ui: 100\n",                             # UI: 100 -> расхождение 15%
-    )
+    """Расхождение суммы clicks Диаграмма vs Запросы > 10% -> caveat clicks_diagram_vs_queries_mismatch."""
+    clicks = gsc_manual._CLICKS_HEADER
+    _write_gsc_month(paths, "2026-06", {
+        "Диаграмма.csv": (
+            f"Дата,{clicks},Показы,CTR,Позиция\n"
+            "2026-06-01,100,1200,8%,3.0\n"                     # диаграмма: 100 кликов
+        ),
+        "Запросы.csv": (
+            f"Популярные запросы,Популярные страницы,Устройство,{clicks},Показы,CTR,Позиция\n"
+            "аренда авто,https://pognali.rent/cars,DESKTOP,80,1000,8%,3.1\n"
+            "прокат авто,https://pognali.rent/,MOBILE,5,80,6%,7.0\n"  # сумма Запросы = 85
+        ),
+    })
 
     result = gsc_manual.extract(CONFIG_GSC_MANUAL, {}, paths)
 
     caveats = result["clicks_ui_caveats"]
     assert len(caveats) == 1
     assert caveats[0]["month"] == "2026-06"
-    assert caveats[0]["total_clicks_ui"] == 100
-    assert caveats[0]["sum_clicks"] == 85
+    assert caveats[0]["diagram_clicks"] == 100
+    assert caveats[0]["query_clicks"] == 85
     assert caveats[0]["deviation_pct"] == 15.0
 
     report = json.loads((paths.raw / "gsc" / "validation_report.json").read_text("utf-8"))
-    assert report["clicks_ui_caveats"][0]["deviation_pct"] == 15.0
+    matching = [c for c in report["caveats"]
+                if c["type"] == "clicks_diagram_vs_queries_mismatch"]
+    assert matching[0]["deviation_pct"] == 15.0
     entry = manifest_mod.load_manifest(paths.raw)["sources"]["gsc"]
-    assert any("total_clicks_ui" in n for n in entry["notes"])
+    assert any("расхожд" in n for n in entry["notes"])
 
 
 def test_gsc_manual_missing_device_column_flags_month(paths):
-    """Нет колонки device в экспорте -> device=unknown, месяц исключён из S20."""
-    _write_gsc_manual(paths, "gsc_2026-05.csv",
-        "query,page,clicks,impressions,ctr,position\n"          # без device
-        "аренда авто,https://pognali.rent/cars,10,100,4%,3.1\n",
-    )
+    """Запросы.csv без Page/Device (раздельный экспорт) -> device=unknown, месяц исключён из S20."""
+    clicks = gsc_manual._CLICKS_HEADER
+    _write_gsc_month(paths, "2026-05", {
+        "Диаграмма.csv": (
+            f"Дата,{clicks},Показы,CTR,Позиция\n"
+            "2026-05-01,10,100,4%,3.1\n"
+        ),
+        "Запросы.csv": (                                        # без Page/Device
+            f"Популярные запросы,{clicks},Показы,CTR,Позиция\n"
+            "аренда авто,10,100,4%,3.1\n"
+        ),
+        "Страницы.csv": (                                        # обязателен в раздельном формате
+            f"Популярные страницы,{clicks},Показы,CTR,Позиция\n"
+            "https://pognali.rent/cars,10,100,4%,3.1\n"
+        ),
+    })
 
     result = gsc_manual.extract(CONFIG_GSC_MANUAL, {}, paths)
 
@@ -1063,7 +1100,7 @@ def test_gsc_manual_missing_device_column_flags_month(paths):
     assert row.split(",")[3] == "unknown"                       # device -> unknown
     entry = manifest_mod.load_manifest(paths.raw)["sources"]["gsc"]
     assert entry["device_missing_months"] == ["2026-05"]
-    assert any("device" in n for n in entry["notes"])
+    assert any("device" in n.lower() for n in entry["notes"])
 
 
 def test_gsc_manual_no_exports_raises_source_unavailable(paths):
@@ -1078,22 +1115,25 @@ CONFIG_WM_MANUAL = {
 }
 
 
-def _write_wm_manual(paths, name, text):
+def _write_wm_manual(paths, text, name="webmaster_export.csv"):
+    """Положить ЕДИНЫЙ wide-файл (весь период сразу) в inputs/manual_exports/webmaster/.
+
+    Формат: Query,Url,{YYYY-MM}_shows,{YYYY-MM}_position,{YYYY-MM}_clicks[,...]
+    на каждый месяц истории — см. docs/webmaster_export_instructions.md и
+    реальную выгрузку clients/pognali.rent/data/raw/webmaster/webmaster_export.csv.
+    """
     manual_dir = paths.root / "inputs" / "manual_exports" / "webmaster"
     manual_dir.mkdir(parents=True, exist_ok=True)
     (manual_dir / name).write_text(text, encoding="utf-8")
 
 
 def test_webmaster_manual_aggregates_to_popular_contract(paths):
-    """Норма: помесячные CSV -> search_queries_popular.json в контракте transform."""
-    _write_wm_manual(paths, "webmaster_2026-05.csv",
-        "query,impressions,clicks,position,month\n"
-        "аренда авто,600,30,3.0,2026-05\n"
-        "прокат машин,100,5,7.0,2026-05\n",
-    )
-    _write_wm_manual(paths, "webmaster_2026-06.csv",
-        "query,impressions,clicks,position,month\n"
-        "аренда авто,400,20,5.0,2026-06\n",
+    """Норма: один wide-файл (месяцы в колонках) -> search_queries_popular.json в контракте transform."""
+    _write_wm_manual(paths,
+        "Query,Url,2026-05_shows,2026-05_position,2026-05_clicks,"
+        "2026-06_shows,2026-06_position,2026-06_clicks\n"
+        "аренда авто,https://pognali.rent/cars,600,3.0,30,400,5.0,20\n"
+        "прокат машин,https://pognali.rent/,100,7.0,5,,,\n",   # нет данных за 2026-06
     )
 
     result = webmaster_manual.extract(CONFIG_WM_MANUAL, {}, paths)
@@ -1104,42 +1144,44 @@ def test_webmaster_manual_aggregates_to_popular_contract(paths):
     # «аренда авто» отсортирован первым (больше показов) и агрегирован за 2 месяца.
     top = popular[0]
     assert top["query_text"] == "аренда авто"
+    assert top["page"] == "https://pognali.rent/cars"
     assert top["indicators"]["TOTAL_SHOWS"] == 1000        # 600 + 400
     assert top["indicators"]["TOTAL_CLICKS"] == 50         # 30 + 20
     # Позиция — средневзвешенная по показам: (3*600 + 5*400) / 1000 = 3.8.
     assert top["indicators"]["AVG_SHOW_POSITION"] == pytest.approx(3.8)
     assert result["rows"] == 2
+    assert result["months"] == ["2026-05", "2026-06"]
 
     entry = manifest_mod.load_manifest(paths.raw)["sources"]["webmaster"]
     assert entry["canonical_tables"] == ["seo_queries"]
     assert entry["source_mode"] == "manual"
-    assert entry["page_device_breakdown"] is False
-    assert entry["manual_no_page_breakdown_policy"] == "degrade"   # дефолт
-    # Ограничение метода зафиксировано явно (и для API тоже, не только ручного).
-    assert any("ограничение метода" in n for n in entry["notes"])
+    assert entry["has_page_column"] is True
+    assert entry["has_device_column"] is False
+    assert entry["page_device_breakdown"] is True
 
 
 def test_webmaster_manual_records_no_page_device_breakdown(paths):
-    """Экспорт без page/device -> зафиксировано ограничение + политика из конфига."""
-    _write_wm_manual(paths, "webmaster_2026-05.csv",
-        "query,impressions,clicks,position,month\n"
-        "аренда авто,600,30,3.0,2026-05\n",
+    """Url пуст для всех строк (нет разбивки по странице) -> page="", строки не отклоняются."""
+    _write_wm_manual(paths,
+        "Query,Url,2026-05_shows,2026-05_position,2026-05_clicks\n"
+        "аренда авто,,600,3.0,30\n"
+        "прокат машин,,100,7.0,5\n",
     )
-    cfg = {"sources": {"webmaster": {
-        "enabled": True, "mode": "manual",
-        "manual_export_dir": "inputs/manual_exports/webmaster",
-        "manual_no_page_breakdown_policy": "aggregate"}}}
 
-    result = webmaster_manual.extract(cfg, {}, paths)
+    result = webmaster_manual.extract(CONFIG_WM_MANUAL, {}, paths)
 
-    assert result["page_device_breakdown"] is False
-    assert result["manual_no_page_breakdown_policy"] == "aggregate"
+    assert result["accepted"] == 2 and result["rejected"] == 0
+    popular = json.loads(
+        (paths.raw / "webmaster" / "search_queries_popular.json").read_text("utf-8")
+    )
+    assert {q["page"] for q in popular} == {""}
+    assert {q["query_text"] for q in popular} == {"аренда авто", "прокат машин"}
+
     report = json.loads(
         (paths.raw / "webmaster" / "validation_report.json").read_text("utf-8")
     )
-    assert report["page_device_breakdown"] is False
-    assert "aggregate" in report["policy_effect"]
-    assert report["manual_no_page_breakdown_policy"] == "aggregate"
+    assert report["rejected"] == 0
+    assert report["has_page_column"] is True   # колонка Url ожидается, даже если пуста
 
 
 def test_webmaster_manual_no_exports_raises(paths):

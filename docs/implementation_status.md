@@ -85,6 +85,9 @@
 | **7C** | DONE | 2026-07-29. Дополняет `src/report/build_report.py` (7A/7B) — план действий, assignee, LOW-находки и переполнение в приложение. `## План действий`: `### 2 недели` (первые `MAX_ACTION_PLAN_2W=7` находок с непустой рекомендацией по тому же `_priority_key`, что и «Три главных разрыва») + `### 2 месяца` (следующие `MAX_ACTION_PLAN_2M=5`) — **решение, не заданное источниками истины** (в `schemas.Finding`/каталоге v2/methodology-v2.md нет поля трудоёмкости/срока): лимиты по числу пунктов, не по факту трудозатрат, задокументировано в докстринге модуля. `_assignee(finding)`: необязательный ключ `assignee` карточки находки (в `schemas.Finding` тоже отсутствует — не заводился, т.к. вне `allowed_files`/схема не в этой задаче) → «уточнить», если не проставлен аналитиком. `_build_findings_section`/`split_findings_for_report`: находки уровня LOW больше не показываются в «Ключевые находки» (только HIGH/MED/client-HIGH, лимит `MAX_REPORT_FINDINGS` не изменился) — уходят в новый `## Приложение` вместе с находками сверх лимита (раньше просто считались в пометке `«Показаны N из M»`, без списка — теперь перечислены). `## Приложение` → `### Дополнительные находки` (LOW + переполнение, каждая строка несёт confidence/assignee/деньги/рекомендацию) и `### SEO-ядро — не посчитано` (те же элементы `degradation.skipped`, что и общий раздел, отфильтрованные по `block == 4`, для навигации клиента). `## Что не удалось проверить` → `## Что не удалось проверить и почему` (контент не менялся — reason уже был в тексте). Заголовок отчёта: убрана ссылка на «задачу 7A» и приложения-сноски (появились), осталась только оговорка про отсутствие повестки созвона (это 7D). 17 новых тестов в `tests/test_report_build.py` (план 2W/2M по приоритету и пусто, assignee default/explicit, заголовок skipped-раздела, LOW вне основного раздела и в приложении, все находки LOW, переполнение лимита в приложении не теряется, SEO-ядро фильтр по блоку и чистый случай, unit-тест `split_findings_for_report`). `pytest tests/test_report_build.py` — **31 passed**, 0 failed (было 20 до этой задачи). Полный прогон не запускался (не требовался промтом). **Не сделано (намеренно, по плану — 7D):** сноски-приложения содержательного типа (не только LOW/SEO-ядро) и повестка созвона с клиентом. **Побочное наблюдение (не исправлено, вне `allowed_files`):** `src/pipeline/orchestrator.py:573` всё ещё логирует «report: заглушка — src/report/build_report.py не реализован» — стало неверным с 7A, не относится к этой задаче. |
 | **7A** | DONE | 2026-07-29. Реализует `src/report/build_report.py` (был `raise NotImplementedError`) — детерминированный рендерер-скелет `report/diagnostic_report.md`, без LLM. Читает `findings/approved/*.yaml`, `data/metrics/degradation_report.json`, `data/metrics/metrics_summary.json`, `config.yaml`, `config/defaults.yaml` (currency_round) и новый `config/report_glossary.yaml` (20 терминов — check_id/блоки/data_window/significant/HIGH-MED-LOW/client-HIGH/confidence_cap/source_modes/type/деградация/4 денежные категории/money_not_assessable/"сценарий, не прогноз"/CPA/CTR/CR/п.п./бренд-небренд). Разделы: заголовок (клиент/ниша/гео/период), резюме (структурные счётчики выполнено/не выполнено — без бизнес-чисел, тем же принципом, что и `metrics_summary`), ключевые находки (топ `MAX_REPORT_FINDINGS=8`), «что не удалось проверить» (skipped переносится дословно — id/block/reason без перефразирования), глоссарий. Форматирование: `format_rub` (округление по `currency_round`, разделитель тысяч пробелом, None → «в ₽ не оценить»), `format_percent` (доля→%), `format_pp` (разница долей → п.п. со знаком). **Решение, не заданное явно источниками истины (задокументировано в docstring модуля, не угадано молча):** карточка находки (`schemas.Finding`) не несёт поля `priority`; статичные баллы «Критичность/Реальность» каталога v2 §3 существуют только на уровне check_id в markdown-таблице и не входят в машинный реестр `config/methodology.yaml` — переносить их в report-слой значило бы завести второй, не согласованный с реестром источник истины вне `allowed_files` этой задачи. Сортировка `_priority_key` вместо этого строится на полях, которые реально есть на находке: уверенность (HIGH/client-HIGH выше MED выше LOW) → |money_amount_rub| по убыванию (находки без суммы — после находок с суммой) → блок каталога (D,A,T,C,S) → check_id, для детерминированности. Лимит `MAX_REPORT_FINDINGS=8` — фиксированная константа (бюджет ≤10 страниц минус ~2 страницы под заголовок/резюме/деградацию/глоссарий), не выведена из конфига — в `config/defaults.yaml` не заводилась (файл вне `allowed_files`). **Не сделано (по заданию — намеренно вне этой задачи):** приложения-сноски и повестка звонка с клиентом (skeleton явно помечает это в тексте отчёта: «Черновой рендер (задача 7A): без приложений-сносок и повестки созвона»). Тесты: новый `tests/test_report_build.py` — 14 тестов (сквозной `build()` с находками/без них, сортировка HIGH/client-HIGH/MED/LOW и по сумме, находки без суммы после находок с суммой, дословный перенос `skipped` включая пустой список, `format_rub`/`format_percent`/`format_pp`, обрезка по `MAX_REPORT_FINDINGS` с пометкой и без неё при их отсутствии, глоссарий 15-20 терминов из реального `config/report_glossary.yaml`) — **14 passed**. Регрессия: `pytest tests/ --ignore=tests/test_block1.py --ignore=tests/test_block3.py` (эти два файла не собираются в этой среде — `ModuleNotFoundError: scipy`, окружение, не связано с этой задачей) — **688 passed, 14 failed**; все 14 падений pre-existing (`test_direct_2b_patch.py`×2, `test_extract_smoke.py`×9, `test_metrika_logs_lookback.py`×1, `test_money_frame.py`×1, `test_transform_direct_normalize.py`×1 — уже задокументированы в записях выше этой таблицы), ни одно не относится к `src/report/`. |
 | **7D** | DONE | 2026-07-29. Завершает `src/report/build_report.py` (7A/7B/7C) — приложения-таблицы (CSV), сноски на них из основного текста и повестка звонка с клиентом. **Обнаруженный конфликт с заданием (задокументировано, не угадано молча):** промт задачи требовал вопросы «из `llm_notes`» для повестки звонка — такого поля нет ни в `schemas.Finding`, ни в каталоге v2, ни в methodology-v2.md, ни в `config/methodology.yaml` (проверено grep по всем трём источникам истины). Решено по прямому прецеденту `assignee` (задача 7C): `llm_notes` заведён как необязательный ключ карточки YAML вне формальной схемы находки — `_llm_notes(finding)` читает его через `.get()`, при отсутствии/пустоте возвращает `[]` (вопросов на звонок по находке нет), никогда не выдумывает вопрос. **CSV-таблицы приложения** (`_build_appendix_tables`, пишутся всегда, даже пустыми — только заголовок): `report/appendix_tables/findings_appendix.csv` (дополнительные находки — check_id/name/confidence/money_category/money_amount_rub/assignee/recommended_action), `skipped_checks.csv` (id/block/reason — весь `degradation.skipped`), `seo_core_gaps.csv` (тот же skipped, отфильтрованный по блоку S — подмножество `skipped_checks.csv`). **Сноски** — фиксированные номера `[1]`/`[2]`/`[3]`, привязанные статично к этим трём таблицам (не автонумеруются по мере появления в тексте, т.к. ровно три таблицы пишутся при каждой сборке): `[1]` — заголовок «Дополнительные находки», `[2]` — заголовок «Что не удалось проверить и почему», `[3]` — заголовок «SEO-ядро — не посчитано»; новый раздел `## Сноски` в конце отчёта перечисляет пути к файлам. **`oral_review_agenda.md`** (`build_oral_review_agenda`, пишется отдельным файлом рядом с `diagnostic_report.md`) — бюджет 60 минут разложен явно (`ORAL_REVIEW_MINUTES_INTRO=5` + находки по `ORAL_REVIEW_MINUTES_PER_FINDING=10` + `ORAL_REVIEW_MINUTES_WRAP=5`), `MAX_ORAL_REVIEW_FINDINGS=5` выведен из этого бюджета, а не назначен произвольно; находки — топ-5 той же отсортированной по `_priority_key` последовательности, что и «Три главных разрыва»/план действий (не топ-3 вердикта — под звонок отведено больше времени); вопросы под каждой находкой — из `llm_notes`, свод открытых вопросов — в разделе «Вопросы и дальнейшие шаги». Заголовок отчёта (`_build_header`) обновлён: убрана более не верная оговорка «без повестки созвона» (7A/7C), заменена на ссылку на новый файл повестки. Тесты: `tests/test_report_build.py` — 20 новых тестов (группы 16-19: appendix_tables с находками/пусто, сноски-заголовки и раздел «Сноски», повестка с вопросами/без них/лимит топ-5/без находок, сквозной смоук-тест полного отчёта — markdown+3 CSV+повестка за один `build()`, согласованность числа строк CSV с текстом приложения) — `pytest tests/test_report_build.py` — **40 passed**, 0 failed (было 20 после 7C). `pytest tests/test_orchestrator_analyze_gate.py` — **5 passed** (гейт report не задет). Полный `pytest tests/` — **795 passed, 13 failed**; тот же состав pre-existing падений, что и в записях выше (`test_direct_2b_patch.py`×2, `test_extract_smoke.py`×9, `test_metrika_logs_lookback.py`×1, `test_transform_direct_normalize.py`×1), ни одно не относится к `src/report/`. **Тестовый прогон на фикстурном клиенте `pognali.rent`** (реальные `data/canonical`/`data/metrics` уже посчитаны): (1) `python run.py pognali.rent --stage report` с пустым `findings/approved/` — гейт корректно отказал; (2) добавлена временная одна утверждённая находка (не закоммичена, `clients/` целиком в `.gitignore`), вызван `build_report.build()` напрямую с `orchestrator.ClientPaths('pognali.rent')` — `diagnostic_report.md`, все 3 CSV и `oral_review_agenda.md` записались корректно с реальными skipped-проверками (21 строка `skipped_checks.csv`, 4 — `seo_core_gaps.csv`); временная находка и сгенерированные файлы отчёта удалены после проверки. **Побочное наблюдение (не исправлено, вне `allowed_files`):** `src/pipeline/orchestrator.py::run_report` по-прежнему не вызывает `build_report.build()` вовсе (только логирует стаб-сообщение «report: заглушка... не реализован» и возвращает `True`) — уже отмечено в 7C как отдельная задача по подключению `build_report` к оркестратору, этой задачей не устранено (файл вне `allowed_files`). |
+| **FIX-ad-extensions-coverage** | DONE | 2026-07-30. Решение принято ПО ОФИЦИАЛЬНОЙ ДОКУМЕНТАЦИИ (сверено дважды независимыми WebFetch на `ref-v5/adextensions/get.html`), а не по аналогии: `adextensions.get` в Яндекс.Директ API v5 отдаёт **единственный тип расширения — CALLOUT** (уточнение) и только его текст (CalloutText); валидные `FieldNames` = `Id/Type/Status/StatusClarification/Associated`. **Цена/акция/срок/наличие через adextensions.get НЕ доступны ни в каком поле — отдельного типа расширения (PRICE/PROMOTION) в API нет.** Обходной путь не изобретался (принцип 5.d). Итог — вариант 3 задания (закрыть как unavailable явно), но **точечно, не молча "все A21-A24"**: только **A24** («устаревшая цена/акция/срок/наличие в объявлении») реально зависит от этих структурных полей. A21 (высокий CTR+низкая CR) и A23 (конкретный спрос→общая страница) этим НЕ затронуты — поля расширений им не нужны, что подтверждено `requires` в `config/methodology.yaml` (A21: `[direct_queries, visits]`; A23: `[visits, costs]`; A24: `[direct_queries]`); A22 — отдельная текстовая LLM-проверка, не тронута. Слепое пометить A21-A24 unavailable было бы фактически неверным — не сделано (принцип «не угадывать»). **Изменения в `src/extract/direct.py`:** (1) исправлен латентный баг — прежний код просил `"State"` в `FieldNames` для `adextensions.get`, а State там **невалиден** (возвращается в ответе, но не запрашивается) → error 8000 молча ронял весь вызов, тот же класс, что и `"Strategy"` в `campaigns.get`; `"State"` убран. (2) Новые константы `ADEXTENSION_TYPES=["CALLOUT"]`, `ADEXTENSIONS_FIELD_NAMES_ENUM`/`ADEXTENSIONS_FIELD_NAMES` + `_validate_field_names(...)` ДО запроса (тот же приём, что 2A-direct-strategy-fix) — невалидное поле фильтруется, не роняя источник. (3) `adextensions.get` теперь фильтруется `SelectionCriteria.Types=["CALLOUT"]`. (4) `_record_manifest` пишет постоянный caveat (как D11, не зависит от прогона): `ad_extensions_types_available=["CALLOUT"]`, `ad_extensions_price_fields_available=false`, `ad_extensions_caveat={affected_checks:["A24"], reason:...}` — A24 больше не в молчаливом «не проверено». `_fetch_ad_texts` получил параметр `log` (для валидации), докстринг модуля/функции описывают ограничение. **Тесты:** новый `tests/test_direct_ad_extensions.py` — 6 тестов (константы CALLOUT/no-State; реальный вызов шлёт только документированные поля + Types=CALLOUT + CalloutText; невалидное поле фильтруется до запроса и не роняет extract; ошибка adextensions изолирована — extract не падает, note записан; A24 закрыт явным caveat с причиной, A21/A23 НЕ в affected_checks; успешный CALLOUT-ответ выгружается в ad_texts.json). `pytest tests/test_direct_ad_extensions.py tests/test_direct_2a_strategy.py` — **17 passed**. `tests/test_direct_2b_patch.py` — 21 passed, 2 failed (`test_query_report_dimensions`/`test_geo_report_schema` — pre-existing из 4X-direct-normalize-2, семантика `cost_normalized`, не связаны с этой задачей и не тронуты ею). **Не тронуто (вне allowed_files):** `config/methodology.yaml` — A24 не получил `requires`-флаг на новый manifest-ключ и не переведён в другой `type_effective` через `type_downgrade_if` (потребовало бы правки реестра и `degradation.py`); manifest-caveat записан, но автоматическое понижение `type_effective` A24 по нему — отдельная задача с methodology.yaml/degradation.py в allowed_files. Blocker: нет. |
+| **FIX-a24-type-effective-downgrade** | DONE | 2026-07-30. Закрывает зависимость, оставленную `FIX-ad-extensions-coverage`: манифест-флаг `ad_extensions_price_fields_available` теперь действительно понижает A24 вниз по цепочке manifest → degradation → confidence_cap. `config/methodology.yaml` A24: `type_downgrade_if: "ad_extensions_price_fields_available == false"`, `type_downgraded: "B"` (по прецеденту A07 — единственная действующая пара `type_downgrade_if`/`type_downgraded` в реестре; D11 `permanent_LOW` НЕ подошёл в качестве образца — проверено, что `type_downgrade_if=null` там намеренно не участвует в вычислении `type_effective`/`confidence_cap` через `degradation.py` вообще, LOW-потолок для D11 зашит отдельно и напрямую в `src/compute/block0.py::_run_d11`, а для A24 это означало бы трогать `block1.py` — запрещено промтом). **Обнаружено и заполнено:** `type_downgrade_if` в текущем `src/pipeline/degradation.py::evaluate_check` управлял только `type_effective`, но НИКАК не влиял на `confidence_cap` (тот считается исключительно из `source_modes`, независимо от типовых понижений) — под задачу «confidence тоже должен понизиться» такой связи попросту не существовало. Добавлено новое опциональное поле реестра `confidence_cap_downgraded` (задокументировано в шапке `methodology.yaml`) — применяется в `evaluate_check` ТОЛЬКО когда `type_downgrade_if` этой же проверки истинен, через `min_confidence(confidence_cap, confidence_cap_downgraded)`; поле опционально и не задано ни для одной другой записи реестра (включая A07) — поведение прочих проверок не изменилось. A24 — единственная запись с `confidence_cap_downgraded: "MED"`. `src/compute/block1.py::_run_a24` не тронут (запрещено промтом) — не потребовалось: он и так хардкодит `confidence: "LOW"` на каждую строку независимо от `confidence_cap`, т.е. row-level confidence уже на полу; изменение реально влияет на `data/metrics/degradation_report.json.checks[*].confidence_cap` (вход `analyze`), не на `a24.parquet` построчно. Тесты: `tests/test_degradation.py` — 3 новых (флаг false -> `type_effective=B`+`confidence_cap=MED`; флаг true -> оба без изменений; проверка без `confidence_cap_downgraded` (A07-подобная) не меняет `confidence_cap` при сработавшем `type_downgrade_if`). `pytest tests/test_degradation.py` — **9 passed** (было 6). `pytest tests/test_smoke.py` — **17 passed**, регрессий нет. Blocker: нет. |
+| **FIX-vat-source-tag-mapping** | DONE | 2026-07-30. Закрывает несовпадение имён между Q01 (`finance.vat_basis_by_source[].source` в `client_answers.yaml`) и `source_tag` в `costs.parquet`/direct-таблицах, подтверждённое `AUDIT-block0-client-answers-wiring-and-source-tag-mismatch`: `_vat_lookup()` (`build_canonical.py`) сравнивало строки точно после `.strip()`, без `.lower()`/транслитерации — из трёх реальных пар совпадала только `"direct"→"direct"`, `"seo"→"seo_fee"` и `"Яндекс Бизнес"→"yandex_business"` уходили в `vat_basis_unknown`, хотя ответ на Q01 фактически был дан. Добавлен явный словарь `_VAT_SOURCE_TAG_ALIASES` (ровно три пары, не общая нормализация регистра/транслитерации — она могла бы неверно сработать на будущих `source_tag`, которых сейчас нет в данных) — применяется в `_vat_lookup()` к `src` до записи в `out`, ДО сравнения с `source_tag` строк расходов. `src/compute/block1.py` не тронут (не в `allowed_files`) — `_direct_vat_multiplier`/`_open_duckdb_with_direct_vat` переиспользуют тот же `_vat_lookup`, поэтому фикс подхватился автоматически для `direct_queries`/`direct_campaigns`/`direct_geo`/`direct_placements` без правки block1.py (`"direct"→"direct"` — identity, поведение существующих тестов `test_block1_direct_vat_normalization.py` не изменилось, все 4 теста прошли без правок). Тесты (`tests/test_build_canonical.py`): 3 unit-теста на `_vat_lookup()` (seo-алиас, Яндекс Бизнес-алиас, неизвестный source остаётся как есть) + 3 сквозных через `build()` (seo→seo_fee применяет НДС, Яндекс Бизнес→yandex_business применяет НДС, source_tag вне трёх пар остаётся `vat_basis_unknown`, как раньше). `pytest tests/test_build_canonical.py -k vat tests/test_block1_direct_vat_normalization.py` (через `.venv`, где установлен `scipy`) — **18 passed**, 0 failed. Blocker: нет. |
 
 ---
 
@@ -260,6 +263,21 @@ geo: ok}`.
 поведению API (feeds.get не может обнаружить фид без готового Ids) —
 тест обновлён под `feed_used=False`, остальной файл не тронут.
 
+**FIX-feeds-get-contradiction (2026-07-30) — исправление предыдущего вывода
+про feeds.get.** Пункт 3 выше был НЕВЕРЕН: сверка с официальной документацией
+(ref-v5/feeds/get.html) показала, что `Ids` обязателен ТОЛЬКО когда передан
+`SelectionCriteria`; «чтобы получить все фиды пользователя, не указывайте
+SelectionCriteria». То есть предварительный список Id не нужен — это был баг,
+а не ограничение API. `_fetch_feed` теперь реально вызывает feeds.get БЕЗ
+SelectionCriteria (не через `_get_all`, который форсирует пустой
+`SelectionCriteria={}`), маппит метаданные фидов в `product_feed.parquet` и
+выставляет `feed_used` по факту непустого ответа. Докстринг модуля и комментарий
+шага 9 приведены в соответствие. Тесты: `test_feed_listed_without_selection_criteria`
+(пустой ответ → feed_used=False, вызов без SelectionCriteria) и
+`test_feed_used_writes_parquet_when_present` (непустой → feed_used=True, parquet).
+Ложный тест `test_feed_missing_ids_graceful` заменён. Уровень доступности A25 на
+слое extract закрыт; сама проверка A25 (сверка фида с сайтом) не реализуется.
+
 Тесты: `pytest tests/test_direct_2b_patch.py` → 30 passed (23 старых/новых
 mock-теста для 2B-patch-2 внутри файла + существовавшие). `pytest
 tests/test_extract_smoke.py -k direct` → 11 passed. Полный
@@ -401,7 +419,8 @@ config.yaml), пока это не поправят отдельной зада�
 
 **wordstat-folder-id-config** DONE — 2026-07-22 (обновлено: реальный
 `folder_id` для pognali.rent получен от оператора тем же днём —
-`ajebnohb0odjms4dgq25`, вписан в `clients/pognali.rent/config.yaml`,
+`b1ggocts4bcj79ds932l` (исправлено, было указано ошибочно — см.
+AUDIT-live-verification-status), вписан в `clients/pognali.rent/config.yaml`,
 TODO-заглушка снята). `clients/_template/config.yaml`:
 `sources.wordstat.folder_id` переведён с `null` на `""` с расширенным
 комментарием (где взять — Yandex Cloud Console, раздел «Каталог»; не секрет,
@@ -1704,6 +1723,18 @@ filter-at-write.
 
 ---
 
+**FIX-lookback-test-contract** — 2026-07-30. Переписан
+`test_lookback_visits_excluded_from_build_visits_aggregation`
+(`tests/test_metrika_logs_lookback.py`) под контракт filter-at-write:
+проверяет обе половины — (а) `bc.build_visits()` возвращает и main-, и
+lookback-строки с корректным `is_lookback_only`; (б) `bc.build()` пишет в
+`visits.parquet` только main-строки (читает реально записанный parquet, а
+не промежуточный df). `build_canonical.py` не менялся. `pytest
+tests/test_metrika_logs_lookback.py tests/test_lookback_wiring_check.py`
+— 14 passed.
+
+---
+
 **AUDIT-manual-export-contract-drift** — аудит, без правок кода — 2026-07-29.
 Вопрос: соответствует ли контракт `gsc_manual.py`/`webmaster_manual.py`
 (пути, имена файлов, структура папок) `docs/gsc_export_instructions.md` —
@@ -2026,3 +2057,1094 @@ block4_seo.s07_min_demand_count` (с комментарием, ссылка на
 страница -> находка), `test_s07_page_match_without_query_match_is_not_a_finding`
 (страница без query -> НЕ находка, ключевой сценарий промта) —
 `pytest tests/test_block4_seo.py` — **52 passed**, 0 failed. Blocker: нет.
+
+---
+
+**AUDIT-s26-geo-data-availability** — 2026-07-30. Диагностика (без правок кода):
+физически ли доступны данные для формулы S26 ("Сопоставить гео-спрос, страницы,
+позиции и фактическую зону обслуживания", каталог v2 строка 282) — до задачи,
+которая тронет `block4_seo.py`.
+
+1. **Wordstat — один регион(-набор) на клиента, не мульти-гео.**
+   `src/extract/wordstat.py:_region_ids` читает `config.sources.wordstat.regions`
+   как ОДИН список GeoID, передаваемый ЦЕЛИКОМ в каждый вызов `topRequests`/
+   `dynamics` (`body["regions"] = [str(r) for r in regions]`, строки 196/286-294,
+   416-417, 431-432). У pognali.rent (`clients/pognali.rent/config.yaml:37`)
+   это `regions: [75]` (весь Приморский край одним значением) — один агрегат
+   спроса на весь регион, а не отдельные срезы по городам/районам, которые
+   можно было бы сравнить между собой. Это подтверждает то, что уже
+   зафиксировано в самом `block4_seo.py` (docstring `_run_s26`, п.13,
+   `geo_dimension_available: false`): canonical wordstat не несёт гео-поле
+   на строку. Вывод п.1 задачи: **S26 структурно невозможен как гео-анализ
+   без отдельной extract-задачи на мульти-гео Wordstat** (per-регион вызовы
+   или колонка региона в `wordstat_weekly`/`wordstat_core_queries`) — это
+   пробел в `extract`, а не в `compute`; никакой патч `block4_seo.py` поверх
+   существующих данных эту часть формулы не закроет.
+
+2. **"Фактическая зона обслуживания" клиентом не отвечена.**
+   В анкете (`clients/_template/inputs/client_answers.yaml`) нет отдельного
+   поля "зона обслуживания" — ближайший кандидат, Q04 `capacity_limits`
+   (строка 55-57, комментарий явно упоминает "регионы" среди того, что
+   бизнес не может обслужить), это список лимитов, а не описание зоны
+   покрытия. У pognali.rent (`clients/pognali.rent/inputs/client_answers.yaml`)
+   анкета **полностью не заполнена** — файл идентичен `_template`
+   (`capacity_limits: []`, все поля null/пустые). Единственный текстовый
+   источник гео вообще — `client.geo: "Владивосток / Приморский край"` в
+   `config.yaml:7`, это общая формулировка ниши/региона для отчёта, не
+   структурированная зона обслуживания по городам/районам.
+
+3. **Вердикт:** S26 **нельзя** закрыть компьют-патчем поверх существующих
+   данных. Требуются, до того как трогать `block4_seo.py` под S26 предметно:
+   (a) extract-задача на мульти-гео Wordstat (новый транспорт-паттерн —
+   per-регион вызовы `topRequests`/`dynamics` или гео-колонка в raw/canonical
+   wordstat) — без неё нет самого гео-разреза спроса, только агрегат по
+   всему региону; (b) заполненная оператором "зона обслуживания" —
+   либо новое поле в `client_answers.yaml`, либо расширение `capacity_limits`
+   до структурированного описания (список городов/районов), т.к. текущая
+   анкета для pognali.rent пуста. Текущая реализация `_run_s26` (механически
+   равна `_run_s07`, см. AUDIT-s07-s26-formula-match/FIX-s07-site-pages-join
+   выше) не эквивалентна и не станет эквивалентна каталожной формуле S26 без
+   этих двух предпосылок независимо от того, что дальше делается в `compute`.
+   Blocker: extract-задача на мульти-гео Wordstat + заполнение зоны
+   обслуживания оператором — оба вне scope компьют-слоя.
+
+---
+
+**AUDIT-crm-real-file-ingestion** — 2026-07-30. Диагностика (без правок кода,
+без изменений `clients/pognali.rent/data/raw/crm/`): реально ли парсится
+настоящий CRM-файл клиента через `src/extract/crm_import.py`. Прогон —
+фактический вызов `_read_csv`/`_normalize_row` из кода на реальном файле
+(read-only, ничего не записывалось в боевой manifest/data/raw).
+
+**0. Ключевое расхождение до всего остального.** Файл, на который указал
+оператор (`clients/pognali.rent/inputs/crm_export.csv`, 74002 байт,
+1357 строк данных), — **не** экспорт бронирований аренды авто. Это плоская
+выгрузка лидов/сделок из CRM с колонками
+`lead_id;created_at;source;utm_source;utm_campaign;stage;is_repeat;deal_amount_rub;closed_at`
+(`;`-разделитель, UTF-8 без BOM, точка как десятичный разделитель,
+дата `dd.mm.yyyy HH:MM`). Список колонок из задания (код машины, Время
+начала/окончания, Суток аренды, Доставка, Приём, Мойка, Повреждения,
+Топливо, выручка_чистая, компенсации, выручка_полная, price_mismatch)
+описывает какой-то другой источник (похоже на выгрузку бронирований
+проката, не на этот CRM-экспорт) — такого файла в `clients/pognali.rent/`
+нет ни под одним из проверенных имён. Ниже — таблица по факту того файла,
+что есть, а не подгонка под ожидаемый список.
+
+| колонка_клиента (из задания) | прочитана_кодом | тип_совпал | пример_до | пример_после |
+|---|---|---|---|---|
+| ID | переименовать (файл: `lead_id`, canonical: `phone_or_id`, `column_map` не задан → без правки конфига не читается) | да, при добавлении `column_map` | `"653065"` | `lead_id="653065"`, `lead_kind="id"` (6 цифр — не считается телефоном) |
+| Дата создания | переименовать (файл: `created_at`, canonical: `lead_date`, `column_map` не задан) | да, при добавлении `column_map` | `"08.07.2026 11:40"` | `"2026-07-08"` (время отброшено, формат `%d.%m.%Y` уже в `DEFAULT_DATE_FORMATS`) |
+| код машины | нет — такой каноничной колонки в `crm_import.py` вообще не существует (`CANONICAL_COLUMNS` = `lead_date, source, phone_or_id, status, amount_rub, is_new_client`) | — | — | — |
+| Время начала | нет — не в `CANONICAL_COLUMNS`, в файле такой колонки тоже нет | — | — | — |
+| Время окончания | нет — не в `CANONICAL_COLUMNS`; ближайшее по смыслу поле файла `closed_at` код не читает (не входит в `RAW_FIELDS`) | — | `"10.07.2026 12:00"` | (игнорируется полностью) |
+| Суток аренды | нет — не в `CANONICAL_COLUMNS`, в файле нет | — | — | — |
+| Цена | нет отдельной колонки — ближайший аналог `amount_rub` (см. "За аренду" ниже, дублируют друг друга в задании) | — | — | — |
+| За аренду | частично — `amount_rub` есть в схеме кода, в файле есть `deal_amount_rub`, но нужен `column_map`; отдельно "Цена" от "За аренду" код не различает — это одно поле `amount_rub` | да, при добавлении `column_map` | `"8200.0"` | `8200.0` (float, разделитель точка — совпадает с суммой в файле построчно, см. п.2 ниже) |
+| Доставка | нет — не в `CANONICAL_COLUMNS`, в файле нет | — | — | — |
+| Приём | нет — не в `CANONICAL_COLUMNS`, в файле нет | — | — | — |
+| Мойка | нет — не в `CANONICAL_COLUMNS`, в файле нет | — | — | — |
+| Повреждения | нет — не в `CANONICAL_COLUMNS`, в файле нет | — | — | — |
+| Топливо | нет — не в `CANONICAL_COLUMNS`, в файле нет | — | — | — |
+| Источник клиента | нет, поле пустое | тип не проверить — 0 непустых значений | в файле колонка `source` есть по имени, но **0 из 1357 строк** заполнены | `""` → `source=None` во всех строках |
+| Источник | дубль предыдущего (в задании те же данные под другим названием) | — | — | — |
+| Источник клиента (норм) | нет — это `source_norm`, считается в `build_canonical.py:normalize_crm_source` из `source`; при пустом `source` на входе будет `unknown`/`null` для всех 1357 строк | — | — | — |
+| Источник (норм) | дубль предыдущего | — | — | — |
+| выручка_чистая | нет — не в `CANONICAL_COLUMNS`, в файле нет | — | — | — |
+| компенсации | нет — не в `CANONICAL_COLUMNS`, в файле нет | — | — | — |
+| выручка_полная | нет — не в `CANONICAL_COLUMNS`, в файле нет (в файле одна денежная колонка `deal_amount_rub`, не три) | — | — | — |
+| price_mismatch | нет — такой проверки/поля в `crm_import.py` не существует | — | — | — |
+
+Дополнительно (не входит в список задания, но реально есть в файле):
+`status`/`stage` — колонка `stage` в файле присутствует по имени, но
+**0 из 1357** строк заполнены (как и `source`, `utm_source`, `utm_campaign`,
+`is_repeat`). Заполнены только `lead_id`, `created_at`, `deal_amount_rub`,
+`closed_at` (1357 из 1357 каждая).
+
+**1. Разделитель/кодировка/числа/даты (raw, до парсинга).** `;`-разделитель
+(автоопределение `_sniff_delimiter` угадывает верно), UTF-8 без BOM (не
+понадобился откат на `cp1251`), денежное поле — точка как десятичный
+разделитель (`"8200.0"`, не `"8200,0"` — нетипично для RU-Excel выгрузки,
+похоже на экспорт напрямую из БД/API, а не через Excel), дата
+`dd.mm.yyyy HH:MM` (покрыта `DEFAULT_DATE_FORMATS`).
+
+**2. Фактический прогон `_read_csv`/`_normalize_row` (без `column_map`, как
+сейчас в `clients/pognali.rent/config.yaml` — там только `sources.crm_csv:
+{enabled: false, path: ...}`, ключа верхнего уровня `crm_csv:` с
+`column_map` нет вообще):
+`accepted=0, rejected_reasons={"bad_date": 1357}` — **все 1357 строк
+отбраковываются**, потому что код ищет колонку `lead_date`, а в файле она
+называется `created_at`; без `column_map` это в принципе не должно было
+парситься, и не парсится.
+
+С добавлением тестового (не сохранённого в конфиг) минимального
+`column_map = {lead_date: created_at, phone_or_id: lead_id, amount_rub:
+deal_amount_rub}`: `accepted=1357/1357, rejected_reasons={}` — **все
+строки проходят**.
+
+**3. Денежные поля на выборке (после применения тестового `column_map`,
+`random.seed(42)`, 5 случайных строк из 1357) — совпадение "глазами" с
+исходником:**
+
+| RAW `deal_amount_rub` | PARSED `amount_rub` | RAW `created_at` | PARSED `lead_date` |
+|---|---|---|---|
+| `"20500.0"` | `20500.0` | `"25.04.2025 09:56"` | `"2025-04-25"` |
+| `"15700.0"` | `15700.0` | `"14.05.2026 11:19"` | `"2026-05-14"` |
+| `"10000.0"` | `10000.0` | `"24.06.2026 14:42"` | `"2026-06-24"` |
+| `"4000.0"` | `4000.0` | `"12.11.2025 11:11"` | `"2025-11-12"` |
+| `"6600.0"` | `6600.0` | `"18.12.2025 01:11"` | `"2025-12-18"` |
+
+Совпадает точно на всех 5 строках, время в дате корректно отброшено.
+
+**4. Блок L / `block6.py` (лид→сделка, новые/повторные, скорость
+обработки) — прямо, без додумывания: `src/compute/block6.py::run` —
+`raise NotImplementedError`. **Реализации нет вообще**, ни черновой. Даже
+если бы CRM парсился (см. п.2), потреблять результат сейчас некому — блок
+не читает `data/canonical/crm.parquet` ни в каком виде. Слой `transform`
+(`src/transform/build_canonical.py::build_crm`, строка ~1676) свою часть
+контракта имеет — нормализует `status`→`status_norm`,
+`source`→`source_norm` — но при пустых `status`/`source` во входном файле
+(п.0) на выходе `status_norm`/`source_norm` были бы `unknown`/`null` для
+всех 1357 строк, то есть даже при живом `block6.py` проверки 6.2 (новые/
+повторные) и атрибуция по источнику из этого конкретного файла не
+считались бы — там физически нет данных, а не только нет кода.
+
+**Вердикт:** файл **не грузится как есть** — 0/1357 без правок. Разделитель/
+кодировка/числа/даты корректны и не являются причиной; причина — только
+несовпадение имён колонок с `CANONICAL_COLUMNS` при пустом `column_map` в
+`clients/pognali.rent/config.yaml`. С минимальным `column_map` (3 ключа:
+`lead_date`, `phone_or_id`, `amount_rub`) файл грузится **полностью**,
+1357/1357, деньги и даты парсятся корректно. Но: (a) `sources.crm_csv.
+enabled: false` — источник выключен независимо от парсинга; (b) `source`/
+`status`/`is_new_client` в этом файле на 100% пусты — с ним в принципе
+недоступны проверки 6.2/6.3 и атрибуция по источнику, даже если включить
+источник и дописать `column_map`; (c) большинство колонок, перечисленных в
+задании (рентал-специфичные — код машины, сутки аренды, доставка/приём/
+мойка/топливо, выручка_чистая/полная, компенсации, price_mismatch), в этом
+файле не существует и не входят в схему `crm_import.py` — это, по всей
+видимости, требования к другому источнику данных (выгрузка бронирований),
+который в репозитории не найден; (d) `block6.py` — пустой стаб,
+`NotImplementedError`, потребления результата парсинга нет независимо от
+пунктов (a)-(c). Blocker: (1) подтвердить у оператора, существует ли
+отдельный файл-экспорт бронирований с рентал-колонками из задания и где он
+лежит — то, что было прочитано, им не является; (2) если "CRM" в задании и
+есть этот лид/сделка-экспорт — тогда рентал-колонки из задания не входят в
+scope этого источника в принципе и вопрос снимается сам собой, но это
+нужно явно подтвердить, а не предполагать.
+
+---
+
+**CRM-scope-money-only** — 2026-07-30. Оператор подтвердил: файл из
+предыдущего аудита (`lead_id;created_at;source;utm_source;utm_campaign;
+stage;is_repeat;deal_amount_rub;closed_at`, 1357 строк) — это и есть
+искомый CRM-файл, не заглушка. Рентал-специфичные колонки из задания
+(код машины, Суток аренды, выручка_чистая/полная, компенсации,
+Доставка/Приём/Мойка/Повреждения/Топливо, price_mismatch) в этом файле
+не существуют — реализовано по факту наличных данных, а не по
+изначально описанному, но не найденному, набору колонок.
+
+Изменено (`allowed_files`): `src/extract/crm_import.py`,
+`clients/pognali.rent/config.yaml`, `tests/test_crm_import.py`.
+
+1. **`clients/pognali.rent/config.yaml`**: `sources.crm_csv.enabled`
+   `false -> true`; добавлена секция верхнего уровня `crm_csv:` —
+   `column_map` (`lead_date<-created_at`, `phone_or_id<-lead_id`,
+   `amount_rub<-deal_amount_rub` — единственные 3 поля, которые вообще
+   есть и нужны), `attribution_reliable: false` +
+   `attribution_unreliable_reason` (текст: source/stage/is_repeat пусты
+   в 1357/1357 строк на 2026-07-30).
+2. **`src/extract/crm_import.py`**: `crm_cfg.get("attribution_reliable",
+   True)` + `attribution_unreliable_reason` — читаются из конфига (не
+   захардкожены, принцип 1 CLAUDE.md), пробрасываются в
+   `validation_report.json` и в `manifest.json` как
+   `crm_attribution_reliable` (булево, видно
+   `degradation.collect_manifest_flags` наравне с остальными флагами
+   манифеста, без правок `degradation.py`) + текстовая причина рядом.
+   Default `True` — клиенты без этого ключа в конфиге не затронуты.
+   `RAW_FIELDS` не менялся — `source`/`status` как были в raw, так и
+   остаются (пустыми, но не удалёнными).
+3. **`block6.py` не тронут** — остаётся `NotImplementedError`; по
+   методологии (`marketing-diagnostics-methodology-v2.md`, §"Блок L")
+   это осознанный апселл-статус, не баг, менять не требовалось.
+4. **`money_frame.py` не читает CRM вообще** (`grep crm` — пусто) —
+   пункт "downstream не падает от отсутствия надёжного source" в задаче
+   выполняется тривиально: некому падать, потребителя ниже по потоку
+   от CRM пока не существует, кроме самого стаба `block6.py`.
+
+Тесты — `tests/test_crm_import.py` (новый файл, 7 тестов):
+без `column_map` реальная схема — 0/1357 принято, `bad_date` на всех
+(регрессия аудита); с `column_map` — 1357/1357 принято; денежные поля
+и даты точно совпадают на выборке; `source`/`status` не исчезают из
+raw-заголовков; `crm_attribution_reliable=false` + причина попадают и
+в `validation_report.json`, и в `manifest.json`; default `True` без
+флага в конфиге; флаг виден `degradation.collect_manifest_flags`.
+`pytest tests/test_crm_import.py tests/test_smoke.py` — **24 passed**,
+0 failed (смоук на `_template` — убедиться, что правка конфига
+pognali.rent не задевает шаблонного клиента).
+
+Дополнительно — реальный прогон `extract()` на боевом
+`clients/pognali.rent/config.yaml` + реальном
+`inputs/crm_export.csv`, вывод перенаправлен в scratch-директорию
+(`tempfile.mkdtemp`), **боевой `clients/pognali.rent/data/raw/crm/` не
+тронут**: `accepted=1357/1357`, `crm_attribution_reliable=false` с
+причиной — воспроизводит результат тестов на реальном файле, не только
+на фикстуре.
+
+**Вердикт:** денежная сверка подключена и работает (даты + `amount_rub`,
+100% строк); атрибуция официально закрыта как непригодная явным
+конфиг-флагом + manifest-флагом, а не молчаливым провалом или
+удалением колонок. Blocker: нет — задача самодостаточна на имеющихся
+данных. Отдельный вопрос (не blocker для этой задачи) остаётся из
+прошлого аудита: рентал-специфичные колонки из исходного описания
+задания по-прежнему не найдены ни в одном файле репозитория.
+
+**VERIFY-crm-file-actually-present (2026-07-30):** файл с рентал-колонками (ID, Дата создания, код машины...) в репозитории отсутствует; CRM-задачи по pognali.rent выполняются на `clients/pognali.rent/inputs/crm_export.csv` (sha256 3894c6c8..., изменён 2026-07-30 15:15:35 +0300) с заголовком `lead_id;created_at;source;utm_source;utm_campaign;stage;is_repeat;deal_amount_rub;closed_at`.
+
+---
+
+**FIX-s07-verify-normalize-reuse** — аудит, без правок кода — 2026-07-30.
+
+1. **normalize() переиспользуется, отдельной токенизации нет.** `_run_s07`
+   (`src/compute/block4_seo.py`) для сопоставления с `site_pages` использует
+   `_normalize_words()` (строка ~1340), которая вызывает
+   `WC.normalize(text).split()` — то есть `src/extract/wordstat_config.py:
+   normalize()`, ту же функцию, что и `_seo_known_query_set()` для стороны
+   `seo_queries.query`. `_url_path_word_source()` тоже прогоняет URL-путь
+   через `_normalize_words()` (та же `WC.normalize`) перед разбиением на
+   слова. Единственное место, где на первый взгляд токенизация происходит
+   БЕЗ явного вызова `WC.normalize()` в этой же строке — `_phrase_matches_
+   site_page()` делает `normalized_phrase.split()` напрямую, без обёртки в
+   `WC.normalize()`. Это не отдельная токенизация: `normalized_phrase`
+   приходит из колонки `wordstat.normalized_phrase`, которая сама
+   производится через `WC.normalize(phrase)` на этапе extract
+   (`src/extract/wordstat.py:341,490`, `norm = WC.normalize(phrase)`) —
+   т.е. эта строка уже прошла через `normalize()` до попадания в canonical,
+   и `.split()` на уже нормализованной строке эквивалентен повторному
+   `WC.normalize(...).split()` (нормализация здесь — lower + схлопывание
+   пробелов, идемпотентна). Итог: везде, где сравниваются слова (запрос,
+   фраза, title/h1/URL-путь), в цепочке стоит один и тот же `normalize()` —
+   отдельной/расходящейся токенизации в `_run_s07` нет.
+2. **Риск расхождения — не применим.** Раз отдельной токенизации нет (п.1),
+   фиксировать пример расходящегося совпадения (разные окончания слова в
+   одной функции и не совпадающие в другой) не требуется — унификация не
+   нужна, унифицировано уже сейчас.
+3. **Комментарий у `s07_min_demand_count` подтверждён.**
+   `config/defaults.yaml:29` — `# S07 (каталог v2 §9, строка 263:
+   "Сопоставить кластеры Wordstat/GSC с картой страниц"...` — дословно
+   ссылается на каталог v2, строка 263 (проверено прямым чтением файла).
+
+Не чинилось (allowed_files этой задачи — только этот файл). Blocker: нет.
+
+---
+
+**FIX-site-crawl-top20-caveat (2026-07-30).** `build_url_priority_list`
+(`src/extract/site_crawl.py`) теперь фиксирует отдельный пер-источниковый
+caveat для промежуточного усечения кандидатов до `top_n_each_source` (=20)
+ДО объединения списков — раньше в manifest был виден только финальный
+caveat усечения по `crawl.max_urls`, и факт отбрасывания части кандидатов
+на этапе top-N по источнику терялся. Хелперы `_pages_from_canonical` и
+`_pages_from_seo_queries` теперь возвращают `(pages, total_available)`
+(число уникальных кандидатов до среза top_n); новый `_source_truncation_caveat`
+строит текст в том же формате «что усечено → сколько отброшено → ремарка»,
+что и финальный max_urls-caveat, со ссылкой на каталог v2 §G1 ред.2
+(«частичное покрытие по построению — не повод для произвольно короткого
+списка»). Результат несёт новое поле `source_caveats: list[dict]`
+(`source/candidates/kept/dropped/caveat`, только для источников с
+`candidates > top_n`); `_record_manifest` пишет его в `extra.source_caveats`.
+Порог 20 и логика ранжирования не менялись — только видимость. Источники:
+`top_spend` (Директ), `top_organic_gsc` (GSC), `top_organic_webmaster`
+(Webmaster). 3 новых теста в `tests/test_site_crawl.py`
+(`test_source_caveat_present_when_source_exceeds_top_n`,
+`test_no_source_caveat_when_within_top_n`,
+`test_source_caveat_absent_without_canonical_data`) — `pytest
+tests/test_site_crawl.py` 24 passed. Blocker: нет.
+
+---
+
+**ADD-webmaster-operator-instructions (2026-07-30).** Новый
+`docs/webmaster_export_instructions.md` — по аналогии с
+`gsc_export_instructions.md`, закрывает пробел, отмеченный в
+`AUDIT-manual-export-contract-drift` (п.2 выше): для Вебмастера
+инструкции оператору не было вовсе, только докстринг модуля.
+Перечитан `src/extract/webmaster_manual.py` перед финализацией — код
+не менялся (вне скоупа задачи, только документация). Контракт в
+инструкции — один wide-файл `webmaster_export.csv` в
+`inputs/manual_exports/webmaster/` (колонки `Query`/`Url` +
+`{YYYY-MM}_shows/_position/_demand/_ctr/_clicks`), **без** папок
+`YYYY-MM/`: формулировка задания предполагала помесячные папки по
+аналогии с GSC, но это не соответствует фактическому контракту
+`webmaster_manual.py`/`_export_path()`/тестам/реальной выгрузке
+pognali.rent (см. `AUDIT-manual-export-contract-drift`, п.3) — один файл
+на весь период, разворот в long делает `4X-webmaster-transform`
+(`src/transform/webmaster_popular_queries.py`), а не структура папок.
+Инструкция написана под фактический код, расхождение с заданием никак
+не скрыто (явно отмечено здесь). Отдельный блок «не путать demand и
+shows» — по `data-export-spec-v2.md`, раздел D, ред. 2. Blocker: нет.
+
+---
+
+**AUDIT-metrika-dropped-fields-negotiation** — аудит, без правок кода —
+2026-07-30. Установить, жив ли механизм негоциации полей в
+`src/extract/metrika_logs.py` или два упавших теста
+(`test_metrika_logs_negotiation_isolates_unsupported_fields`,
+`test_metrika_logs_backfill_preserves_old_files`) тестируют мёртвый
+сценарий. Читал: `metrika_logs.py` (механизм целиком),
+`tests/test_extract_smoke.py` (оба теста + точный traceback), записи
+2A-patch этого файла.
+
+**Вердикт: тесты устарели под старый список полей — механизм негоциации
+рабочий.** Как в двух прошлых аудитах (lookback, gsc/webmaster).
+
+1. Оба теста падают на одном и том же ассерте
+   (`test_extract_smoke.py:204` и `:275`):
+   `set(result["dropped_fields"]) == {'ym:s:lastSignhasGCLID'}` при
+   фактическом `dropped_fields == []`. Симулируемое «плохое» поле теста —
+   `_METRIKA_BAD_FIELDS = {"ym:s:lastSignhasGCLID"}`
+   (`test_extract_smoke.py:105`).
+
+2. `ym:s:lastSignhasGCLID` патчем 2A-patch убрано из запроса НАСОВСЕМ
+   (`metrika_logs.py:48`, докстринг стр. 175–179): его нет ни в
+   `PATCH_ADDED_FIELDS`, ни в `PATCH2_ADDED_FIELDS`, значит и в
+   `PATCH_CANDIDATE_FIELDS` (стр. 215). Мок `_evaluate_route(..., bad=…)`
+   возвращает 400 только если поле реально попало в состав запроса —
+   но `lastSignhasGCLID` в состав не попадает, 400 не срабатывает,
+   `_negotiate_fields` возвращает `dropped={}`. Симулируемый негативный
+   ответ API проверяет поле, которое код больше не запрашивает.
+
+3. Механизм НЕ сломан — у него есть живые кандидаты. `_negotiate_fields`
+   вызывается с `PATCH_CANDIDATE_FIELDS` в `_run_full` (стр. 533) и в
+   `_run_backfill` (стр. 617); все эти поля реально уходят в
+   `logrequests/evaluate`. Эмпирическая проверка (тот же FakeSession, но
+   `bad={"ym:s:browser"}` — поле, которое КОД реально запрашивает):
+   `dropped_fields == ['ym:s:browser']`,
+   `dropped_reasons == {'ym:s:browser': 'Unknown field ...'}`,
+   `ym:s:browser` исключён из `available_fields`. Бинарное деление
+   (`_find_bad_fields`) изолирует именно отклонённое поле и пишет
+   `dropped_fields`/`dropped_reasons`/manifest корректно.
+
+Итог: чинить механизм не нужно. Тесты чинятся заменой
+`_METRIKA_BAD_FIELDS` на любое поле из актуального
+`PATCH_CANDIDATE_FIELDS` (например `ym:s:browser`) — отдельной задачей
+(в скоуп этого аудита правка теста не входит). Это уточняет и закрывает
+строку `не установлена` для обоих тестов в записи
+`AUDIT-pre-existing-failures` (стр. 1561–1562): источник расхождения —
+именно перевод `lastSignhasGCLID` в постоянно-неотправляемые поля
+патчем 2A-patch, а не поломка негоциации. Blocker: нет.
+
+---
+
+**FIX-direct-feed-stale-docstring (2026-07-30).** Докстринг
+`test_direct_feed_used_writes_parquet` в `tests/test_extract_smoke.py`
+описывал отменённый вывод («feeds.get требует Ids явно», error 8000) —
+`FIX-feeds-get-contradiction` (см. выше) уже установил обратное:
+`SelectionCriteria` не указывается, чтобы получить все фиды аккаунта;
+`Ids` обязателен только внутри `SelectionCriteria`, если он передан.
+Докстринг переписан под фактическое поведение (пустой ответ feeds.get в
+этом тесте — потому что у клиента нет фидов, а не ограничение API).
+Логика теста не менялась. `pytest tests/test_extract_smoke.py -k
+test_direct_feed_used_writes_parquet` — 1 passed. Blocker: нет.
+
+---
+
+**FIX-ad-texts-parquet-test (2026-07-30).** Закрывает гэп
+`ad_texts.json vs .parquet`, зафиксированный в строке
+`test_build_ad_texts_inline_logic_keeps_raw_intact_and_splits_correctly`
+(стр. 1571, задача `AUDIT-pre-existing-failures`): тест и его докстринг
+в `tests/test_transform_direct_normalize.py` ожидали, что инлайн-код
+`build()` пишет `canonical/ad_texts.json` + `ad_texts_archived.json`, а
+фактический код (`build_canonical.py`, задача 4F-ad-texts-parquet) давно
+пишет `ad_texts.parquet`/`ad_texts_archived.parquet` с манифест-флагом
+`{"active_count", "archived_count"}`. Переписаны оба теста в этом файле
+под .parquet-контракт (чтение через `pd.read_parquet`, проверка
+`active_df["ad_id"]`/`archived_df["ad_id"]` вместо парсинга JSON;
+второй тест проверяет отсутствие `.parquet`-файлов вместо `.json`),
+цель тестов (raw `ad_texts.json` не мутируется; State=="ON" -> active,
+всё остальное включая отсутствие State -> archived) сохранена без
+изменений. Обновлён и вводный докстринг файла (строки 1-14),
+ссылавшийся на устаревший JSON-контракт. `pytest
+tests/test_transform_direct_normalize.py` — 5 passed. Blocker: нет.
+
+---
+
+**FIX-gsc-webmaster-smoke-fixtures (2026-07-30).** Закрывает blocker из
+`AUDIT-manual-export-contract-drift` (стр. 1781-1817): 5 фикстур в
+`tests/test_extract_smoke.py` писали более старый контракт ручных
+выгрузок, не связанный с текущим кодом `gsc_manual.py`/
+`webmaster_manual.py`. `_write_gsc_manual` (плоский `gsc_YYYY-MM.csv` без
+папки `YYYY-MM/`, `meta.yaml`/`total_clicks_ui`) заменён на
+`_write_gsc_month` — пишет папку `YYYY-MM/` со срезовыми
+`Диаграмма.csv`/`Запросы.csv`(/`Страницы.csv`), формат подтверждён
+реальной выгрузкой `clients/pognali.rent/data/raw/gsc/2026-06/`.
+`_write_wm_manual` (long-формат, файл на месяц) заменён на запись ОДНОГО
+wide-файла `webmaster_export.csv` (`Query,Url,{YYYY-MM}_shows/_position/
+_clicks`), формат подтверждён `clients/pognali.rent/data/raw/webmaster/
+webmaster_export.csv`. Переписаны под фактическое поведение кода (не
+угадывались):
+  - `test_gsc_manual_validates_and_writes_same_contract` — комбинированный
+    Запросы.csv (Page+Device в строке, contract 3A) -> `device_missing_months
+    == []`, page/device в выходном CSV берутся из строки.
+  - `test_gsc_manual_total_clicks_ui_mismatch_becomes_caveat` — переписан
+    под реальную сверку `_clicks_caveat()` (Диаграмма.csv vs Запросы.csv,
+    caveat `clicks_diagram_vs_queries_mismatch`), а не несуществующий
+    `meta.yaml: total_clicks_ui`.
+  - `test_gsc_manual_missing_device_column_flags_month` — раздельный
+    формат (Запросы.csv без Page/Device) требует `Страницы.csv` (иначе
+    месяц целиком пропускается с `missing_required_files`); ассерт про
+    manifest-заметку сделан регистронезависимым (`"Device"` в тексте, не
+    `"device"`).
+  - `test_webmaster_manual_aggregates_to_popular_contract` — переписан на
+    один wide-файл; ассерты на `manual_no_page_breakdown_policy` и
+    заметку «ограничение метода» убраны — этого поля/заметки в текущем
+    `webmaster_manual.py` не существует (`has_page_column`/
+    `page_device_breakdown` теперь захардкожены `True`, конфиг не
+    читается).
+  - `test_webmaster_manual_records_no_page_device_breakdown` — так как
+    политика конфига в коде отсутствует, тест переименован по смыслу
+    (тот же docstring-сценарий, что и в
+    `docs/webmaster_export_instructions.md`: пустая колонка `Url` для всех
+    строк) и теперь проверяет, что такие строки не отклоняются и
+    агрегируются с `page=""`.
+`gsc_manual.py`/`webmaster_manual.py`/`docs/gsc_export_instructions.md`/
+`docs/webmaster_export_instructions.md` не менялись (вне
+`allowed_files`). `pytest tests/test_extract_smoke.py -k
+"gsc_manual or webmaster_manual"` — 7 passed (5 починенных + 2
+`no_exports`, которые уже проходили). Полный `pytest
+tests/test_extract_smoke.py` — 46 passed, 4 failed (те же
+pre-existing `test_metrika_logs_negotiation_isolates_unsupported_fields`/
+`test_metrika_logs_backfill_preserves_old_files`/
+`test_wordstat_queue_cycle_writes_raw_and_manifest`/
+`test_wordstat_dead_token_raises` — вне скоупа этой задачи, не
+редактировались). Blocker: нет.
+
+---
+
+**AUDIT-cost-normalized-queries-geo-architecture (без правок кода) —
+2026-07-30.** Разведка по конфликту, найденному задачей
+`FIX-direct-queries-geo-cost-normalized` (та задача была остановлена до
+правок — см. её отчёт выше): предполагала гэп в `transform`
+(`build_canonical.py`), но там же на неё указывает явный, тестами
+закреплённый контракт "null в transform, нормализация — в compute".
+Проверено построчно, ничего не менялось.
+
+**(1) Контракт "null в transform" — реальный, преднамеренный, установлен
+задачей `4X-direct-normalize-2` (стр. 51):** докстринги
+`build_direct_queries`/`build_direct_campaigns`/`build_direct_geo`
+(`build_canonical.py`) дословно: `"cost_raw хранится как int64
+микрорублей; cost_rub = float64 рублей (валютная конверсия, считается
+всегда). cost_normalized = null и vat_basis_applied = False на этом
+слое — НДС-нормализацию применяет compute после ответа на Q01"`.
+Закреплён тремя проходящими тестами в `tests/test_build_canonical.py`
+(стр. 461-547): `test_build_direct_queries_cost_rub_always_computed_cost_normalized_null`,
+`test_build_direct_campaigns_cost_rub_always_computed_cost_normalized_null`,
+`test_build_direct_geo_cost_rub_always_computed_cost_normalized_null` —
+каждый явно требует `pd.isna(row["cost_normalized"])` и
+`vat_basis_applied == False`, плюс комментарий над ними (стр. 461-468):
+`"cost_normalized — НДС-нормализация; на слое transform всегда null...
+их заполняет compute после Q01... Не путать с costs.parquet, где
+cost_normalized/cost_status считаются уже здесь, в transform"`.
+
+**(2) Факт-проверка compute-слоя: нормализация НЕ реализована нигде.**
+`src/compute/block1.py` — единственный потребитель
+`direct_queries.cost_normalized`/`direct_geo.cost_normalized`/
+`direct_campaigns.cost_normalized`/`direct_placements.cost_normalized`
+(A09-A11, A12, A15, A18-A26 и разрезы по дате/устройству/фразе/гео) —
+везде читает `cost_normalized` через голый DuckDB
+`SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL)` прямо
+из этих таблиц (строки 419-421, 903, 912, 981, 1050, 1156, 1451/1456,
+1532/1539, 1620, 1664, 1710, 1772, 1854 и др.) — **нет ни одного вызова
+`_vat_lookup`/`_apply_vat_to_rows`/любой другой функции, которая брала
+бы `finance.vat_basis_by_source` и применяла его к `cost_raw`/`cost_rub`
+этих четырёх таблиц.** `grep -n "vat_basis_by_source\|_vat_lookup\|
+_apply_vat_to_rows\|vat_included" src/compute/block1.py` находит только
+три упоминания — все в докстринге (строки 42, 93, 99), ни одного в теле
+функций. Единственное место, где `_vat_lookup`/`_apply_vat_to_rows`
+реально вызываются, — `build_costs` (`build_canonical.py`, задача 4B),
+и это заполняет `costs.parquet`, а не отчётные Direct-таблицы; A02
+единственная из A01-A26 читает деньги из `costs` (`FROM costs WHERE
+source_tag = 'direct'`, строка 421) — там `cost_normalized` уже
+настоящий (НДС-корректный). A09-A11 и остальные, что требуют
+`direct_queries`/`direct_campaigns`/`direct_geo`/`direct_placements`,
+получают гарантированно `NULL` на реальных данных клиента — сам
+докстринг `block1.py` (строки 90-102) это признаёт открытым текстом:
+`"Для direct_queries/direct_campaigns cost_normalized в текущем
+состоянии пайплайна всегда null... Это значит, что на реальных данных
+клиента прямо сейчас A09–A11 будут писать явную деградацию по деньгам,
+пока эта отдельная задача не закрыта — это осознанное следствие
+правила, а не баг данного модуля."`
+
+**(3) Откуда взялась формулировка "заполняется в compute".** Она
+появилась в задаче `4X-direct-normalize-2` (2026-07-22, стр. 51) —
+на тот момент `src/compute/block1.py` был пустой заглушкой
+(`raise NotImplementedError`, задача явно это констатирует: `"src/
+compute/block1.py (и все прочие src/compute/block0..6.py) — пустые
+заглушки... НИЧЕГО не читают ни из costs, ни из
+direct_queries/campaigns/geo"`) — формулировка была декларацией
+намерения на будущее, а не описанием существующего кода. Когда задача
+`5D` (2026-07-28, стр. 847) реально реализовала `block1.py`, она
+унаследовала эту формулировку в комментариях (стр. 90-99), но саму
+нормализацию не добавила — она читает `cost_normalized` как готовое
+поле, ожидая, что его кто-то заполнит, и открыто документирует
+получающуюся деградацию как ожидаемую, а не как баг.
+
+**Вердикт: гэп Q01 для direct_queries/direct_campaigns/direct_geo/
+direct_placements реально ОТКРЫТ** — нормализация не реализована ни в
+`transform`, ни в `compute`. Ранее в `AUDIT-pre-existing-failures`
+(стр. 1559-1560) он был описан только со стороны двух упавших тестов
+`test_direct_2b_patch.py::test_query_report_dimensions`/
+`::test_geo_report_schema` (эти два теста, впрочем, ожидают СТАРУЮ,
+дообновлённую 4X-direct-normalize-2 семантику — `cost_normalized ==
+cost_raw/1_000_000`, то есть валютную конверсию без НДС, что само по
+себе не тот же контракт, что "нормализация по vat_basis_by_source";
+скорее всего эти два теста — сироты, забытые при переименовании
+4X-direct-normalize-2, а не спецификация будущего поведения). Ссылка
+`build_canonical.py:1131` в записи `AUDIT-pre-existing-failures` —
+устаревший номер строки (файл с тех пор вырос), фактическое место —
+докстринг `build_direct_queries` вокруг строки 1162-1169 на момент
+этого аудита.
+
+**Куда чинить, когда возьмутся за реализацию:** по контракту,
+установленному `4X-direct-normalize-2` и тремя тестами
+`test_build_canonical.py` выше, — **в `src/compute/block1.py`** (по
+месту фактического использования `cost_normalized`), не в
+`build_canonical.py`. Задача `FIX-direct-queries-geo-cost-normalized`
+(предполагавшая правку в transform) закрыта неверной — правильная
+версия этой задачи должна называть `src/compute/block1.py` (плюс,
+возможно, общий helper для `direct_campaigns`/`direct_placements`,
+которые несут тот же контракт и то же незакрытое ограничение, хотя
+исходная задача называла только `direct_queries`/`direct_geo`) в
+`allowed_files`, а не `src/transform/build_canonical.py`. Правка кода
+и тестов не производилась (allowed_files этого аудита — только этот
+файл). Blocker: нет, только маршрутизация следующей задачи.
+
+---
+
+**AUDIT-cost-normalized-formula-for-queries-geo (без правок кода) —
+2026-07-30.** Повторный вопрос (какую формулу писать в `block1.py`:
+полную НДС-нормализацию по `vat_basis_by_source` или чистую конвертацию
+`cost_raw/1_000_000`) и что делать с 2 падающими тестами
+`test_direct_2b_patch.py::test_query_report_dimensions`/
+`::test_geo_report_schema`. Подтверждает вердикт
+`AUDIT-cost-normalized-queries-geo-architecture` (стр. выше) с двумя
+недостающими фактами, которые тот аудит не проверял напрямую.
+
+**(1) Провенанс 2 тестов — по git-истории, не по предположению.**
+`git log --oneline -- tests/test_direct_2b_patch.py` — один коммит
+(`e18f88e`, 2026-07-20), тест не менялся с тех пор. Ломающее
+переименование `cost_normalized` (валютная конверсия) →
+`cost_rub`/`cost_normalized` (НДС-семантика, null до Q01) внесено
+коммитом `d047032 "save before reset"` (2026-07-22 13:14) — тем самым
+"защитным коммитом перед reset --hard", что описан в CLAUDE.md
+(«Дисциплина параллельных сессий»); задача `4X-direct-normalize-2`
+(запись выше, стр. 51) документирует именно эту правку и явно
+признаёт тесты сломанными, но не трогает их (вне `allowed_files`).
+Итог: оба теста написаны до переименования, для старой семантики
+(`cost_normalized == cost_raw/1_000_000`), и с тех пор ни разу не
+обновлялись — это сироты, а не спецификация целевого поведения.
+
+**(2) Клиентские данные: `vat_basis_by_source` у pognali.rent.**
+`clients/pognali.rent/inputs/client_answers.yaml: finance.vat_basis_by_source`
+— три записи (`direct`, `seo`, "Яндекс Бизнес"), у всех
+`vat_included: true`. База НДС одинакова по всем источникам на этом
+клиенте — обе формулы дают числа, отличающиеся на один и тот же
+постоянный множитель 1.2 (не ноль), но не создающие кросс-источникового
+искажения (то, ради чего вообще существует D06). На будущем клиенте со
+смешанными `vat_included` (часть true, часть false/null) две формулы
+разойдутся уже структурно — правильная НДС-нормализация обязана
+понижать/размечать по источнику (`cost_status`: gross/net/
+vat_basis_unknown, как в `_apply_vat_to_rows` для `costs.parquet`), а
+чистая конвертация эту разницу молча стирает.
+
+**(3) Вердикт.** Формула для `block1.py` — полная НДС-нормализация по
+`vat_basis_by_source` (та же логика, что `_vat_lookup`/
+`_apply_vat_to_rows` в `build_costs`, применённая к `cost_rub` четырёх
+Direct-таблиц), НЕ чистая конвертация. Основания: `data-export-spec-v2.md`
+(строки 74-84, правило D06/D07 — явно "никогда не выводить
+cost_normalized из cost_raw/cost_rub автоматической формулой без ответа
+Q01"), каталог v2 D06 (тип A+Q, требует сверки по источнику, не одну
+общую формулу), и уже закреплённый контракт `4X-direct-normalize-2`
+(3 проходящих теста в `test_build_canonical.py`, ожидающие
+`cost_normalized is null`/`vat_basis_applied=False` на слое transform).
+`build_canonical.py` трогать не нужно — он уже корректен (подтверждено
+предыдущим аудитом, п. 1-2 записи выше); недостающая часть —
+реализация нормализации в `src/compute/block1.py`, которой сейчас нет
+вообще (см. ту же запись, п. 2).
+
+**(4) Что делать с 2 тестами.** Обновить, не оставлять как есть — они
+закрепляют невалидный (дорелизный) контракт и будут маскировать
+регресс, если кто-то по ошибке вернёт валютную конверсию в
+`cost_normalized` на слое transform. `test_query_report_dimensions`/
+`test_geo_report_schema` должны проверять `cost_rub ==
+pytest.approx(N)` вместо `cost_normalized`, плюс
+`row["cost_normalized"] is None` и `row["vat_basis_applied"] is False`
+— по образцу трёх тестов
+`test_build_direct_*_cost_rub_always_computed_cost_normalized_null` в
+`test_build_canonical.py`. Правка кода и тестов не производилась
+(allowed_files этой задачи — только этот файл). Blocker: нет.
+
+**FIX-block1-cost-normalization — 2026-07-30.** Реализована отложенная
+Q01-нормализация `cost_normalized` для `direct_queries`/`direct_geo`/
+`direct_campaigns`/`direct_placements` в `src/compute/block1.py`, по
+вердикту двух аудитов выше (полная НДС-формула по `vat_basis_by_source`,
+не чистая конвертация; `build_canonical.py` не тронут).
+
+**(1) Выбор варианта переиспользования — (а), прямой импорт.** `block1.py`
+импортирует `_apply_vat_to_rows`/`_vat_lookup` напрямую из
+`src/transform/build_canonical.py` — вторая независимая реализация
+формулы не написана. Обоснование выбора (а) вместо (б, вынос в
+`src/compute/common.py`/`src/shared/vat.py`): в `block1.py` уже есть
+ровно такой же прецедент — импорт `is_brand_query` из того же
+`build_canonical.py` (использован в A17/is_brand). Слои `transform`/
+`compute` в CLAUDE.md неизменяемы по данным (`raw -> canonical ->
+metrics -> ...`, каждый этап читает выход предыдущего), не по границам
+импорта кода — межслойный импорт чистой функции без побочных эффектов
+это правило не нарушает. `build_costs` (transform, вызывает
+`_vat_lookup`/`_apply_vat_to_rows` для `costs.parquet`) не тронута.
+
+**(2) Источник ответа на Q01 — `inputs/client_answers.yaml`, НЕ
+`config.yaml`.** Побочная находка при чтении `build_canonical.build()`
+(за пределами `allowed_files`, не исправлялась): `build()` берёт
+`vat_basis_by_source` из `config.get("finance")`, а `config` там —
+результат `load_client_config()` = только `config.yaml`; секции
+`finance` нет ни у одного клиента (`clients/*/config.yaml`,
+`clients/_template/config.yaml`) — она лежит в
+`inputs/client_answers.yaml: finance.vat_basis_by_source`. Похоже,
+`costs.parquet.cost_normalized` в реальном прогоне пайплайна тоже всегда
+null (`vat_basis` пуст на этом пути) — отдельный, вне-scope этой задачи
+гэп в transform (D06 в `block0.py` уже читает правильный источник —
+`common.load_inputs(paths)["client_answers"]["finance"].
+vat_basis_by_source`). `block1.py` реализован по образцу D06 (правильный
+источник), не по образцу `build_canonical.build()` (сломанный источник) —
+иначе моя нормализация тоже была бы недостижима на реальных данных.
+Возможный отдельный тикет: `build_canonical.build()` должен брать
+`vat_basis_by_source` из `inputs/client_answers.yaml`, а не из
+`config.get("finance")`.
+
+**(3) Реализация.** `_direct_vat_multiplier(paths)` — вызывает
+`_apply_vat_to_rows` на пробной строке `{"source_tag": "direct",
+"cost_raw": 1.0}` и возвращает получившийся `cost_normalized` как
+множитель (1/1.2, 1.0 или `None`, если база НДС для `"direct"` не
+указана). `_open_duckdb_with_direct_vat(paths, canonical)` — открывает
+соединение через `common.open_duckdb` и, если множитель известен,
+переопределяет view каждой из 4 таблиц (`CREATE OR REPLACE VIEW ... AS
+SELECT * REPLACE (multiplier * cost_rub AS cost_normalized, true AS
+vat_basis_applied) FROM read_parquet(...)`) — источник `read_parquet`
+берётся из уже известного пути `canonical[table]`, а не из имени view,
+чтобы не создать самоссылающееся определение. Один патч на уровне view,
+а не правка ~15 SQL-запросов в A09-A15/A17-A19 по отдельности — при
+`multiplier is None` view не трогается, `cost_normalized` остаётся null
+(деградация, как раньше). Заменены вызовы `common.open_duckdb(paths)` на
+`_open_duckdb_with_direct_vat(paths, canonical)` только там, где функция
+реально агрегирует `cost_normalized` из этих 4 таблиц: A09, A10, A11,
+A12, A13, A14, A15, A17, A18, A19 (проверено построчным гепом каждой
+`_run_aXX`, не списком из промта — промт называл "A04-A11, A18-A20";
+фактически A04-A08 берут деньги уже из нормализованного в transform
+`costs.parquet` через `_campaign_costs`, а не из этих 4 таблиц, и A20 не
+читает cost_normalized вовсе — обе группы в патче не нуждаются и его не
+получили).
+
+**(4) Тесты.** `tests/test_direct_2b_patch.py::test_query_report_dimensions`/
+`::test_geo_report_schema` обновлены по плану п.4 аудита выше: assert на
+`cost_rub`, плюс `pd.isna(cost_normalized)`/`vat_basis_applied == False`
+на слое transform (не тронут). Новый файл
+`tests/test_block1_direct_vat_normalization.py` (5 тестов) — фикстуры
+пишут `direct_queries`/`direct_placements` в реальном контракте
+transform (`cost_normalized=None`) плюс `inputs/client_answers.yaml`;
+проверяют `cost_normalized_rub` при `vat_included=true` (÷1.2) и `false`
+(без деления), что смена `vat_included` даёт кратно предсказуемый
+результат (`net == gross * 1.2`), деградацию до null без
+`client_answers.yaml`, и что подмена работает не только для
+`direct_queries` (A15/`direct_placements`). `pytest tests/` — 844
+passed, 4 failed; все 4 падения в `tests/test_extract_smoke.py`
+(wordstat/metrika_logs backfill) — не затронутые этой задачей модули,
+воспроизводятся и без правок (`git status` показывает эти файлы уже
+модифицированными до начала задачи, вне `allowed_files`). Blocker: нет.
+
+**AUDIT-vat-basis-source-path-critical — 2026-07-30.** Подтверждено:
+`build_costs()`/`build()` в `build_canonical.py` читают
+`vat_basis_by_source` из `config.get("finance")` (`config` = только
+`config.yaml`, см. `load_client_config`) — секции `finance` нет ни у
+одного клиента, только в `inputs/client_answers.yaml` (данные Q01
+реально заполнены у pognali.rent: direct/seo/Яндекс Бизнес — все
+`vat_included: true`). `build()` вообще не принимает параметр `inputs`.
+Прямое доказательство на реальных данных: `costs.parquet` (1377 строк) —
+100% `cost_status="vat_basis_unknown"`, `cost_normalized` NULL везде;
+нормализация не применялась ни разу. Тесты `test_costs_vat_*` в
+`test_build_canonical.py` не ловят баг, т.к. сами кладут
+`vat_basis_by_source` в `config["finance"]` (тот же ошибочный путь, что
+и прод) — маскировка контракта, а не проверка его. Ранее уже
+зафиксировано как побочная находка в `FIX-block1-cost-normalization`
+(этот файл, п.2) — `block1.py` реализован по образцу `block0.py` D06
+(правильный источник — `common.load_inputs()["client_answers"]`), в обход
+`build_canonical.build()`, поэтому патч A09/A10/A11/A12/A13/A14/A15/
+A17/A18/A19 (via `direct_queries`/`direct_geo`/`direct_campaigns`/
+`direct_placements`) не унаследовал баг. Однако A04/A05/A06/A08 берут
+деньги через `_campaign_costs()` → `costs.parquet.cost_normalized`
+напрямую (не через патч `_open_duckdb_with_direct_vat`) — при 100% NULL
+`_money()` возвращает None для каждой группы кампаний, что даёт "нет
+данных"/degraded, а не неверные числа. `money_frame.py` агрегирует
+`cost_normalized_rub` из JSON A-проверок — наследует null транзитивно
+везде, где к нему стекаются A04-A08.
+
+Отдельная находка: D06/D07 (единственные проверки, которые должны были
+поймать ровно это расхождение — `answer_not_applied` при
+`expected_cost_status != actual_cost_status`) в реальном прогоне
+pognali.rent в `degradation_report.json` помечены `skipped`, причина
+`missing: ["client_answers"]` — деградация посчитала источник
+`client_answers` недоступным, хотя файл `inputs/client_answers.yaml` с
+заполненным Q01 на диске существует. Похоже на устаревший прогон
+compute/degradation, сделанный до заполнения Q01-Q07 аналитиком, без
+повторного прогона после — не расследовано в рамках этой задачи (вне
+`files_to_read`). Также замечено (не расследовано): `source` в Q01
+client_answers.yaml — `"seo"`/`"Яндекс Бизнес"`, а `source_tag` в
+costs.parquet — `"seo_fee"`/`"yandex_business"` (см.
+`_VALID_COST_SOURCE_TAGS`); при прямом сопоставлении по строке эти
+записи не совпадут даже после починки основного пути — отдельный риск.
+
+Диагноз: баг подтверждён, ничего не исправлялось (задача диагностическая).
+Задетые места: `costs.parquet.cost_normalized/cost_status` (все клиенты,
+все прошлые прогоны), A04/A05/A06/A08, всё, что суммирует их
+`cost_normalized_rub` в `money_frame.py`, и любой уже собранный `report`,
+опирающийся на эти проверки. Возможный тикет на будущее (не в этой
+задаче): `build_canonical.build()` должен читать `vat_basis_by_source`
+из `inputs/client_answers.yaml` тем же путём, что уже использует D06 в
+`block0.py`; заодно свести словарь `source_tag`/`source` к одному имени
+между Q01 и costs.parquet. Blocker: нет (диагностика завершена).
+
+**AUDIT-block0-client-answers-wiring-and-source-tag-mismatch — 2026-07-30.**
+Два независимых диагноза перед `FIX-vat-basis-wiring`, не чинилось.
+
+**Вопрос 1 — почему D06/D07 skipped.** Причина — **(б), баг того же
+класса, что и `build()`, но в другом месте**, НЕ (а) порядок операций.
+`_run_d06`/`_run_d07` (`block0.py`) сами по себе корректны — читают
+`common.load_inputs(paths)["client_answers"]`, и `load_inputs()`
+(`common.py:67-81`) корректно резолвит `inputs/*.yaml` по имени файла
+без расширения (`client_answers.yaml` -> ключ `"client_answers"`) —
+путь совпадает с реальным
+`clients/pognali.rent/inputs/client_answers.yaml`. Проблема — ДО этого,
+в гейте `run()` (`block0.py:815,819`: `if "D06" in runnable_ids and
+"costs" in canonical`). `runnable_ids` строится в
+`degradation.build_degradation_report()` из `available_tables_from_manifest(manifest)`
+(`degradation.py:218-236`), а `manifest`, который получает эта функция —
+**`data/raw/manifest.json`** (пишет `orchestrator.run_compute()`,
+`orchestrator.py:496`: `manifest = manifest_mod.load_manifest(paths.raw)`),
+т.е. манифест extract-стадии по API-источникам, а не что-либо, что
+смотрит в `inputs/`. `available_tables_from_manifest()` берёт таблицы
+из `manifest["sources"][*]["canonical_tables"]` плюс
+`manifest.get("input_tables", [])` — и **ничто в кодовой базе никогда
+не пишет `input_tables`**: `grep -rn "input_tables" src/` даёт только
+чтение в `degradation.py:234` и дефолт `[]` в `manifest.py:37`
+(`load_manifest` при отсутствии файла). Реальный
+`clients/pognali.rent/data/raw/manifest.json` подтверждает:
+`"input_tables": []`, `sources` содержит только `metrika_reports,
+metrika_logs, wordstat, direct, gsc, site_crawl, webmaster, crux` —
+`client_answers` там в принципе не может появиться. `requires:
+[costs, client_answers]` у D06/D07 (`config/methodology.yaml:127,138`)
+поэтому не выполняется никогда, независимо от содержимого
+`client_answers.yaml`. Точный `reason` из
+`clients/pognali.rent/data/metrics/degradation_report.json` (запись
+skipped): `"missing": ["client_answers"], "reason": "нет источника:
+анкета клиента (inputs/client_answers.yaml)"`.
+Даты файлов: `client_answers.yaml` изменён 2026-07-30 14:35,
+`degradation_report.json` — 2026-07-29 14:01 (старее), `data/raw/manifest.json`
+— 2026-07-22 20:28. Порядок дат сам по себе выглядит как версия (а)
+("прогон был до анкеты, нужен новый прогон") — но это **ложное
+впечатление**: повторный прогон `compute` прямо сейчас использовал бы
+тот же `data/raw/manifest.json` от 2026-07-22 (extract не перезапускался)
+и тот же путь `available_tables_from_manifest()` без `input_tables` —
+результат не изменится. Заметка о `_MANUAL_TABLES`
+(`degradation.py:74-76`, содержит `client_answers`/`webvisor_findings`/
+`crm`/`manual_serp`) и `_SOURCE_LABELS` (строка 52) показывает, что
+доступность этих источников по дизайну ДОЛЖНА определяться — но
+механизм (запись в `input_tables` по факту наличия файла в `inputs/`)
+нигде не реализован. Затронуты не только D06/D07: любая будущая
+проверка с `requires` на `client_answers`/`webvisor_findings`/`crm`/
+`manual_serp` будет skipped всегда, на любом клиенте.
+
+**Вопрос 2 — совпадение source_tag.** `_vat_lookup()`
+(`build_canonical.py:477-491`) сопоставляет по точной строке после
+`.strip()` — без `.lower()`, без транслитерации/маппинга
+кириллица→snake_case:
+
+| source (Q01, `client_answers.yaml`) | source_tag (costs.parquet) | совпадёт как есть |
+|---|---|---|
+| `"direct"` | `"direct"` (TSV Директа, `build_costs` хардкодит `source_tag="direct"`) | **да** |
+| `"seo"` | `"seo_fee"` (из `costs_manual.seo_fee_rub_month`) | **нет** |
+| `"Яндекс Бизнес"` | `"yandex_business"` (из `costs_manual.other[].source_tag`, см. `_VALID_COST_SOURCE_TAGS`) | **нет** |
+
+Подтверждено: даже после починки пути `config` → `inputs` в `build()`,
+НДС применится только к `source_tag="direct"` (единственное точное
+совпадение) — `"seo"`/`"Яндекс Бизнес"` останутся
+`vat_basis_unknown` из-за несовпадения имён, а не из-за отсутствия
+ответа. На практике сейчас это не проявляется на реальных данных:
+`costs.parquet` pognali.rent содержит только `source_tag="direct"`
+(1377/1377 строк) — `costs_manual` для этого клиента сейчас не задан,
+поэтому строк `seo_fee`/`yandex_business`/`agency_fee` в данных нет;
+риск станет видимым, как только у любого клиента появятся
+`costs_manual`-фиксы с этими тегами.
+
+Диагноз завершён, правок не вносилось. Blocker: нет.
+
+**AUDIT-input-tables-blast-radius — 2026-07-30.** Полный периметр
+check_id, чей `requires` в `config/methodology.yaml` ссылается на
+источник input-категории, и которые физически не могли стать
+`runnable=true` ни разу ни на одном клиенте — подтверждено по
+`clients/pognali.rent/data/metrics/degradation_report.json` реального
+прогона (все 12 ниже — в `skipped`, ни один не в `runnable_check_ids`).
+Правок не вносилось.
+
+Из четырёх токенов в `_MANUAL_TABLES`/`_SOURCE_LABELS`
+(`degradation.py:74-76,43-56`: `client_answers`, `webvisor_findings`,
+`crm`, `manual_serp`) реестр `methodology.yaml` фактически ссылается
+(`requires`/`optional`) только на `client_answers` и `webvisor_findings`
+— `crm` и `manual_serp` не встречаются ни в одном `requires`/`optional`
+ни одной из 100 проверок (мёртвые записи в справочнике деградации,
+зарезервированы на будущее). `manual_serp` в S25 (задача 5bC) — это
+только внутреннее поле результата
+(`manual_serp_check_required=true`), не гейт деградации — S25 не
+затронут.
+
+| check_id | requires-источник | reason из реального прогона | ранее записано как «работает»/«готово»? |
+|---|---|---|---|
+| D06 | client_answers | нет источника: анкета клиента (inputs/client_answers.yaml) | **да** — 5B (эта же папка, п. «D01/D04/D05/D06 гейтятся штатно») |
+| D07 | client_answers | нет источника: анкета клиента (inputs/client_answers.yaml) | **да** — 5C («Все шесть проверок работают строго в пределах requires») |
+| T06 | client_answers | нет источника: анкета клиента (inputs/client_answers.yaml) | **да** — 5F, описан как рабочий агрегат без оговорки о недостижимости гейта |
+| C03 | site_crawl | нет источника: обход сайта (ручная техническая проверка) | нет — 5G п.(2) явно документирует разрыв `site_crawl.py:CANONICAL_TABLES=["pages"]` vs реальной `site_pages` |
+| C08 | site_crawl | (то же) | нет — тот же пункт 5G |
+| C11 | site_crawl | (то же) | нет — тот же пункт 5G |
+| C14 | site_crawl | (то же) | нет — 5H наследует формулировку 5G (не переформулирована явно для C14, но ссылается на тот же паттерн) |
+| C17 | site_crawl | (то же) | нет — 5H, тот же паттерн |
+| C23 | site_crawl | (то же) | нет — 5H, тот же паттерн |
+| S15 | site_crawl | (то же) | нет — 5bB прямо цитирует разрыв («тот же приём, что C03/C08/C11/C14/C17... эти ID никогда не станут runnable») |
+| S18 | site_crawl | (то же) | нет — тот же пункт 5bB |
+| S19 | site_crawl | (то же) | нет — тот же пункт 5bB |
+
+Итог: **3 из 12** (D06, D07, T06) — единственные, ранее задним числом
+описанные как работающие/гейтящиеся штатно без указания, что
+`requires: [client_answers]` структурно недостижим (см.
+`AUDIT-input-tables-blast-radius` выше — `input_tables` в
+`data/raw/manifest.json` нигде не заполняется). **9 из 12**
+(C03/C08/C11/C14/C17/C23/S15/S18/S19, все — `requires: [site_crawl]`)
+— наоборот, уже на момент реализации (5G/5H/5bB) явно и корректно
+задокументированы как «никогда не станет runnable через автоматическую
+деградацию» из-за отдельного, независимого несовпадения имён
+(`site_crawl.py: CANONICAL_TABLES=["pages"]` против канонической
+таблицы `site_pages`) — это НЕ то же расхождение, что баг
+`input_tables`, а третий, самостоятельный источник того же класса
+поломки (имя в `requires` не совпадает с тем, что реально попадает в
+`available_set`).
+
+Не гейтятся токенами input-категории и корректно работают в обход
+`requires`/`optional` (проверено по `runnable_check_ids` — все три
+runnable): **C13, C24** (5H, `requires=[visits]`, `client_answers`
+читается в теле проверки напрямую, минуя degradation) и **T09** (5F,
+`requires=[visits]`, `client_answers` — необязательное обогащение).
+D03 skipped, но по независимой причине (`requires: [goals]`, `goals`
+реально недоступен для pognali.rent) — не связано с этим аудитом.
+
+Диагноз завершён, правок не вносилось. Blocker: нет.
+
+**FIX-input-tables-manifest-gate — 2026-07-30.** Закрыт баг из
+`AUDIT-input-tables-blast-radius` выше: `manifest["input_tables"]` теперь
+заполняется в `run_extract` (`src/pipeline/orchestrator.py`,
+`_detect_input_tables` + `manifest_mod.update_global`) на основании
+фактического наличия непустого `inputs/client_answers.yaml` клиента —
+`degradation.available_tables_from_manifest` (не менялся, уже читал это поле
+корректно) теперь реально видит `client_answers` как доступный источник.
+Поле перезаписывается на каждом прогоне extract целиком (идемпотентность,
+принцип 2) — включая пустой список, если анкета отсутствует/пуста, не
+только когда она заполнена. Расширение на `manual_form_tests`/
+`webvisor_findings` сознательно не сделано — вне скоупа задачи, отдельный
+вопрос.
+
+Интеграционный тест (не юнит на функцию — тот же урок, что и с VAT-багом):
+`tests/test_orchestrator_input_tables_gate.py`, через реальный
+`run_extract` -> `run_compute` -> `degradation_report.json`. Подтверждено:
+без анкеты D06/D07/T06 остаются skipped с честной причиной
+(`missing: [client_answers]`); с заполненной `client_answers.yaml`
+(и заранее выгруженным `costs` для D06/D07) все три становятся
+`runnable=true`.
+
+Попутно обнаружено: `tests/test_crux.py` использует минимальный дублёр
+`ClientPaths` без атрибута `.inputs` для прогона `run_extract` напрямую —
+`_detect_input_tables` сделан устойчивым к этому через `getattr(paths,
+"inputs", None)`, чтобы не расширять скоуп правкой файла вне
+`allowed_files`. Полный `pytest` прогнан: 4 предсуществующих падения в
+`tests/test_extract_smoke.py` (metrika_logs negotiation/backfill, wordstat
+queue/dead-token) не связаны с этой задачей — воспроизводятся и без правки
+(отдельные незакоммиченные изменения в репозитории, вне `allowed_files`).
+
+**AUDIT-c14-requires-decision — 2026-07-30.** Вопрос: должен ли C14 требовать
+`visits`, как остальные проверки группы A+G2 матрицы `data-export-spec-v2.md`
+строка 212 (`C12–C16, C18, C19, C25 | A (поведение) + G2 (ручной аудит)`), или
+`requires: [site_crawl]`, реализованный в 5H, — осознанное решение.
+
+Подтверждено: **осознанное решение, не упущение.** Источники:
+
+- Каталог v2 (§8, приоритет "a" по CLAUDE.md п.5) типизирует C14 как **тип
+  "B"** (полностью ручная, 4/5), а не "A+B" — той же строкой, что C03/C08/C11
+  /C17/C23 (тоже "B"). C15/C16/C18/C25, напротив, типизированы в каталоге v2
+  как **"A+B"**. То есть сам каталог v2 разводит C14 и группу C15/C16/C18/C25
+  по типу проверяемости ещё до матрицы data-export-spec.
+- `src/compute/block3.py:1198-1200` (докстринг `_run_c14`) прямо фиксирует
+  причину: "Тип B (полностью ручная, как C03/C08/C11), плюс optional
+  webvisor_findings — единственная из manual-only проверок 5H с обогащением".
+- Запись 5H (выше, п. «C14/C17/C23 — полностью ручные (тип B, как
+  C03/C08/C11), гейт site_pages в canonical») явно объясняет выбор: C14
+  отнесена к той же группе, что C03/C08/C11 (5G) и C17/C23 (5H), а не к группе
+  C15/C16/C18/C25 (тоже 5H, `_run_manual_form_tests_fallback`, разрыв (9) —
+  CTA/попапы/классификация страниц не хранятся ни в `site_pages`, ни в
+  `visits`).
+- Матрица `data-export-spec-v2.md:212` — источник приоритета "b" (поля/
+  контракты выгрузки) — группирует C14 вместе с C15/C16/C18/C19/C25 под
+  общим "A (поведение) + G2"; это огрублённая сводная группировка на уровне
+  диапазона ID, которая расходится с более точной построковой типизацией
+  каталога v2. По приоритету CLAUDE.md п.5 (a > b) для вопроса типа
+  проверяемости (`type_default`) конкретного ID каталог v2 старше матрицы —
+  реализация 5H следует каталогу, что и задокументировано в самой записи 5H
+  (не задним числом).
+
+Расхождение между строкой 212 матрицы и типом C14 в каталоге v2 — реальный,
+но уже названный и разрешённый конфликт источников, а не новый. Правок в
+`config/methodology.yaml` или `src/compute/block3.py` не требуется и не
+вносилось. Diagnostic завершён, вопрос закрыт. Blocker: нет.
+Blocker: нет.
+
+**FIX-input-tables-manifest-gate (расширенная версия) — 2026-07-30.** Закрыт
+второй, самостоятельный источник недостижимости `runnable=true` из
+`AUDIT-input-tables-blast-radius`: для C03/C08/C11/C17/C23 (`requires:
+[site_crawl]`) — несовпадение имени `site_crawl.py: CANONICAL_TABLES=
+["pages"]` vs реальной канонической таблицы `site_pages`
+(`AUDIT-c-checks-required-source-mismatch`, она же разрыв (2)/(3) в докстринге
+`src/compute/block3.py`). Это отдельный баг от того, что чинила первая версия
+задачи (там — незаполнение `manifest["input_tables"]` для `client_answers`,
+здесь — сам `requires`-токен указывал на источник, для которого деградация
+структурно никогда не соберёт `available`).
+
+Правки:
+- `config/methodology.yaml`: C03, C08, C11, C17, C23 — `requires: [site_crawl]`
+  -> `requires: [manual_form_tests]`. `optional` (webvisor_findings у C03/C08,
+  visits у C23) не менялся. C14 сознательно НЕ тронут — отдельный вопрос,
+  предварительно закрытый выше в `AUDIT-c14-requires-decision` (там речь про
+  выбор между `visits` и `site_crawl`, не про `manual_form_tests`); менять его
+  requires в эту задачу не входило.
+- `src/pipeline/orchestrator.py`: `INPUT_TABLE_FILES` расширен с
+  `client_answers` на `manual_form_tests` -> `manual_form_tests.yaml`.
+  `webvisor_findings`/`crm`/`manual_serp` сознательно не добавлены — ни один
+  `requires` на них не ссылается (только `optional`, которое runnable не
+  гейтит), а `crm`/`manual_serp` — мёртвые записи справочника по итогам
+  `AUDIT-input-tables-blast-radius`.
+- `src/pipeline/degradation.py`: `manual_form_tests` добавлен в `_MANUAL_TABLES`
+  и `_SOURCE_LABELS`. Без этого `table_source_modes()` трактовал бы
+  `manual_form_tests` как `api` по умолчанию, и `confidence_cap` в
+  `degradation_report.json` для этих пяти проверок остался бы `HIGH` вместо
+  `MED` — расхождение с тем, что сами функции `block3.py` (`_manual_pattern_rows`
+  /`_manual_conclusions_rows`) и так жёстко капают строки до `MED`. Это не было
+  явно перечислено в списке «Действия» промта, но необходимо для того, чтобы
+  сам факт нового `requires`-токена был корректно классифицирован как
+  manual-источник — иначе `degradation_report.json` содержал бы неверный
+  `confidence_cap` на уровне проверки при корректных строках находок.
+- `src/compute/block3.py`: диспетчерское условие для C03/C08/C11/C17/C23
+  изменено с `"C0X" in runnable_ids and "site_pages" in canonical` на
+  `"C0X" in runnable_ids` — тот же приём, что уже применялся к C01/C02 (crux)
+  и T06 (client_answers). Тела `_run_manual_only_check`/`_run_c14` не менялись.
+  Обновлены докстринг модуля (заголовочная таблица проверок, разрыв (2)) и
+  докстринг `_run_manual_only_check` — они больше не описывают `site_pages`
+  как инфраструктурную предпосылку для этих пяти ID.
+
+Тесты (интеграционные через реальный orchestrator, тот же урок, что с
+VAT-багом и в первой версии задачи):
+`tests/test_orchestrator_input_tables_gate.py` — новый сценарий
+`test_gate_opens_when_manual_form_tests_filled_without_site_crawl`: без
+единого source с `canonical_tables=["site_pages"]`/`["pages"]` в манифесте
+C03/C08/C11/C17/C23 становятся `runnable=true` от одного заполненного
+`inputs/manual_form_tests.yaml`; `test_gate_stays_closed_without_manual_form_tests`
+подтверждает честную причину `missing: [manual_form_tests]` при пустом файле.
+`tests/test_block3.py`: `test_c03_c08_c11_c17_c23_run_without_site_crawl` —
+все пять пишут артефакты без `site_pages` в canonical; переписаны (не
+удалены) `test_c11_without_site_pages_not_dispatched` и
+`test_c17_without_site_pages_not_dispatched`, которые раньше фиксировали
+именно баг (проверка НЕ считается без site_pages) как ожидаемое поведение —
+явно заданное ломающее изменение контракта (CLAUDE.md, протокол микрозадач
+п.9). `tests/test_degradation.py`:
+`test_manual_form_tests_required_caps_confidence_at_med` — прямая проверка
+`_MANUAL_TABLES`-правки.
+
+Прогон: `pytest tests/test_degradation.py tests/test_orchestrator_input_tables_gate.py
+tests/test_block3.py tests/test_methodology_goals_requires.py` — 57 passed.
+Полный `pytest tests/` — 850 passed, те же 4 предсуществующих падения в
+`tests/test_extract_smoke.py` (metrika_logs negotiation/backfill, wordstat
+queue/dead-token), что и в первой версии задачи — не связаны, вне
+`allowed_files`. Blocker: нет.
+
+---
+
+## task FIX-site-crawl-canonical-tables-rename (2026-07-30)
+
+`requires: [site_crawl]` — токен имени extract-источника, а не канонической
+таблицы; `available_tables_from_manifest` собирает множество из
+`canonical_tables` каждого источника, а `CANONICAL_TABLES` в
+`src/extract/site_crawl.py` был `["pages"]` — ни разу не совпадал ни с
+`"site_crawl"` (в methodology.yaml), ни с реальными именами канонических
+таблиц, которые пишет `build_canonical.py` (`site_pages`, `site_link_graph`).
+S15/S18/S19 были невыполнимы (`runnable=false`) при любом манифесте.
+
+Полный `grep "requires:.*site_crawl"` по methodology.yaml нашёл 4 вхождения,
+не 3: S15, S18, S19 и C14. C04/C05/C24/S11/S12/S13/S16/S17/S27 из матрицы
+G1 data-export-spec-v2.md используют site_crawl только через `optional`
+(S16, S17) либо не используют вовсе (C04/C05/C24 — `requires: [visits]`;
+S11/S12/S13/S27 — `requires: [seo_queries]`) — не трогались, `requires: [site_crawl]`
+у них и не было.
+
+Действия:
+- `src/extract/site_crawl.py`: `CANONICAL_TABLES` → `["site_pages", "site_link_graph"]`
+  (было `["pages"]` — не совпадало ни с чем).
+- `config/methodology.yaml`: `requires: [site_crawl]` →
+  для S15 — `[site_pages]` (redirect_chain/final_url — поля site_pages);
+  для S18, S19 — `[site_link_graph]` (внутренний граф ссылок, глубина от
+  главной, страницы-сироты — по data-export-spec-v2.md, §G1-матрица:
+  «Внутренний граф ссылок... — S18, S19», отдельно от «Цепочки редиректов...
+  — C05, S15»). Отклонение от буквального текста промта («requires:
+  [site_pages] для каждого») — обоснование: source-of-truth
+  data-export-spec-v2.md разводит эти два ID по разным таблицам; S15 не
+  использует граф, S18/S19 не используют redirect_chain напрямую.
+- C03/C08/C11/C17/C23 (`manual_form_tests`) и C14 (`requires: [site_crawl]`,
+  осознанно оставлена отдельным аудитом) — не тронуты, регрессии нет
+  (подтверждено grep + regression-тестом).
+- `optional: [site_crawl]` у S16/S17/C15 (та же проблема токена, но у
+  `optional`, не `requires`) — вне скоупа задачи, не тронуто, зафиксировано
+  здесь как известный смежный дефект для отдельной задачи.
+
+Тесты: новый `tests/test_site_crawl_canonical_requires.py` — S15 требует
+`site_pages`, S18/S19 требуют `site_link_graph`; S15/S18/S19 становятся
+`runnable=true` при `available={"site_pages", "site_link_graph"}` и
+`runnable=false` при пустом `available`; регрессия — C03/C08/C11/C17/C23
+всё ещё на `manual_form_tests`, C14 всё ещё на `[site_crawl]`.
+
+Прогон: `pytest tests/test_site_crawl_canonical_requires.py
+tests/test_methodology_goals_requires.py tests/test_site_crawl.py
+tests/test_site_crawl_pages.py tests/test_site_crawl_bfs.py` — 125 passed.
+`pytest tests/ -k "methodology or degradation"` (без scipy-сломанных
+`test_block1*.py`/`test_block3.py`, вне `allowed_files`, предсуществующая
+проблема окружения) — 28 passed. Blocker: нет.
+
+---
+
+## task VERIFY-site-link-graph-table-exists (2026-07-30)
+
+Только факт, без изменений кода. `site_link_graph` — реально строящаяся
+таблица, не фантомное второе имя по образцу прежнего `["pages"]`.
+
+Подтверждено: `build_site_link_graph()` (`src/transform/build_canonical.py:1668`)
+читает `data/raw/site_crawl/link_graph.parquet`, дедуплицирует, вызывается
+в `run_transform` (`build_canonical.py:2140-2143`), пишет
+`canonical_dir/site_link_graph.parquet`, таблица есть в `SCHEMAS`.
+`src/extract/site_crawl.py` реально собирает граф на extract-этапе (BFS по
+внутренним ссылкам → `link_graph.parquet`, `site_crawl.py:1057-1058`).
+`data-export-spec-v2.md` §G1 (строка 150) даёт требование «Внутренний граф
+ссылок... — S18, S19», но буквального имени `site_link_graph` в спеке нет —
+имя таблицы взято из кода, а не процитировано из спеки; это не расхождение,
+просто источник имени. Физически `clients/pognali.rent/data/canonical/
+site_link_graph.parquet` существует (21771 байт, прогон 2026-07-23,
+присутствует в `manifest.json → tables`). `site_link_graph` — часть
+исправления задачи `FIX-site-crawl-canonical-tables-rename` (см. выше), не
+повтор прежнего бага. S18/S19 разблокированы под этим именем реально, не
+только на бумаге. Blocker: нет.

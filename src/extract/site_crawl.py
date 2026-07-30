@@ -52,7 +52,7 @@ from urllib.parse import urljoin, urlparse
 
 SCRIPT_VERSION = "0.4.0"
 SOURCE = "site_crawl"
-CANONICAL_TABLES: list[str] = ["pages"]
+CANONICAL_TABLES: list[str] = ["site_pages", "site_link_graph"]
 
 DEFAULT_MAX_URLS = 30
 CRAWL_TIMEOUT_SEC = 15  # read-таймаут (бездействие сокета между чтениями)
@@ -831,6 +831,24 @@ def resolve_max_urls(config: dict[str, Any], default: int = DEFAULT_MAX_URLS) ->
         return default
 
 
+def _source_truncation_caveat(source_label: str, total_available: int, top_n: int) -> str:
+    """Текст caveat промежуточного усечения источника до top_n (до объединения).
+
+    Тот же формат, что и финальный max_urls-caveat: «что усечено → сколько
+    отброшено → ремарка». Отдельно подчёркивает, что отбрасывание произошло на
+    этапе top-N по источнику, а не финальным max_urls (каталог угроз v2, §G1,
+    ред. 2: частичное покрытие по построению — НЕ повод для произвольно
+    короткого итогового списка)."""
+    dropped = total_available - top_n
+    return (
+        f"Источник {source_label}: {total_available} кандидатов, "
+        f"оставлено топ-{top_n} до объединения списков. "
+        f"Отброшено {dropped} кандидатов на этом шаге (не финальным crawl.max_urls). "
+        "Частичное покрытие по построению (top-N на источник) — не повод для "
+        "произвольно короткого итогового списка."
+    )
+
+
 def build_url_priority_list(
     config: dict[str, Any],
     canonical_dir: Path | None = None,
@@ -844,15 +862,38 @@ def build_url_priority_list(
 
         {
             "urls":            list[str],  # итоговый список, ≤ max_urls
-            "total_candidates": int,       # до усечения
-            "truncated":       bool,
-            "caveat":          str | None, # заполнен при усечении
+            "total_candidates": int,       # до финального усечения по max_urls
+            "truncated":       bool,       # сработало ли финальное max_urls-усечение
+            "caveat":          str | None, # заполнен при финальном усечении
+            "source_caveats":  list[dict], # пер-источниковые caveat усечения до
+                                           #   top_n_each_source ДО объединения
+                                           #   (только для источников с > top_n);
+                                           #   каждый: source/candidates/kept/
+                                           #   dropped/caveat
             "url_sources":     dict[str, str],  # url -> откуда взят
         }
+
+    Финальное усечение по ``max_urls`` (поле ``caveat``) и промежуточное
+    усечение каждого источника до ``top_n_each_source`` перед объединением
+    (поле ``source_caveats``) фиксируются раздельно: часть кандидатов
+    отбрасывается уже на этапе top-N по источнику, до слияния списков.
     """
     effective_max = max_urls if max_urls is not None else resolve_max_urls(config)
 
     seen: dict[str, str] = {}  # url -> источник (первый выигрывает)
+    source_caveats: list[dict[str, Any]] = []
+
+    def _record_source_truncation(source_label: str, total_available: int) -> None:
+        """Зафиксировать промежуточное усечение источника до top_n_each_source
+        (до объединения списков), если у источника было больше кандидатов."""
+        if total_available > top_n_each_source:
+            source_caveats.append({
+                "source": source_label,
+                "candidates": total_available,
+                "kept": top_n_each_source,
+                "dropped": total_available - top_n_each_source,
+                "caveat": _source_truncation_caveat(source_label, total_available, top_n_each_source),
+            })
 
     def _add(url: str, source_label: str) -> None:
         url = url.strip()
@@ -877,18 +918,24 @@ def build_url_priority_list(
         canonical_dir = Path(canonical_dir)
 
         # 3. По расходу Директа.
-        for url in _pages_from_canonical(
+        spend_pages, spend_total = _pages_from_canonical(
             canonical_dir, "costs.parquet", _PAGE_COL_COST, _COST_COL, top_n_each_source
-        ):
+        )
+        for url in spend_pages:
             _add(url, "top_spend")
+        _record_source_truncation("top_spend", spend_total)
 
         # 4а. Органика GSC.
-        for url in _pages_from_seo_queries(canonical_dir, _SOURCE_GSC, top_n_each_source):
+        gsc_pages, gsc_total = _pages_from_seo_queries(canonical_dir, _SOURCE_GSC, top_n_each_source)
+        for url in gsc_pages:
             _add(url, "top_organic_gsc")
+        _record_source_truncation("top_organic_gsc", gsc_total)
 
         # 4б. Органика Webmaster (запасной вариант, если GSC нет).
-        for url in _pages_from_seo_queries(canonical_dir, _SOURCE_WM, top_n_each_source):
+        wm_pages, wm_total = _pages_from_seo_queries(canonical_dir, _SOURCE_WM, top_n_each_source)
+        for url in wm_pages:
             _add(url, "top_organic_webmaster")
+        _record_source_truncation("top_organic_webmaster", wm_total)
 
         # 5. Страницы с ключевыми словами из wordstat_seeds.
         seeds = [str(s).lower() for s in (config.get("wordstat_seeds") or []) if str(s).strip()]
@@ -917,6 +964,7 @@ def build_url_priority_list(
         "total_candidates": total,
         "truncated": truncated,
         "caveat": caveat,
+        "source_caveats": source_caveats,
         "url_sources": {u: seen[u] for u in final_urls},
     }
 
@@ -1039,64 +1087,77 @@ def _pages_from_canonical(
     page_col: str,
     sort_col: str,
     top_n: int,
-) -> list[str]:
-    """Топ-N уникальных URL из parquet-таблицы, отсортированных по убыванию sort_col."""
+) -> tuple[list[str], int]:
+    """Топ-N уникальных URL из parquet-таблицы, отсортированных по убыванию sort_col.
+
+    Возвращает ``(result_pages, total_available)``, где ``total_available`` —
+    число уникальных URL-кандидатов до усечения до top_n (нужно для
+    пер-источникового caveat в build_url_priority_list). При отсутствии файла,
+    колонки или ошибке — ``([], 0)``.
+    """
     path = canonical_dir / table_file
     if not path.exists():
-        return []
+        return [], 0
     try:
         import pandas as pd
         df = pd.read_parquet(path, columns=[c for c in [page_col, sort_col] if c])
         if page_col not in df.columns:
-            return []
+            return [], 0
         if sort_col in df.columns:
             df = df.sort_values(sort_col, ascending=False)
         pages = df[page_col].dropna().astype(str).unique().tolist()
+        total_available = len(pages)
         result_pages = []
         for p in pages[:top_n]:
             p = p.strip()
             if p:
                 result_pages.append(p.rstrip("/") or "/")
-        return result_pages
+        return result_pages, total_available
     except Exception:
-        return []
+        return [], 0
 
 
 def _pages_from_seo_queries(
     canonical_dir: Path,
     source_value: str,
     top_n: int,
-) -> list[str]:
+) -> tuple[list[str], int]:
     """Топ-N уникальных URL по total_clicks для source='gsc'|'webmaster'
     из объединённой таблицы seo_queries.parquet (после 4D GSC и Webmaster
-    больше не пишутся отдельными файлами)."""
+    больше не пишутся отдельными файлами).
+
+    Возвращает ``(result_pages, total_available)``, где ``total_available`` —
+    число уникальных URL-кандидатов данного источника до усечения до top_n
+    (нужно для пер-источникового caveat в build_url_priority_list). При
+    отсутствии файла, колонки, пустой выборке или ошибке — ``([], 0)``."""
     path = canonical_dir / _SEO_QUERIES_FILE
     if not path.exists():
-        return []
+        return [], 0
     try:
         import pandas as pd
         df = pd.read_parquet(
             path, columns=[_PAGE_COL_SEO, _SOURCE_COL_SEO, _CLICKS_COL_SEO]
         )
         if _PAGE_COL_SEO not in df.columns or _SOURCE_COL_SEO not in df.columns:
-            return []
+            return [], 0
         df = df[df[_SOURCE_COL_SEO] == source_value]
         if df.empty:
-            return []
+            return [], 0
         if _CLICKS_COL_SEO in df.columns:
             ranked = df.groupby(_PAGE_COL_SEO)[_CLICKS_COL_SEO].sum()
             ranked = ranked.sort_values(ascending=False)
             pages = ranked.index.tolist()
         else:
             pages = df[_PAGE_COL_SEO].dropna().astype(str).unique().tolist()
+        total_available = len(pages)
         result_pages = []
         for p in pages[:top_n]:
             p = str(p).strip()
             if p:
                 result_pages.append(p.rstrip("/") or "/")
-        return result_pages
+        return result_pages, total_available
     except Exception:
-        return []
+        return [], 0
 
 
 def _pages_matching_keywords(
@@ -1148,6 +1209,8 @@ def _record_manifest(
     }
     if result["caveat"]:
         extra["caveat"] = result["caveat"]
+    if result.get("source_caveats"):
+        extra["source_caveats"] = result["source_caveats"]
     if headless_stats is not None:
         extra["headless_pages_attempted"] = headless_stats["attempted"]
         extra["headless_diff_populated"] = headless_stats["diff_populated"]

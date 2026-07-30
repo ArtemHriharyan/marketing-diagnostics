@@ -92,14 +92,22 @@ A01, единственное место в пайплайне — не дубл
 строка группы имеет cost_normalized IS NULL — база НДС источника не установлена,
 см. D06/_apply_vat_to_rows), сумма по этой группе отдаётся как null, а не как
 частичная сумма по ненулевым строкам и НЕ как cost_raw — деградация, а не
-подмена (прямое требование промта задачи). Для direct_queries/direct_campaigns
-cost_normalized в текущем состоянии пайплайна всегда null (заполняется в
-compute только после отдельной будущей задачи нормализации Q01 для этих
-таблиц — см. build_canonical.py:1131 и docs/implementation_status.md; для
-costs.parquet cost_normalized уже считается в transform через _apply_vat_to_rows).
-Это значит, что на реальных данных клиента прямо сейчас A09–A11 будут писать
-явную деградацию по деньгам, пока эта отдельная задача не закрыта — это
-осознанное следствие правила, а не баг данного модуля.
+подмена (прямое требование промта задачи). Для costs.parquet cost_normalized
+уже считается в transform через _apply_vat_to_rows. Для direct_queries/
+direct_campaigns/direct_geo/direct_placements transform оставляет
+cost_normalized=null/vat_basis_applied=False (задача 4X-direct-normalize-2,
+осознанный контракт, закреплён тестами test_build_canonical.py) — задача
+FIX-block1-cost-normalization реализовала отложенную Q01-нормализацию здесь,
+в compute: cost_normalized = cost_rub * множитель, множитель считается той же
+формулой _vat_lookup/_apply_vat_to_rows (переиспользована, не продублирована,
+см. _direct_vat_multiplier/_open_duckdb_with_direct_vat) из inputs/
+client_answers.yaml: finance.vat_basis_by_source для source_tag="direct" (тот
+же источник, что читает D06 в block0.py — НЕ config.yaml, там секции finance
+нет ни у одного клиента). Множитель неизвестен (vat_basis_unknown для
+"direct") -> cost_normalized остаётся null для всех строк этих 4 таблиц,
+проверки (A09–A15, A17–A19) пишут явную денежную деградацию — та же
+семантика null-как-деградация, что и раньше, просто её причина теперь
+"источник не ответил на Q01", а не "нормализация нигде не реализована".
 
 «Чистые конверсии» (rule 11 catalog: «конверсия по любой цели» не бизнес-
 результат) — ТОЛЬКО сумма goal_conv_<id> по id из config.sources.direct.
@@ -156,7 +164,7 @@ from scipy import stats
 from . import common
 from ..pipeline import degradation as degradation_mod
 from ..pipeline import orchestrator as orchestrator_mod
-from ..transform.build_canonical import is_brand_query
+from ..transform.build_canonical import _apply_vat_to_rows, _vat_lookup, is_brand_query
 
 # ── Match type (AUDIT-match-type, docs/implementation_status.md, подтверждено
 # документацией Yandex Direct API v5): KEYWORD/SYNONYM/RELATED_KEYWORD — три
@@ -329,6 +337,66 @@ def _money(cost_sum: float | None, null_rows: int) -> float | None:
     if cost_sum is None or null_rows > 0:
         return None
     return round(float(cost_sum), 2)
+
+
+# ── Отложенная Q01-нормализация 4 Direct-таблиц (см. докстринг модуля) ─────
+_DIRECT_COST_TABLES: tuple[str, ...] = (
+    "direct_queries", "direct_campaigns", "direct_geo", "direct_placements",
+)
+
+
+def _direct_vat_multiplier(paths: Any) -> float | None:
+    """cost_rub -> cost_normalized множитель для source_tag="direct" (Q01).
+
+    Переиспользует _vat_lookup/_apply_vat_to_rows (build_canonical.py) — ту же
+    формулу, что уже нормализует costs.parquet в transform (не пишет вторую
+    независимую реализацию, см. AUDIT-cost-normalized-formula-for-queries-geo,
+    docs/implementation_status.md) — подаёт cost_raw=1.0 как "пробную" строку
+    и забирает обратно множитель, который _apply_vat_to_rows к ней применил.
+    Источник ответа Q01 — inputs/client_answers.yaml: finance.vat_basis_by_source
+    (common.load_inputs, тот же путь, что читает D06 в block0.py), НЕ
+    config.yaml клиента — там секции finance нет ни у одного клиента (сверено
+    по clients/*/config.yaml и src/pipeline/orchestrator.load_client_config).
+    None — база НДС для "direct" не установлена (vat_basis_unknown).
+    """
+    inputs = common.load_inputs(paths)
+    client_answers = inputs.get("client_answers") or {}
+    vat_basis = (client_answers.get("finance") or {}).get("vat_basis_by_source") or []
+    vat_map = _vat_lookup(vat_basis)
+    probe: list[dict[str, Any]] = [{"source_tag": "direct", "cost_raw": 1.0}]
+    _apply_vat_to_rows(probe, vat_map)
+    return probe[0]["cost_normalized"]
+
+
+def _open_duckdb_with_direct_vat(paths: Any, canonical: dict[str, Path]) -> Any:
+    """common.open_duckdb + отложенная Q01-нормализация direct_queries/campaigns/geo/placements.
+
+    Подменяет view каждой из 4 таблиц так, чтобы cost_normalized = cost_rub *
+    множитель и vat_basis_applied = true — вместо null/False, как их пишет
+    transform (осознанный контракт этого слоя, см. докстринг модуля). Множитель
+    неизвестен (_direct_vat_multiplier вернул None) -> view не подменяется,
+    cost_normalized остаётся null (деградация, не подмена). Используется ТОЛЬКО
+    проверками, которые реально читают cost_normalized из этих 4 таблиц
+    (A09–A15, A17–A19); остальные вызовы common.open_duckdb в блоке 1 (A01–A08
+    читают деньги из уже нормализованной transform'ом costs.parquet, A16/A20–A26
+    её вовсе не читают) в подмене не нуждаются и её не получают.
+    """
+    con = common.open_duckdb(paths)
+    multiplier = _direct_vat_multiplier(paths)
+    if multiplier is None:
+        return con
+    for table in _DIRECT_COST_TABLES:
+        path = canonical.get(table)
+        if path is None:
+            continue
+        view = common._sql_quote_identifier(table)
+        file_literal = common._sql_quote_literal(str(path))
+        con.execute(
+            f"CREATE OR REPLACE VIEW {view} AS SELECT * REPLACE "
+            f"({multiplier!r} * cost_rub AS cost_normalized, "
+            f"true AS vat_basis_applied) FROM read_parquet({file_literal})"
+        )
+    return con
 
 
 def _macro_goal_ids(config: dict[str, Any]) -> list[str]:
@@ -882,7 +950,7 @@ def _run_a09(
     """
     goal_ids = _macro_goal_ids(config)
 
-    con = common.open_duckdb(paths)
+    con = _open_duckdb_with_direct_vat(paths, canonical)
     try:
         expr = _net_conversions_expr(con, "direct_queries", goal_ids)
         if expr is None:
@@ -960,7 +1028,7 @@ def _run_a10(
     """
     goal_ids = _macro_goal_ids(config)
 
-    con = common.open_duckdb(paths)
+    con = _open_duckdb_with_direct_vat(paths, canonical)
     try:
         expr = _net_conversions_expr(con, "direct_queries", goal_ids)
         if expr is None:
@@ -1029,7 +1097,7 @@ def _run_a11(
     """
     goal_ids = _macro_goal_ids(config)
 
-    con = common.open_duckdb(paths)
+    con = _open_duckdb_with_direct_vat(paths, canonical)
     try:
         expr = _net_conversions_expr(con, "direct_queries", goal_ids)
         if expr is None:
@@ -1137,7 +1205,7 @@ def _run_a12(
         return
 
     goal_ids = _macro_goal_ids(config)
-    con = common.open_duckdb(paths)
+    con = _open_duckdb_with_direct_vat(paths, canonical)
     try:
         expr = _net_conversions_expr(con, "direct_geo", goal_ids)
         if expr is None:
@@ -1230,7 +1298,7 @@ def _run_a13(
         return
 
     goal_ids = _macro_goal_ids(config)
-    con = common.open_duckdb(paths)
+    con = _open_duckdb_with_direct_vat(paths, canonical)
     try:
         expr = _net_conversions_expr(con, "direct_campaigns", goal_ids)
         if expr is None:
@@ -1324,7 +1392,7 @@ def _run_a14(
     min_sample = int(defaults.get("min_sample_visits", 500))
     alpha = float(defaults.get("significance_alpha", 0.05))
 
-    con = common.open_duckdb(paths)
+    con = _open_duckdb_with_direct_vat(paths, canonical)
     try:
         device_rows = con.execute(
             "SELECT device, COUNT(*), SUM(CASE WHEN form_submit THEN 1 ELSE 0 END) "
@@ -1442,7 +1510,7 @@ def _run_a15(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
         )
         return
 
-    con = common.open_duckdb(paths)
+    con = _open_duckdb_with_direct_vat(paths, canonical)
     try:
         rows = con.execute(
             "SELECT placement, ad_network_type, "
@@ -1522,7 +1590,7 @@ def _run_a17(
         return
 
     goal_ids = _macro_goal_ids(config)
-    con = common.open_duckdb(paths)
+    con = _open_duckdb_with_direct_vat(paths, canonical)
     try:
         phrase_types_sql = ", ".join(f"'{t}'" for t in _PHRASE_MATCH_TYPES)
         query_rows = con.execute(
@@ -1611,7 +1679,7 @@ def _run_a18(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
     это ограничение уже отражено в config/methodology.yaml
     (A18.requires == ["direct_queries"]).
     """
-    con = common.open_duckdb(paths)
+    con = _open_duckdb_with_direct_vat(paths, canonical)
     try:
         rows = con.execute(
             "SELECT query, campaign_id, "
@@ -1654,7 +1722,7 @@ def _run_a18(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
 
 # ── A19 — CPC аномально высок относительно близких запросов ────────────────
 def _run_a19(paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path) -> None:
-    con = common.open_duckdb(paths)
+    con = _open_duckdb_with_direct_vat(paths, canonical)
     try:
         phrase_types_sql = ", ".join(f"'{t}'" for t in _PHRASE_MATCH_TYPES)
         rows = con.execute(

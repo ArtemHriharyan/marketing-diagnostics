@@ -35,12 +35,15 @@
        States=ALL (включая ARCHIVED) — для 0.4 «клики vs конверсии» и D08.
     9. campaign_targeting.json    — гео (adgroups.RegionIds), устройства/расписание/
        корректировки ставок (bidmodifiers.get) по кампании/группе (A12–A14, A16).
-    10. ad_texts.json              — тексты объявлений + расширения (ads.get,
-        adextensions.get) (A20–A24).
+    10. ad_texts.json              — тексты объявлений (ads.get: Title/Title2/
+        Text/Href) + уточнения-расширения (adextensions.get: только CalloutText,
+        единственный тип расширения CALLOUT). Цену/акцию/срок/наличие API не
+        отдаёт — см. ADEXTENSION_TYPES и manifest.ad_extensions_caveat (A20–A24).
     11. keywords.parquet           — ключевые фразы с типом соответствия
         (keywords.get) — ОТДЕЛЬНО от search queries (A11, A18).
-    12. product_feed.parquet       — товарный фид, если используется (feeds.get);
-        если фида нет — файл не создаётся, manifest.feed_used=false (A25).
+    12. product_feed.parquet       — метаданные всех товарных фидов кабинета
+        (feeds.get БЕЗ SelectionCriteria — Ids заранее не нужен, см. _fetch_feed);
+        если фидов нет — файл не создаётся, manifest.feed_used=false (A25).
 
 Приёмочные флаги в manifest (проверяются на первом реальном прогоне):
     campaign_report_has_lost_impression_share — читается методологией A07 через
@@ -64,6 +67,13 @@
         _fetch_strategies), поэтому сравнение «с явным периодом vs без» невозможно
         без живого прогона с реальным токеном; до этого поле = "unknown" (не
         угадывается, principle 5.d).
+    ad_extensions_price_fields_available (FIX-ad-extensions-coverage) — всегда
+        False: adextensions.get в Директ API v5 отдаёт только текст уточнений
+        (CALLOUT / CalloutText), структурных полей цены/акции/срока/наличия для
+        A24 в API нет (постоянное ограничение, не зависит от прогона — как D11).
+        A21/A23 не затронуты (им расширения не нужны), A22 — отдельная LLM-
+        проверка. Список затронутых проверок и причина — в
+        manifest.ad_extensions_caveat; тип(ы) — ad_extensions_types_available.
 
 ВНИМАНИЕ ПРО ДЕНЬГИ (принцип 7):
     Поле Cost в отчётах Директа приходит в МИКРОРУБЛЯХ — рубли = Cost / 1_000_000.
@@ -203,6 +213,66 @@ TEXT_CAMPAIGN_FIELD_NAMES = ["BiddingStrategy"]
 # "unknown". Значение НЕ может быть null по контракту задачи 2A-direct-strategy.
 STATISTICS_FIELD_SCOPE_UNKNOWN = "unknown"
 STATISTICS_FIELD_SCOPE_VALUES = ("rolling_window", "all_time", "unknown")
+
+# ── adextensions.get (расширения объявлений) — A24 ────────────────────────────
+# ФАКТ ПО ОФИЦИАЛЬНОЙ ДОКУМЕНТАЦИИ (ref-v5/adextensions/get.html, сверено
+# 2026-07-30, задача FIX-ad-extensions-coverage): Яндекс.Директ API v5 отдаёт
+# РОВНО ОДИН тип расширения — CALLOUT (уточнение), и через adextensions.get
+# возвращает только его текст (CalloutText) плюс служебные поля (Id / Type /
+# Status / StatusClarification / Associated). Цена, акция, срок действия и
+# наличие товара через adextensions.get НЕ возвращаются ни в каком поле —
+# отдельного типа расширения (PRICE / PROMOTION / …) в API попросту нет.
+# Поэтому «цена/акция/срок/наличие» из A24 в Директ API как СТРУКТУРНЫЕ поля
+# отсутствуют: на стороне Директа сверять актуальность можно только по тексту
+# объявления (ads.get: Title/Title2/Text, уже выгружается) и тексту уточнений
+# (CalloutText); структурированной сверки цены/наличия против Директа не
+# существует — только против сайта (A24.optional = site_crawl). Это постоянное
+# свойство API (не зависит от конкретного прогона, как ограничение D11), поэтому
+# фиксируется явным caveat в manifest, а не остаётся молчаливым «не проверено».
+# Обходной путь не изобретаем (принцип 5.d: не угадывать несуществующее).
+ADEXTENSION_TYPES = ["CALLOUT"]  # единственный существующий тип расширения
+
+# Валидные значения FieldNames для adextensions.get (ДОСЛОВНО из документации).
+# "State" сюда НЕ входит: оно присутствует в объекте ответа, но не может быть
+# запрошено через FieldNames. Прежний код ошибочно просил "State" — невалидный
+# элемент FieldNames роняет ВЕСЬ вызов (error 8000), ровно как было со "Strategy"
+# в campaigns.get (2A-direct-strategy-fix). Валидируем состав ДО запроса через
+# _validate_field_names, чтобы один невалидный элемент не убивал расширения.
+ADEXTENSIONS_FIELD_NAMES_ENUM = frozenset({
+    "Id", "Type", "Status", "StatusClarification", "Associated",
+})
+ADEXTENSIONS_FIELD_NAMES = ["Id", "Type", "Status", "StatusClarification"]
+
+# A24 (и текстовая, не-LLM часть про «расширения» в A22) на стороне Директа не
+# получают структурных полей цены/акции/срока/наличия — их нет в API; фиксируем
+# явным флагом. A21 (высокий CTR + низкая CR) и A23 (конкретный спрос ->
+# слишком общая страница) ЭТИМ ограничением НЕ затронуты: поля расширений им не
+# нужны (A21 — CTR/CR из отчётов Директа+Метрики; A23 — посадочные URL из
+# ads.get Href + визиты). Это подтверждается requires в config/methodology.yaml
+# (A21: direct_queries+visits; A23: visits+costs; A24: direct_queries).
+AD_EXTENSIONS_PRICE_FIELDS_AVAILABLE = False
+AD_EXTENSIONS_AFFECTED_CHECKS = ["A24"]
+
+# ── feeds.get (товарные фиды) — A25 ───────────────────────────────────────────
+# ФАКТ ПО ОФИЦИАЛЬНОЙ ДОКУМЕНТАЦИИ (ref-v5/feeds/get.html, сверено 2026-07-30,
+# задача FIX-feeds-get-contradiction): чтобы получить ВСЕ фиды кабинета, надо
+# НЕ передавать SelectionCriteria вовсе («Чтобы получить все фиды пользователя,
+# не указывайте SelectionCriteria»). Поле Ids обязательно ТОЛЬКО когда
+# SelectionCriteria присутствует — то есть предварительный список Id знать не
+# нужно, вопреки прежнему коду. Поэтому вызываем feeds.get без SelectionCriteria
+# и НЕ через _get_all (тот форсирует пустой SelectionCriteria={} через
+# setdefault, что вернуло бы «Ids обязателен»). feeds.get отдаёт МЕТАДАННЫЕ
+# фида (id/имя/бизнес-тип/источник/число офферов/дата обновления), но НЕ
+# построчные офферы — per-offer offer_id/price/availability в API v5 нет и они
+# берутся из источника фида отдельно (в этот слой не входят).
+# Валидные значения FieldNames (ДОСЛОВНО из документации): Id | Name |
+# BusinessType | SourceType | FilterSchema | UpdatedAt | CampaignIds |
+# NumberOfItems | Status | TitleAndTextSources. Источник фида — во вложенных
+# объектах UrlFeed (Url/Login/RemoveUtmTags) и FileFeed (Filename), которые
+# запрашиваются отдельными UrlFeedFieldNames / FileFeedFieldNames.
+FEEDS_FIELD_NAMES = ["Id", "Name", "BusinessType", "SourceType", "NumberOfItems", "UpdatedAt"]
+URL_FEED_FIELD_NAMES = ["Url"]
+FILE_FEED_FIELD_NAMES = ["Filename"]
 
 # Директ отдаёт ошибки JSON-API как HTTP 200 с телом {"error": {...}} — статус
 # 200 сам по себе НЕ значит успех. Разбираем error_code, чтобы падать внятно и
@@ -580,7 +650,7 @@ def _run_window_extract(
 
     # 7. Тексты объявлений + расширения.
     try:
-        ad_texts = _fetch_ad_texts(session, headers, notes, campaign_ids)
+        ad_texts = _fetch_ad_texts(session, headers, notes, campaign_ids, log=log)
         with (out_dir / "ad_texts.json").open("w", encoding="utf-8") as fh:
             json.dump(ad_texts, fh, ensure_ascii=False, indent=2)
     except C.AuthError:
@@ -604,9 +674,10 @@ def _run_window_extract(
         notes.append(f"ключевые фразы недоступны: {exc}")
 
     # 9. Товарный фид (если используется). Нет фида -> файл не создаём.
-    # feeds.get требует явный Ids (обязательный параметр) — список Id фидов
-    # клиента нельзя получить без него, отдельного метода перечисления фидов
-    # в API v5 нет; поэтому не вызываем feeds.get вслепую (см. _fetch_feed).
+    # feeds.get вызывается БЕЗ SelectionCriteria и отдаёт все фиды кабинета
+    # (ref-v5/feeds/get: Ids обязателен только при наличии SelectionCriteria) —
+    # предварительный список Id не нужен. feed_used выставляется по факту
+    # непустого ответа (см. _fetch_feed).
     feed_used = False
     try:
         feed_rows = _fetch_feed(session, headers, notes)
@@ -1148,12 +1219,30 @@ def _fetch_targeting(session, headers, campaign_ids: list[int]) -> dict[str, Any
     return {"ad_groups": ad_groups, "bid_modifiers": bid_modifiers}
 
 
-def _fetch_ad_texts(session, headers, notes: list[str], campaign_ids: list[int]) -> dict[str, Any]:
-    """Тексты объявлений (ads.get) + расширения (adextensions.get, best-effort).
+def _fetch_ad_texts(
+    session, headers, notes: list[str], campaign_ids: list[int],
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Тексты объявлений (ads.get) + уточнения-расширения (adextensions.get).
+
+    ВАЖНО про A24 (FIX-ad-extensions-coverage): Яндекс.Директ API v5 отдаёт
+    единственный тип расширения — CALLOUT (уточнение) и только его текст
+    (CalloutText). Цена, акция, срок действия и наличие товара через
+    adextensions.get НЕ доступны ни в каком поле (см. ADEXTENSION_TYPES и
+    комментарий над ним — сверено по ref-v5/adextensions/get.html). Поэтому для
+    A24 структурных полей «цена/акция/срок/наличие» на стороне Директа нет:
+    сверять можно только текст объявления (Title/Title2/Text из ads.get) и текст
+    уточнений; сверка актуальности цены/наличия возможна лишь против сайта
+    (A24.optional = site_crawl). Недоступность фиксируется явным caveat в
+    manifest (ad_extensions_price_fields_available=false, ad_extensions_caveat),
+    а не молчаливым отсутствием данных. Обходной путь не изобретаем.
 
     ads.get требует непустой SelectionCriteria (error 4001) — фильтруем по
-    CampaignIds, полученным из campaigns.get (шаг 5).
+    CampaignIds из campaigns.get (шаг 5). adextensions.get фильтруем по Types
+    (единственный тип — CALLOUT), а FieldNames валидируем локально ДО запроса
+    (тот же приём, что для Strategy), чтобы невалидное поле не роняло вызов.
     """
+    log = log or (lambda _msg: None)
     ads = _get_all(
         session, headers, ADS_URL,
         {
@@ -1164,11 +1253,16 @@ def _fetch_ad_texts(session, headers, notes: list[str], campaign_ids: list[int])
         result_key="Ads", context="ads.get",
     )
     extensions: list[dict[str, Any]] = []
+    field_names = _validate_field_names(
+        ADEXTENSIONS_FIELD_NAMES, ADEXTENSIONS_FIELD_NAMES_ENUM,
+        param_name="FieldNames", context="adextensions.get", log=log,
+    )
     try:
         extensions = _get_all(
             session, headers, ADEXTENSIONS_URL,
             {
-                "FieldNames": ["Id", "Type", "State", "Status", "StatusClarification"],
+                "SelectionCriteria": {"Types": ADEXTENSION_TYPES},
+                "FieldNames": field_names,
                 "CalloutFieldNames": ["CalloutText"],
             },
             result_key="AdExtensions", context="adextensions.get",
@@ -1176,7 +1270,10 @@ def _fetch_ad_texts(session, headers, notes: list[str], campaign_ids: list[int])
     except C.AuthError:
         raise
     except C.SourceUnavailable as exc:
-        notes.append(f"расширения объявлений (цена/акция/наличие) недоступны: {exc}")
+        notes.append(
+            "уточнения-расширения объявлений (adextensions.get, только текст "
+            f"CalloutText) недоступны: {exc}"
+        )
     return {"ads": ads, "extensions": extensions}
 
 
@@ -1223,24 +1320,71 @@ def _fetch_keywords(session, headers, campaign_ids: list[int]) -> list[dict[str,
     return rows
 
 
-def _fetch_feed(session, headers, notes: list[str]) -> list[dict[str, Any]]:
-    """feeds.get -> метаданные товарных фидов (пусто, если фидов нет).
+def _feed_row(feed: dict[str, Any]) -> dict[str, Any]:
+    """Нормализовать один объект Feed из feeds.get в строку product_feed.
 
-    Директ API отдаёт метаданные фида (id/имя/источник/статус синхронизации),
-    но НЕ построчные офферы; per-offer поля (offer_id/price/availability) берутся
-    из источника фида отдельно и в этот слой не входят.
-
-    feeds.get требует SelectionCriteria.Ids явно (обязательный параметр,
-    подтверждено error 8000) — фида не привязан к CampaignIds/AdGroupIds, и
-    отдельного метода перечисления Id фидов клиента без него в API v5 нет.
-    Поэтому не вызываем feeds.get вслепую с фиктивными Ids: graceful empty,
-    причина фиксируется в notes/manifest.feed_used=false.
+    source_url — из вложенного UrlFeed.Url (SourceType=URL) либо FileFeed.Filename
+    (SourceType=FILE); Директ отдаёт ровно один из двух объектов на фид.
+    offers_count — NumberOfItems (число офферов в фиде на момент синхронизации).
     """
-    notes.append(
-        "товарный фид: feeds.get требует Ids, список фидов клиента не может быть "
-        "получен без него — ограничение API, не баг"
-    )
-    return []
+    source_url = None
+    url_feed = feed.get("UrlFeed")
+    if isinstance(url_feed, dict):
+        source_url = url_feed.get("Url")
+    if source_url is None:
+        file_feed = feed.get("FileFeed")
+        if isinstance(file_feed, dict):
+            source_url = file_feed.get("Filename")
+    return {
+        "feed_id": str(feed["Id"]) if feed.get("Id") is not None else None,
+        "feed_name": feed.get("Name"),
+        "business_type": feed.get("BusinessType"),
+        "source_url": source_url,
+        "offers_count": feed.get("NumberOfItems"),
+        "updated_at": feed.get("UpdatedAt"),
+    }
+
+
+def _fetch_feed(session, headers, notes: list[str]) -> list[dict[str, Any]]:
+    """feeds.get -> метаданные всех товарных фидов кабинета (пусто, если фидов нет).
+
+    Директ API отдаёт метаданные фида (id/имя/бизнес-тип/источник/число офферов/
+    дата обновления), но НЕ построчные офферы; per-offer поля
+    (offer_id/price/availability) берутся из источника фида отдельно и в этот
+    слой не входят.
+
+    Чтобы получить ВСЕ фиды кабинета, SelectionCriteria НЕ передаётся вовсе
+    (ref-v5/feeds/get.html: «Чтобы получить все фиды пользователя, не указывайте
+    SelectionCriteria»; Ids обязателен ТОЛЬКО когда SelectionCriteria
+    присутствует). Предварительный список Id знать не нужно — поэтому вызов идёт
+    напрямую, а не через _get_all (тот форсирует пустой SelectionCriteria={} и
+    получил бы «Ids обязателен»). feed_used выставляет вызывающий код по факту
+    непустого ответа. Пагинация — по LimitedBy, как в _get_all.
+    """
+    items: list[dict[str, Any]] = []
+    offset = 0
+    page_limit = 10000
+    while True:
+        params: dict[str, Any] = {
+            "FieldNames": FEEDS_FIELD_NAMES,
+            "UrlFeedFieldNames": URL_FEED_FIELD_NAMES,
+            "FileFeedFieldNames": FILE_FEED_FIELD_NAMES,
+            "Page": {"Limit": page_limit, "Offset": offset},
+        }
+        resp = C.http_request(
+            session, "POST", FEEDS_URL,
+            source=SOURCE, headers=headers,
+            json={"method": "get", "params": params}, timeout=60,
+        )
+        C.ensure_ok(resp, SOURCE, "feeds.get")
+        _raise_for_api_error(resp, "feeds.get")  # ошибка приходит как 200+error
+        result = resp.json().get("result") or {}
+        items.extend(result.get("Feeds") or [])
+        limited = result.get("LimitedBy")
+        if limited is None:
+            break
+        offset = limited
+    return [_feed_row(f) for f in items]
 
 
 def _record_manifest(
@@ -1280,6 +1424,26 @@ def _record_manifest(
         "strategy_field_present": strategy_field_present,
         "strategy_field_samples": strategy_field_samples or [],
         "statistics_field_scope": statistics_field_scope,
+        # FIX-ad-extensions-coverage: adextensions.get отдаёт только уточнения
+        # (CALLOUT -> CalloutText); структурных полей цены/акции/срока/наличия
+        # в Директ API нет. Постоянное свойство API (как ограничение D11) —
+        # фиксируем явно, чтобы A24 не оставался в молчаливом «не проверено».
+        "ad_extensions_types_available": list(ADEXTENSION_TYPES),
+        "ad_extensions_price_fields_available": AD_EXTENSIONS_PRICE_FIELDS_AVAILABLE,
+        "ad_extensions_caveat": {
+            "affected_checks": list(AD_EXTENSIONS_AFFECTED_CHECKS),
+            "reason": (
+                "Яндекс.Директ API v5 (adextensions.get) отдаёт единственный тип "
+                "расширения — уточнение (CALLOUT) и только его текст (CalloutText). "
+                "Цена, акция, срок действия и наличие как структурные поля через "
+                "API недоступны. A24 на стороне Директа опирается только на текст "
+                "объявления (Title/Title2/Text) и текст уточнений; сверка "
+                "актуальности цены/акции/наличия возможна лишь против сайта "
+                "(A24.optional = site_crawl), не против структурных полей Директа. "
+                "A21/A23 этим ограничением не затронуты (поля расширений им не "
+                "нужны). A22 — отдельная текстовая LLM-проверка."
+            ),
+        },
         # Целевые конверсии.
         "macro_goals_configured": macro_goals_configured,
         # Статус по типу отчёта (изоляция ошибок).

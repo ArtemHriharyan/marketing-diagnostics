@@ -194,7 +194,12 @@ def test_query_report_dimensions(tmp_path):
     assert row["device"] == "MOBILE"
     assert row["impressions"] == 80
     assert row["cost_raw"] == 3000000
-    assert row["cost_normalized"] == pytest.approx(3.0)
+    # cost_rub — валютная конверсия, считается всегда (не зависит от Q01).
+    assert row["cost_rub"] == pytest.approx(3.0)
+    # cost_normalized — НДС-нормализация; на слое transform ещё null (Q01
+    # применяется в compute, см. src/compute/block1.py:_open_duckdb_with_direct_vat).
+    assert pd.isna(row["cost_normalized"])
+    assert row["vat_basis_applied"] == False  # noqa: E712 — numpy bool, `is` fails
     assert row["conversions_all"] == 2
     assert "ctr" not in df.columns
     assert "cpa" not in df.columns
@@ -219,7 +224,12 @@ def test_geo_report_schema(tmp_path):
     assert row["location_of_presence_id"] == "213"
     assert row["location_of_presence_name"] == "Москва"
     assert row["cost_raw"] == 1000000
-    assert row["cost_normalized"] == pytest.approx(1.0)
+    # cost_rub — валютная конверсия, считается всегда (не зависит от Q01).
+    assert row["cost_rub"] == pytest.approx(1.0)
+    # cost_normalized — НДС-нормализация; на слое transform ещё null (Q01
+    # применяется в compute, см. src/compute/block1.py:_open_duckdb_with_direct_vat).
+    assert pd.isna(row["cost_normalized"])
+    assert row["vat_basis_applied"] == False  # noqa: E712 — numpy bool, `is` fails
     assert "ctr" not in df.columns
 
 
@@ -640,7 +650,8 @@ def test_geo_unavailable_documented(tmp_path):
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 2B-patch-2: QUERY_FIELDS без Device, geo через CUSTOM_REPORT, CampaignIds
-# в adgroups/ads/keywords.get, feeds.get без Ids -> graceful empty.
+# в adgroups/ads/keywords.get. feeds.get вызывается БЕЗ SelectionCriteria
+# (FIX-feeds-get-contradiction) — отдаёт все фиды кабинета, Ids заранее не нужен.
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_query_report_no_device_field():
@@ -740,8 +751,13 @@ def test_keywords_requires_campaign_ids(tmp_path):
         )
 
 
-def test_feed_missing_ids_graceful(tmp_path):
-    """feeds.get не вызывается без Ids; feed_used=False, явный note, пайплайн не падает."""
+def test_feed_listed_without_selection_criteria(tmp_path):
+    """feeds.get вызывается БЕЗ SelectionCriteria (все фиды кабинета, Ids не нужен).
+
+    FIX-feeds-get-contradiction: ref-v5/feeds/get.html — «чтобы получить все
+    фиды пользователя, не указывайте SelectionCriteria». Пустой ответ ->
+    feed_used=False, product_feed.parquet не пишется, пайплайн не падает.
+    """
     paths = Paths(tmp_path / "data" / "raw")
     (tmp_path / "data" / "raw").mkdir(parents=True, exist_ok=True)
     box = {}
@@ -752,11 +768,51 @@ def test_feed_missing_ids_graceful(tmp_path):
     assert result["feed_used"] is False
 
     feeds_calls = [kwargs for _m, u, kwargs in session.calls if "/feeds" in u]
-    assert not feeds_calls, "feeds.get не должен вызываться без известных Ids"
+    assert feeds_calls, "feeds.get должен вызываться (без SelectionCriteria)"
+    for kwargs in feeds_calls:
+        params = kwargs["json"]["params"]
+        assert "SelectionCriteria" not in params, (
+            "feeds.get не должен передавать SelectionCriteria — иначе Ids "
+            f"стал бы обязательным: {params}"
+        )
 
     entry = manifest_mod.load_manifest(paths.raw)["sources"]["direct"]
     assert entry.get("feed_used") is False
-    notes = entry.get("notes", [])
-    assert any("feeds.get требует Ids" in n for n in notes), (
-        f"ожидался явный note про ограничение feeds.get: {notes}"
-    )
+    assert not (paths.raw / "direct" / "product_feed.parquet").exists()
+
+
+def test_feed_used_writes_parquet_when_present(tmp_path):
+    """Непустой ответ feeds.get -> feed_used=True и product_feed.parquet записан.
+
+    FIX-feeds-get-contradiction: реальный вызов feeds.get отдаёт метаданные
+    фидов кабинета; feed_used выставляется по факту непустого ответа.
+    """
+    paths = Paths(tmp_path / "data" / "raw")
+    (tmp_path / "data" / "raw").mkdir(parents=True, exist_ok=True)
+    box = {}
+    feed_obj = {
+        "Id": 777, "Name": "Каталог", "BusinessType": "RETAIL",
+        "SourceType": "URL", "NumberOfItems": 1500,
+        "UpdatedAt": "2026-06-15T10:00:00Z",
+        "UrlFeed": {"Url": "https://shop.example/feed.xml"},
+    }
+    # Префиксный роут /feeds перекрывает пустой из _direct_routes (первое совпадение).
+    routes = [
+        (_contains("/feeds"),
+         FakeResponse(json_data={"result": {"Feeds": [feed_obj]}})),
+    ] + _direct_routes(box)
+    session = FakeSession(routes)
+    box["session"] = session
+
+    result = direct.extract(CONFIG_DIRECT, ENV, paths, session=session, sleeper=NO_SLEEP)
+    assert result["feed_used"] is True
+
+    parquet_path = paths.raw / "direct" / "product_feed.parquet"
+    assert parquet_path.exists()
+    df = pd.read_parquet(parquet_path)
+    assert df.iloc[0]["feed_id"] == "777"
+    assert df.iloc[0]["source_url"] == "https://shop.example/feed.xml"
+    assert int(df.iloc[0]["offers_count"]) == 1500
+
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["direct"]
+    assert entry.get("feed_used") is True

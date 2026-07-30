@@ -9,27 +9,27 @@ browser/OS-специфика, корзина/бронирование, нали
 Проверки (config/methodology.yaml, catalog-proveryaemyh-marketingovyh-ugroz-v2.md §8):
     C01  медленная загрузка на мобильных                    [crux] (+visits)
     C02  отдельные шаблоны значительно медленнее среднего     [crux] (+visits)
-    C03  JS-ошибки ломают форму/калькулятор/фильтр/корзину    [site_crawl] (+webvisor_findings)
+    C03  JS-ошибки ломают форму/калькулятор/фильтр/корзину    [manual_form_tests] (+webvisor_findings)
     C04  реклама/поиск ведут на 404/5xx/недоступные страницы  [visits] (+site_crawl)
     C05  лишние редиректы и цепочки переходов                 [visits] (+site_crawl)
     C06  большой отвал между открытием и отправкой формы      [visits]
     C07  форма содержит лишние обязательные поля              [visits] (+webvisor_findings)
-    C08  маски/валидация/CAPTCHA блокируют отправку           [site_crawl] (+webvisor_findings)
+    C08  маски/валидация/CAPTCHA блокируют отправку           [manual_form_tests] (+webvisor_findings)
     C09  мобильные элементы неудобны                          [visits] (+webvisor_findings)
     C10  нет понятного подтверждения успешной отправки        [visits] (+webvisor_findings)
-    C11  submit фиксируется, но данные фактически не доставлены [site_crawl]
+    C11  submit фиксируется, но данные фактически не доставлены [manual_form_tests]
     C12  на первом экране непонятно, что предлагает компания  [visits] (+webvisor_findings)
     C13  цена/условия/следующий шаг раскрываются поздно       [visits] (+webvisor_findings)
     C14  недостаточно доверия (гарантии/реквизиты/отзывы)     [site_crawl] (+webvisor_findings)
     C15  основной CTA незаметен/неоднозначен                  [visits] (+site_crawl)
     C16  слишком много конкурирующих действий на странице     [visits]
-    C17  нет альтернативы основной форме (звонок/мессенджер)  [site_crawl]
+    C17  нет альтернативы основной форме (звонок/мессенджер)  [manual_form_tests]
     C18  навигация/категории/фильтры/поиск не помогают        [visits]
     C19  внутренний поиск часто даёт ноль результатов         [visits]
     C20  попап/чат/cookie-баннер перекрывает контент и CTA    [visits] (+webvisor_findings)
     C21  проблема в конкретном браузере/ОС/разрешении         [visits]
     C22  корзина/запись/бронирование теряют на конкретном шаге [visits]
-    C23  платёжный/бронирующий модуль выдаёт ошибки           [site_crawl] (+visits)
+    C23  платёжный/бронирующий модуль выдаёт ошибки           [manual_form_tests] (+visits)
     C24  реклама/SEO ведут на отсутствующий товар/услугу      [visits] (+site_crawl)
     C25  информационные страницы не ведут к коммерции          [visits]
 
@@ -64,12 +64,22 @@ docstring block1.py — один источник правды на одну ц�
 
 2. `site_crawl.py: CANONICAL_TABLES = ["pages"]`, а фактическое имя канонической
    таблицы (SCHEMAS, build_canonical.py) — `site_pages`. Тот же класс разрыва:
-   requires=[site_crawl] (C03/C08/C11) не станет "runnable" автоматически, пока
-   имена не будут выровнены отдельной задачей с extract в allowed_files. Здесь
-   используется `common.load_canonical()`, который читает файлы `data/canonical/
-   *.parquet` напрямую с диска (а не манифест) — поэтому "site_pages" в
-   `canonical` появляется корректно, как только transform реально построил
-   таблицу, независимо от разрыва (1)/(2) в деградации.
+   requires=[site_crawl] не станет "runnable" автоматически через
+   деградацию, пока имена не будут выровнены отдельной задачей с extract в
+   allowed_files. Здесь используется `common.load_canonical()`, который
+   читает файлы `data/canonical/*.parquet` напрямую с диска (а не манифест) —
+   поэтому "site_pages" в `canonical` появляется корректно, как только
+   transform реально построил таблицу, независимо от разрыва (1)/(2) в
+   деградации. C03/C08/C11/C17/C23 задачей FIX-input-tables-manifest-gate
+   (расширенная версия, см. docs/implementation_status.md) переведены с
+   requires=[site_crawl] на requires=[manual_form_tests] и этим разрывом
+   больше НЕ затронуты — их гейт теперь корректно зависит от заполненности
+   inputs/manual_form_tests.yaml, а не от факта краулинга сайта (что и было
+   содержательно верным источником для этих проверок с самого начала, см.
+   разрыв 3 ниже). Разрыв (2) остаётся в силе для C14 (requires=[site_crawl]
+   не тронут в этой задаче — отдельный вопрос) и для необязательных
+   site_crawl в C04/C05/C15/C24 (optional на runnable не влияет, но
+   деградация всё равно никогда не покажет site_crawl доступным).
 
 3. `inputs/manual_form_tests.yaml` НЕ упомянут в requires/optional НИ ОДНОЙ
    проверки C01–C12 в config/methodology.yaml — при этом marketing-diagnostics-
@@ -555,10 +565,11 @@ def _run_manual_only_check(
 ) -> None:
     """methodology v2 §6: "не автоматизируются в принципе — заносить в
 
-    inputs/manual_form_tests.yaml, не пытаться закрыть скриптом". site_pages
-    (site_crawl) — инфраструктурная предпосылка (аналитик тестировал формы в
-    рамках того же обхода сайта), не источник самих находок C03/C08/C11 (см.
-    докстринг модуля, разрыв 3).
+    inputs/manual_form_tests.yaml, не пытаться закрыть скриптом". Единственный
+    источник находок — сам inputs/manual_form_tests.yaml; requires=
+    [manual_form_tests] (config/methodology.yaml) гейтит диспетчеризацию по
+    этому же файлу через manifest["input_tables"] (см. докстринг модуля,
+    разрыв 3) — site_pages/site_crawl здесь не участвует.
     """
     inputs = common.load_inputs(paths)
     doc = inputs.get("manual_form_tests")
@@ -1277,7 +1288,7 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         _run_c02(paths, defaults, canonical, caps.get("C02", "HIGH"), metrics_dir)
         artifacts.append("c02")
 
-    if "C03" in runnable_ids and "site_pages" in canonical:
+    if "C03" in runnable_ids:
         _run_manual_only_check("C03", paths, caps.get("C03", "HIGH"), metrics_dir)
         artifacts.append("c03")
 
@@ -1297,7 +1308,7 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         _run_c07(paths, defaults, caps.get("C07", "HIGH"), metrics_dir)
         artifacts.append("c07")
 
-    if "C08" in runnable_ids and "site_pages" in canonical:
+    if "C08" in runnable_ids:
         _run_manual_only_check("C08", paths, caps.get("C08", "HIGH"), metrics_dir)
         artifacts.append("c08")
 
@@ -1309,7 +1320,7 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         _run_c10(paths, defaults, caps.get("C10", "HIGH"), metrics_dir)
         artifacts.append("c10")
 
-    if "C11" in runnable_ids and "site_pages" in canonical:
+    if "C11" in runnable_ids:
         _run_manual_only_check("C11", paths, caps.get("C11", "HIGH"), metrics_dir)
         artifacts.append("c11")
 
@@ -1344,7 +1355,7 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         )
         artifacts.append("c16")
 
-    if "C17" in runnable_ids and "site_pages" in canonical:
+    if "C17" in runnable_ids:
         _run_manual_only_check("C17", paths, caps.get("C17", "HIGH"), metrics_dir)
         artifacts.append("c17")
 
@@ -1389,7 +1400,7 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         )
         artifacts.append("c22")
 
-    if "C23" in runnable_ids and "site_pages" in canonical:
+    if "C23" in runnable_ids:
         _run_manual_only_check("C23", paths, caps.get("C23", "HIGH"), metrics_dir)
         artifacts.append("c23")
 

@@ -7,10 +7,10 @@ build_direct_placements/build_direct_geo_monthly/write_ad_texts_archive
 4X-direct-reconcile и 4X-direct-cleanup). Фильтрация текстов объявлений по
 State=="ON" (допустимые значения Ad.State — ON/OFF/SUSPENDED/ARCHIVED,
 значения "ACTIVE" в API не существует) реально подключена к
-build_canonical.build() через ленивый импорт; запись canonical/ad_texts.json
-+ ad_texts_archived.json делает сам build() инлайн (не эта функция) —
-сквозная проверка того инлайн-кода тоже здесь, отдельно от юнит-тестов
-чистой функции.
+build_canonical.build() через ленивый импорт; запись canonical/ad_texts.parquet
++ ad_texts_archived.parquet (4F-ad-texts-parquet) делает сам build() инлайн
+(не эта функция) — сквозная проверка того инлайн-кода тоже здесь, отдельно
+от юнит-тестов чистой функции.
 """
 
 from __future__ import annotations
@@ -72,8 +72,9 @@ def test_filter_ad_texts_missing_state_goes_to_archived(tmp_path):
 # следующий тест сквозной — гоняет реальный build_canonical.build() и
 # проверяет то, что 4X-direct-cleanup сверил построчно (см.
 # docs/implementation_status.md): raw ad_texts.json не открывается на запись
-# и не удаляется, canonical/ad_texts.json содержит только State=="ON", а
-# canonical/ad_texts_archived.json — всё остальное, включая записи без State.
+# и не удаляется, canonical/ad_texts.parquet содержит только State=="ON", а
+# canonical/ad_texts_archived.parquet — всё остальное, включая записи без
+# State (контракт .parquet — задача 4F-ad-texts-parquet).
 class _Paths:
     def __init__(self, root: Path):
         self.root = root
@@ -114,19 +115,17 @@ def test_build_ad_texts_inline_logic_keeps_raw_intact_and_splits_correctly(tmp_p
     assert raw_path.read_bytes() == raw_bytes_before
     assert raw_path.stat().st_mtime_ns == raw_mtime_before
 
-    active_payload = json.loads((paths.canonical / "ad_texts.json").read_text(encoding="utf-8"))
-    archived_payload = json.loads(
-        (paths.canonical / "ad_texts_archived.json").read_text(encoding="utf-8")
-    )
-    assert {a["Id"] for a in active_payload["ads"]} == {1}
-    assert {a["Id"] for a in archived_payload["ads"]} == {2, 3}
+    active_df = pd.read_parquet(paths.canonical / "ad_texts.parquet")
+    archived_df = pd.read_parquet(paths.canonical / "ad_texts_archived.parquet")
+    assert set(active_df["ad_id"]) == {"1"}
+    assert set(archived_df["ad_id"]) == {"2", "3"}
 
     canonical_manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
     assert canonical_manifest["flags"]["ad_texts"] == {"active_count": 1, "archived_count": 2}
 
 
 def test_build_no_ad_texts_source_writes_no_ad_texts_files(tmp_path):
-    """Без raw ad_texts.json — canonical ad_texts.json/ad_texts_archived.json не создаются."""
+    """Без raw ad_texts.json — canonical ad_texts.parquet/ad_texts_archived.parquet не создаются."""
     from src.pipeline import manifest as manifest_mod
     from src.transform import build_canonical as bc
 
@@ -149,5 +148,5 @@ def test_build_no_ad_texts_source_writes_no_ad_texts_files(tmp_path):
     bc.build(paths, {"data_window": {"date_from": "2026-06-01", "date_to": "2026-06-30"}},
               {"utm_undefined_threshold": 0.25})
 
-    assert not (paths.canonical / "ad_texts.json").exists()
-    assert not (paths.canonical / "ad_texts_archived.json").exists()
+    assert not (paths.canonical / "ad_texts.parquet").exists()
+    assert not (paths.canonical / "ad_texts_archived.parquet").exists()

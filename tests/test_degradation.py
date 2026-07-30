@@ -111,6 +111,31 @@ def test_one_manual_required_caps_confidence_at_med():
     assert result["source_modes"]["costs"] == "api"
 
 
+def test_manual_form_tests_required_caps_confidence_at_med():
+    """FIX-input-tables-manifest-gate (расширенная версия): manual_form_tests
+
+    добавлен в _MANUAL_TABLES вместе с requires C03/C08/C11/C17/C23 в
+    config/methodology.yaml (site_crawl -> manual_form_tests) — без этого
+    confidence_cap этих пяти проверок остался бы HIGH вместо MED.
+    """
+    check = {
+        "id": "C03",
+        "requires": ["manual_form_tests"],
+        "type_default": "B",
+        "type_downgrade_if": None,
+        "type_downgraded": None,
+    }
+    result = evaluate_check(
+        check,
+        available={"manual_form_tests"},
+        source_modes=_modes(),
+        manual_cap="MED",
+    )
+    assert result["runnable"] is True
+    assert result["confidence_cap"] == "MED"
+    assert result["source_modes"]["manual_form_tests"] == "manual"
+
+
 # ── 4. Все requires из api-источников -> HIGH ────────────────────────────────
 
 def test_all_api_required_keeps_confidence_high():
@@ -131,3 +156,63 @@ def test_all_api_required_keeps_confidence_high():
     assert result["confidence_cap"] == "HIGH"
     assert result["source_modes"]["visits"] == "api"
     assert result["source_modes"]["costs"] == "api"
+
+
+# ── 5. confidence_cap_downgraded (A24: ad_extensions_price_fields_available) ─
+
+def test_confidence_cap_downgraded_applies_when_type_downgrade_fires():
+    """type_downgrade_if истинно + confidence_cap_downgraded задан -> потолок ниже."""
+    check = {
+        "id": "A24",
+        "requires": ["direct_queries"],
+        "type_default": "A+B",
+        "type_downgrade_if": "ad_extensions_price_fields_available == false",
+        "type_downgraded": "B",
+        "confidence_cap_downgraded": "MED",
+    }
+    result = evaluate_check(
+        check,
+        available={"direct_queries"},
+        source_modes=_modes(),
+        manual_cap="MED",
+        flags={"ad_extensions_price_fields_available": False},
+    )
+    assert result["type_effective"] == "B"
+    assert result["confidence_cap"] == "MED"
+
+
+def test_confidence_cap_downgraded_ignored_when_flag_true():
+    """Флаг true -> type_downgrade_if ложно -> confidence_cap_downgraded не применяется."""
+    check = {
+        "id": "A24",
+        "requires": ["direct_queries"],
+        "type_default": "A+B",
+        "type_downgrade_if": "ad_extensions_price_fields_available == false",
+        "type_downgraded": "B",
+        "confidence_cap_downgraded": "MED",
+    }
+    result = evaluate_check(
+        check,
+        available={"direct_queries"},
+        source_modes=_modes(),
+        manual_cap="MED",
+        flags={"ad_extensions_price_fields_available": True},
+    )
+    assert result["type_effective"] == "A+B"
+    assert result["confidence_cap"] == "HIGH"
+
+
+def test_confidence_cap_downgraded_absent_leaves_cap_unaffected():
+    """Проверки без confidence_cap_downgraded (напр. A07) не меняют confidence_cap."""
+    check = {
+        "id": "A07",
+        "requires": ["costs"],
+        "type_default": "A",
+        "type_downgrade_if": "some_flag == false",
+        "type_downgraded": "B",
+    }
+    result = evaluate_check(
+        check, available={"costs"}, source_modes=_modes(), flags={}
+    )
+    assert result["type_effective"] == "B"
+    assert result["confidence_cap"] == "HIGH"

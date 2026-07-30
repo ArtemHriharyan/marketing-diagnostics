@@ -260,15 +260,17 @@ def test_c08_reuses_same_manual_bucket_mechanism(tmp_path):
     assert any(r.get("check_id") == "C08" and r["finding"] == "manual_pattern" for r in rows)
 
 
-def test_c11_without_site_pages_not_dispatched(tmp_path):
-    """requires=[site_crawl]: без site_pages в canonical C11 вообще не считается."""
+def test_c11_runs_without_site_pages_when_manual_form_tests_filled(tmp_path):
+    """FIX-input-tables-manifest-gate (расширенная версия): requires теперь
+    [manual_form_tests], не [site_crawl] — C11 считается без site_pages в
+    canonical, пока в runnable_ids (что определяет заполненная анкета форм)."""
     paths = _Paths(tmp_path)
     _write_input_yaml(paths, "manual_form_tests", {"meta": {"tested_at": "2026-07-20"}})
 
     artifacts = block3.run(paths, DEFAULTS, {"C11"})
 
-    assert "c11" not in artifacts
-    assert not (paths.metrics / "c11.json").exists()
+    assert "c11" in artifacts
+    assert (paths.metrics / "c11.json").exists()
 
 
 # ── C04 — 404/5xx на посадочных ─────────────────────────────────────────────
@@ -627,14 +629,38 @@ def test_c25_manual_fallback_present(tmp_path):
 
 
 # ── C17/C23 — полностью ручные (тип B, как C03/C08/C11) ─────────────────────
-def test_c17_without_site_pages_not_dispatched(tmp_path):
+def test_c17_runs_without_site_pages_when_manual_form_tests_filled(tmp_path):
+    """Тот же сценарий, что test_c11_runs_without_site_pages_when_manual_form_tests_filled."""
     paths = _Paths(tmp_path)
     _write_input_yaml(paths, "manual_form_tests", {"meta": {"tested_at": "2026-07-20"}})
 
     artifacts = block3.run(paths, DEFAULTS, {"C17"})
 
-    assert "c17" not in artifacts
-    assert not (paths.metrics / "c17.json").exists()
+    assert "c17" in artifacts
+    assert (paths.metrics / "c17.json").exists()
+
+
+def test_c03_c08_c11_c17_c23_run_without_site_crawl(tmp_path):
+    """Ключевой сценарий FIX-input-tables-manifest-gate (расширенная версия):
+
+    все пять проверок runnable исключительно от inputs/manual_form_tests.yaml,
+    независимо от наличия/отсутствия site_pages (site_crawl) в canonical —
+    requires в config/methodology.yaml для них больше не site_crawl.
+    """
+    paths = _Paths(tmp_path)
+    _write_input_yaml(paths, "manual_form_tests", {
+        "meta": {"tested_at": "2026-07-20"},
+        "patterns": [{"step": "форма", "issue": "тестовый паттерн"}],
+    })
+
+    check_ids = {"C03", "C08", "C11", "C17", "C23"}
+    artifacts = block3.run(paths, DEFAULTS, check_ids)
+
+    for check_id in check_ids:
+        name = check_id.lower()
+        assert name in artifacts
+        rows = _read_metric(paths, name)
+        assert any(r.get("finding") == "manual_pattern" for r in rows)
 
 
 def test_c23_manual_present(tmp_path):

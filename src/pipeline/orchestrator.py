@@ -311,6 +311,58 @@ def run_intake(paths: ClientPaths, log: StageLogger) -> bool:
     return True
 
 
+# Соответствие имени YAML в inputs/ клиента -> канонической таблице,
+# которую он закрывает в manifest["input_tables"] (читает
+# src.pipeline.degradation.available_tables_from_manifest). Расширено с
+# client_answers на manual_form_tests в FIX-input-tables-manifest-gate
+# (расширенная версия, см. docs/implementation_status.md) — requires:
+# [manual_form_tests] несёт C03/C08/C11/C17/C23 (config/methodology.yaml).
+# webvisor_findings НЕ добавлен: ни одна проверка не ссылается на него через
+# requires (только через optional, которое на runnable не влияет) — токен
+# добавляется в эту карту только когда/если появится такой requires.
+# crm/manual_serp не добавляются: по AUDIT-input-tables-blast-radius это
+# мёртвые записи справочника деградации, ни один requires/optional на них не
+# ссылается.
+INPUT_TABLE_FILES: dict[str, str] = {
+    "client_answers": "client_answers.yaml",
+    "manual_form_tests": "manual_form_tests.yaml",
+}
+
+
+def _detect_input_tables(paths: "ClientPaths") -> list[str]:
+    """Определить, какие input-таблицы клиента реально заполнены.
+
+    Таблица считается доступной, если соответствующий файл в inputs/
+    существует и парсится YAML в непустое значение — отсутствующий файл или
+    пустой YAML (```None``` после ``safe_load``) не считаются. Результат
+    идёт в manifest["input_tables"], который читает
+    ``degradation.available_tables_from_manifest`` при сборке карты
+    деградации: без этого D06/D07/T06 (``requires: [client_answers, ...]``)
+    и C03/C08/C11/C17/C23 (``requires: [manual_form_tests]``) структурно
+    никогда не становятся runnable, даже когда анкета/ручные тесты форм
+    заполнены.
+
+    ``paths.inputs`` опционален (минимальные дублёры ClientPaths в тестах
+    других экстракторов его не объявляют) — без него функция просто ничего
+    не находит, как при отсутствующем каталоге.
+    """
+    inputs_dir = getattr(paths, "inputs", None)
+    if inputs_dir is None:
+        return []
+    detected: list[str] = []
+    for table, filename in INPUT_TABLE_FILES.items():
+        path = inputs_dir / filename
+        if not path.exists():
+            continue
+        try:
+            content = load_yaml(path)
+        except Exception:
+            continue
+        if content:
+            detected.append(table)
+    return detected
+
+
 # Карта: ключ источника в config.sources -> модули-экстракторы src/extract/.
 # У Метрики два экстрактора на один источник: сырьё визитов (Logs API) и
 # агрегаты для сверки (Reports API).
@@ -378,6 +430,11 @@ def run_extract(paths: ClientPaths, log: StageLogger) -> None:
     defaults = load_defaults()
     env = extract_common.load_env(paths.env_file)  # токены НЕ логируются
     sources = config.get("sources", {}) or {}
+
+    input_tables = _detect_input_tables(paths)
+    manifest_mod.update_global(paths.raw, input_tables=input_tables)
+    if input_tables:
+        log(f"extract[inputs]: заполнены -> {', '.join(input_tables)}")
 
     extracted, unavailable, skipped = [], [], []
     for source, spec in sources.items():

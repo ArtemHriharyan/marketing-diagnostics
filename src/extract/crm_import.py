@@ -3,10 +3,20 @@
 Контракт:
     Читает   — config.sources.crm_csv.path (по умолчанию inputs/crm_export.csv)
                и правила разбора config.crm_csv (column_map, status_map,
-               date_formats, delimiter, hash_salt).
+               date_formats, delimiter, hash_salt, attribution_reliable,
+               attribution_unreliable_reason).
     Пишет    — data/raw/crm/leads.csv|parquet (нормализованные строки) +
                data/raw/crm/validation_report.json (принято/отброшено и почему)
-               + manifest.json (canonical_tables: [crm]).
+               + manifest.json (canonical_tables: [crm], булев флаг
+               crm_attribution_reliable + crm_attribution_unreliable_reason).
+    attribution_reliable — постоянное per-клиентское решение (config.crm_csv),
+               не деградация конкретного прогона: если source/status в
+               выгрузке структурно непригодны для атрибуции по этому
+               клиенту, config.crm_csv.attribution_reliable=false фиксирует
+               это явным manifest-флагом (доступен как type_downgrade_if
+               наравне с остальными флагами degradation.py), вместо тихого
+               игнорирования пустых колонок. По умолчанию true — не влияет
+               на клиентов, у которых этот ключ не задан.
     Деградация — опционален; без CRM весь блок 6 (лид->сделка и т.д.) уходит
                  в degradation_report.
     LLM      — не используется. Файл заполняет клиент/аналитик вручную.
@@ -96,6 +106,10 @@ def extract(
     date_formats = list(crm_cfg.get("date_formats") or []) + DEFAULT_DATE_FORMATS
     salt = str(crm_cfg.get("hash_salt") or "")
     fmt = C.resolve_raw_format(sources_cfg)
+    attribution_reliable = bool(crm_cfg.get("attribution_reliable", True))
+    attribution_reason = (
+        crm_cfg.get("attribution_unreliable_reason") if not attribution_reliable else None
+    )
 
     rows, headers, delimiter = _read_csv(csv_path, crm_cfg.get("delimiter"))
     log(f"{SOURCE}: {csv_path.name} — {len(rows)} строк, разделитель '{delimiter}'")
@@ -129,6 +143,8 @@ def extract(
         "columns_seen": headers,
         "column_map": column_map,
         "raw_format": fmt,
+        "attribution_reliable": attribution_reliable,
+        "attribution_unreliable_reason": attribution_reason,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
     (out_dir / "validation_report.json").write_text(
@@ -342,5 +358,7 @@ def _record_manifest(paths, accepted, report) -> dict[str, Any]:
             "rejected": report["rejected"],
             "rejected_reasons": report["rejected_reasons"],
             "warnings": report["warnings"],
+            "crm_attribution_reliable": report["attribution_reliable"],
+            "crm_attribution_unreliable_reason": report["attribution_unreliable_reason"],
         },
     )

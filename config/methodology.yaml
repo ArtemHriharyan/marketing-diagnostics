@@ -21,6 +21,15 @@
 #                                    деградация конкретного прогона) — захардкожено
 #                                    напрямую, БЕЗ участия type_downgrade_if (см. ниже
 #                                    и CLAUDE.md, раздел «Схема ID проверок»).
+#     confidence_cap_downgraded: "MED"  опционально: доп. потолок confidence_cap,
+#                                    применяется ТОЛЬКО когда type_downgrade_if
+#                                    истинно (тот же флаг манифеста), поверх обычного
+#                                    потолка от source_modes (src/pipeline/degradation.py
+#                                    min_confidence). Без этого поля срабатывание
+#                                    type_downgrade_if на confidence_cap не влияет —
+#                                    так ведут себя все проверки, кроме явно опознавших
+#                                    поле (см. A24: потеря "A" при понижении типа
+#                                    означает потерю автоматической проверяемости).
 #     downgrade_reason: "..."        человекочитаемая причина понижения (опционально,
 #                                    заполняется вместе с type_downgraded, когда
 #                                    ограничение зафиксировано фактом, а не гипотезой)
@@ -451,8 +460,10 @@ checks:
     optional: [site_crawl]
     outputs: [a24]
     type_default: "A+B"
-    type_downgrade_if: null
-    type_downgraded: null
+    type_downgrade_if: "ad_extensions_price_fields_available == false"
+    type_downgraded: "B"
+    confidence_cap_downgraded: "MED"
+    downgrade_reason: "adextensions.get (Директ API v5) не отдаёт структурные поля цены/акции/срока/наличия — только текст уточнений CALLOUT/CalloutText; постоянное ограничение API, не зависит от прогона (см. FIX-ad-extensions-coverage)"
 
   - id: "A25"
     legacy_id: null
@@ -614,7 +625,7 @@ checks:
     legacy_id: null
     block: 3
     name: "JavaScript-ошибки ломают форму, калькулятор, фильтр или корзину"
-    requires: [site_crawl]
+    requires: [manual_form_tests]
     optional: [webvisor_findings]
     outputs: [c03]
     type_default: "B"
@@ -669,7 +680,7 @@ checks:
     legacy_id: null
     block: 3
     name: "Маски, валидация или CAPTCHA блокируют отправку"
-    requires: [site_crawl]
+    requires: [manual_form_tests]
     optional: [webvisor_findings]
     outputs: [c08]
     type_default: "A+B"
@@ -702,7 +713,7 @@ checks:
     legacy_id: null
     block: 3
     name: "Событие submit фиксируется, но форма фактически не доставляет данные"
-    requires: [site_crawl]
+    requires: [manual_form_tests]
     optional: []
     outputs: [c11]
     type_default: "B"
@@ -768,7 +779,7 @@ checks:
     legacy_id: null
     block: 3
     name: "Нет альтернативы основной форме (звонок, мессенджер)"
-    requires: [site_crawl]
+    requires: [manual_form_tests]
     optional: []
     outputs: [c17]
     type_default: "B"
@@ -834,7 +845,7 @@ checks:
     legacy_id: null
     block: 3
     name: "Платёжный или бронирующий модуль выдаёт ошибки"
-    requires: [site_crawl]
+    requires: [manual_form_tests]
     optional: [visits]
     outputs: [c23]
     type_default: "A+B"
@@ -1022,7 +1033,7 @@ checks:
     legacy_id: null
     block: 4
     name: "Цепочки и массовые редиректы размывают сигнал"
-    requires: [site_crawl]
+    requires: [site_pages]
     optional: [seo_queries]
     outputs: [s15]
     type_default: "A+B"
@@ -1055,7 +1066,7 @@ checks:
     legacy_id: null
     block: 4
     name: "Важные страницы имеют мало внутренних ссылок или являются сиротами"
-    requires: [site_crawl]
+    requires: [site_link_graph]
     optional: []
     outputs: [s18]
     type_default: "B"
@@ -1066,7 +1077,7 @@ checks:
     legacy_id: null
     block: 4
     name: "Архитектура сайта требует слишком много кликов до коммерческой страницы"
-    requires: [site_crawl]
+    requires: [site_link_graph]
     optional: [visits]
     outputs: [s19]
     type_default: "A+B"
