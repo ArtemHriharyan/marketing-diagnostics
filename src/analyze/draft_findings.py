@@ -28,7 +28,7 @@
 
 Задача 6B подключает сам вызов модели (единственное место в пайплайне,
 где это разрешено — принцип 3 CLAUDE.md):
-    _call_llm()           — один структурированный вызов (output_config.format)
+    _call_llm()           — один структурированный вызов (text.format)
                             поверх input_pack; предсказуемый токен-бюджет
                             (LLM_MAX_TOKENS), без повторной генерации после
                             валидного ответа (ретраи — только транспортные,
@@ -39,8 +39,7 @@
                             находки как findings/draft/F-<блок>-<nn>.yaml
                             (не больше schemas.MAX_FINDINGS_PER_RUN).
 
-    Модель и ключ API берутся из project env (anthropic.Anthropic() по
-    умолчанию читает ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN из process env),
+    Модель и ключ API берутся из project env (только OPENAI_API_KEY),
     а НЕ из clients/<name>/.env — секреты клиента (принцип 6 CLAUDE.md)
     относятся к источникам данных, а не к самому пайплайну.
 
@@ -258,11 +257,10 @@ def build_system_prompt(defaults: dict[str, Any] | None = None) -> str:
 
 
 # ── Вызов модели (задача 6B; единственное место в пайплайне — принцип 3) ────
-# Модель и ключ — из project env (anthropic.Anthropic() по умолчанию читает
-# ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN из process env), НЕ из
+# Модель и ключ — из project env (только OPENAI_API_KEY), НЕ из
 # clients/<name>/.env — см. докстринг модуля.
 LLM_MODEL_ENV_VAR = "ANALYZE_LLM_MODEL"
-DEFAULT_LLM_MODEL = "claude-opus-4-8"
+DEFAULT_LLM_MODEL = "gpt-5.6-terra"
 LLM_MAX_TOKENS = 8000          # предсказуемый бюджет одного структурированного вызова
 LLM_TIMEOUT_SECONDS = 180.0
 LLM_MAX_RETRIES = 2            # ретраи транспортного уровня SDK (сеть/429/5xx)
@@ -275,7 +273,7 @@ def _resolve_llm_model() -> str:
 
 
 def _finding_item_schema() -> dict[str, Any]:
-    """JSON Schema одной находки для output_config.format.
+    """JSON Schema одной находки для text.format.
 
     Форма зеркалит schemas.Finding. Допустимые значения status/confidence/
     money_category намеренно не заданы через enum здесь — их проверяет
@@ -307,9 +305,10 @@ def _finding_item_schema() -> dict[str, Any]:
         },
         "required": [
             "check_id", "name", "status", "confidence", "significant", "period",
-            "data_source", "evidence", "what_is_distorted", "money_not_assessable",
-            "assumptions", "recommended_action", "how_to_measure",
-            "what_cannot_be_concluded", "source_check_ids",
+            "segment", "data_source", "evidence", "control_metric", "what_is_distorted",
+            "money_category", "money_amount_rub", "money_not_assessable", "assumptions",
+            "recommended_action", "how_to_measure", "what_cannot_be_concluded",
+            "source_check_ids",
         ],
         "additionalProperties": False,
     }
@@ -336,30 +335,43 @@ def _call_llm(
     происходит локально в draft().
 
     ``client`` — точка подмены для тестов (см. tests/test_analyze*.py); по
-    умолчанию создаётся anthropic.Anthropic() (ключ/модель — из project env,
-    см. докстринг модуля).
+    умолчанию создаётся openai.OpenAI() с ключом только из project env.
     """
     if client is None:
-        import anthropic
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY не задан в project environment; analyze не читает clients/<name>/.env"
+            )
 
-        client = anthropic.Anthropic(timeout=LLM_TIMEOUT_SECONDS, max_retries=LLM_MAX_RETRIES)
+        from openai import OpenAI
 
-    response = client.messages.create(
+        client = OpenAI(
+            api_key=api_key,
+            timeout=LLM_TIMEOUT_SECONDS,
+            max_retries=LLM_MAX_RETRIES,
+        )
+
+    response = client.responses.create(
         model=_resolve_llm_model(),
-        max_tokens=LLM_MAX_TOKENS,
-        system=system_prompt,
-        messages=[{
+        max_output_tokens=LLM_MAX_TOKENS,
+        instructions=system_prompt,
+        input=[{
             "role": "user",
             "content": (
                 "Входной пакет (metrics/inputs/degradation/контекст клиента) в "
                 "формате JSON:\n\n" + json.dumps(input_pack, ensure_ascii=False)
             ),
         }],
-        output_config={"format": {"type": "json_schema", "schema": _findings_response_schema()}},
+        text={"format": {
+            "type": "json_schema",
+            "name": "analyze_findings",
+            "strict": True,
+            "schema": _findings_response_schema(),
+        }},
     )
 
-    text = next(block.text for block in response.content if getattr(block, "type", None) == "text")
-    return json.loads(text)
+    return json.loads(response.output_text)
 
 
 def _finding_from_dict(item: Any) -> schemas.Finding | None:

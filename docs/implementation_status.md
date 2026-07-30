@@ -3388,3 +3388,5 @@ Blocker: нет для завершённой части (Части 1-2 чер�
 `ANTHROPIC_API_KEY` для продолжения. Изменённый файл вне `allowed_files`:
 `src/compute/common.py` (однострочный фикс диспетчера, внесён по прямому
 согласию аналитика в ходе задачи, не самовольное расширение скоупа).
+
+**MIGRATE-analyze-openai** DONE — 2026-07-30. Слой analyze переведён с Anthropic на OpenAI Responses API: `openai`, `client.responses.create`, `OPENAI_API_KEY` только из project environment, `gpt-5.6-terra` по умолчанию; strict JSON Schema, rejected-артефакты и ручной report gate сохранены. Целевые тесты проходят без реального API.

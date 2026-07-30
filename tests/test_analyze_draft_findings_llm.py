@@ -1,10 +1,9 @@
-"""Тесты слоя analyze (задача 6B): подключение вызова модели в draft_findings.py.
+"""Тесты слоя analyze: подключение OpenAI Responses API в draft_findings.py.
 
-Вызов API Anthropic мокается целиком (_MockMessages/_MockClient) — сеть не
+Вызов API OpenAI мокается целиком (_MockResponses/_MockClient) — сеть не
 трогаем, реальный ключ/модель не нужны. Сценарии:
 
-1. _call_llm: формирует ожидаемый запрос (model/max_tokens/system/messages/
-   output_config.format) и парсит текстовый JSON-ответ модели.
+1. _call_llm: формирует ожидаемый запрос Responses API и парсит output_text.
 2. _resolve_llm_model: по умолчанию DEFAULT_LLM_MODEL, переопределяется через
    project env (ANALYZE_LLM_MODEL), не через clients/<name>/.env — у _Paths
    в этих тестах вовсе нет .env_file, так что подмена через client-секреты
@@ -12,7 +11,7 @@
 3. draft(): валидные находки модели пишутся как findings/draft/F-<блок>-<nn>.yaml
    с последовательной нумерацией внутри блока.
 4. draft(): находки, не прошедшие schemas.validate_finding, отбрасываются без
-   повторного вызова модели (ровно один messages.create за прогон).
+   повторного вызова модели (ровно один responses.create за прогон).
 5. draft(): не больше schemas.MAX_FINDINGS_PER_RUN находок пишется, даже если
    модель вернула больше — лишние отбрасываются, вызов модели остаётся один.
 """
@@ -96,8 +95,8 @@ def _evidence_metrics_row(check_id: str, confidence: str) -> dict:
     }
 
 
-class _MockMessages:
-    """Подмена client.messages — capture пишет kwargs каждого вызова."""
+class _MockResponses:
+    """Подмена client.responses — capture пишет kwargs каждого вызова."""
 
     def __init__(self, findings_payload: list[dict], capture: list[dict] | None = None):
         self._payload = findings_payload
@@ -106,12 +105,12 @@ class _MockMessages:
     def create(self, **kwargs):
         self.capture.append(kwargs)
         text = json.dumps({"findings": self._payload}, ensure_ascii=False)
-        return types.SimpleNamespace(content=[types.SimpleNamespace(type="text", text=text)])
+        return types.SimpleNamespace(output_text=text)
 
 
 class _MockClient:
     def __init__(self, findings_payload: list[dict], capture: list[dict] | None = None):
-        self.messages = _MockMessages(findings_payload, capture)
+        self.responses = _MockResponses(findings_payload, capture)
 
 
 def _finding_dict(check_id: str, **overrides) -> dict:
@@ -152,13 +151,26 @@ def test_call_llm_sends_expected_request_and_parses_response():
     assert len(capture) == 1
     kwargs = capture[0]
     assert kwargs["model"] == draft_findings.DEFAULT_LLM_MODEL
-    assert kwargs["max_tokens"] == draft_findings.LLM_MAX_TOKENS
-    assert kwargs["system"] == "системный промт"
-    assert kwargs["output_config"]["format"]["type"] == "json_schema"
-    assert kwargs["output_config"]["format"]["schema"]["required"] == ["findings"]
-    assert len(kwargs["messages"]) == 1
-    assert kwargs["messages"][0]["role"] == "user"
-    assert '"metrics"' in kwargs["messages"][0]["content"]
+    assert kwargs["max_output_tokens"] == draft_findings.LLM_MAX_TOKENS
+    assert kwargs["instructions"] == "системный промт"
+    assert kwargs["text"]["format"]["type"] == "json_schema"
+    assert kwargs["text"]["format"]["name"] == "analyze_findings"
+    assert kwargs["text"]["format"]["strict"] is True
+    assert kwargs["text"]["format"]["schema"]["required"] == ["findings"]
+    item_schema = kwargs["text"]["format"]["schema"]["properties"]["findings"]["items"]
+    assert set(item_schema["required"]) == set(item_schema["properties"])
+    assert len(kwargs["input"]) == 1
+    assert kwargs["input"][0]["role"] == "user"
+    assert '"metrics"' in kwargs["input"][0]["content"]
+
+
+def test_call_llm_fails_clearly_without_openai_api_key(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+        draft_findings._call_llm("системный промт", {"metrics": {}})
 
 
 # ── 2. _resolve_llm_model: project env, не client env ──────────────────────
@@ -169,8 +181,8 @@ def test_resolve_llm_model_defaults_without_env(monkeypatch):
 
 
 def test_resolve_llm_model_reads_project_env_override(monkeypatch):
-    monkeypatch.setenv(draft_findings.LLM_MODEL_ENV_VAR, "claude-sonnet-5")
-    assert draft_findings._resolve_llm_model() == "claude-sonnet-5"
+    monkeypatch.setenv(draft_findings.LLM_MODEL_ENV_VAR, "gpt-5.6-sol")
+    assert draft_findings._resolve_llm_model() == "gpt-5.6-sol"
 
 
 # ── 3. draft(): валидные находки -> F-<блок>-<nn>.yaml ──────────────────────

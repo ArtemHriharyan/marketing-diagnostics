@@ -156,18 +156,18 @@ def test_input_pack_round_trips_through_json(tmp_path):
 # модели (findings: []) draft() по-прежнему пишет ровно аудиторский артефакт,
 # а не «находку». Реальный вызов API подменяется мок-клиентом.
 
-class _MockMessages:
+class _MockResponses:
     def __init__(self, findings_payload):
         self._payload = findings_payload
 
     def create(self, **kwargs):
         text = json.dumps({"findings": self._payload}, ensure_ascii=False)
-        return types.SimpleNamespace(content=[types.SimpleNamespace(type="text", text=text)])
+        return types.SimpleNamespace(output_text=text)
 
 
 class _MockClient:
     def __init__(self, findings_payload):
-        self.messages = _MockMessages(findings_payload)
+        self.responses = _MockResponses(findings_payload)
 
 
 def test_draft_writes_single_audit_artifact_not_a_finding(tmp_path):
