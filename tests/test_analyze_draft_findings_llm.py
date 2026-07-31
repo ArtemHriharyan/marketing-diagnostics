@@ -173,6 +173,29 @@ def test_call_llm_fails_clearly_without_openai_api_key(monkeypatch):
         draft_findings._call_llm("системный промт", {"metrics": {}})
 
 
+def test_call_llm_creates_client_with_proxyapi_base_url(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _MockOpenAI:
+        def __init__(self, *, base_url, timeout, max_retries, **_private):
+            captured.update(
+                base_url=base_url,
+                timeout=timeout,
+                max_retries=max_retries,
+            )
+            self.responses = _MockResponses([])
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_MockOpenAI))
+
+    assert draft_findings._call_llm("системный промт", {"metrics": {}}) == {"findings": []}
+    assert captured == {
+        "base_url": draft_findings.PROXYAPI_OPENAI_BASE_URL,
+        "timeout": draft_findings.LLM_TIMEOUT_SECONDS,
+        "max_retries": draft_findings.LLM_MAX_RETRIES,
+    }
+
+
 # ── 2. _resolve_llm_model: project env, не client env ──────────────────────
 
 def test_resolve_llm_model_defaults_without_env(monkeypatch):

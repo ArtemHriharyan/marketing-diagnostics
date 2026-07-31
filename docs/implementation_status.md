@@ -3390,3 +3390,4 @@ Blocker: нет для завершённой части (Части 1-2 чер�
 согласию аналитика в ходе задачи, не самовольное расширение скоупа).
 
 **MIGRATE-analyze-openai** DONE — 2026-07-30. Слой analyze переведён с Anthropic на OpenAI Responses API: `openai`, `client.responses.create`, `OPENAI_API_KEY` только из project environment, `gpt-5.6-terra` по умолчанию; strict JSON Schema, rejected-артефакты и ручной report gate сохранены. Целевые тесты проходят без реального API.
+**PROXYAPI-analyze** DONE — 2026-07-31. Клиент OpenAI в analyze использует ProxyAPI; ключ читается только из OPENAI_API_KEY, выбор модели и Responses API не менялись.

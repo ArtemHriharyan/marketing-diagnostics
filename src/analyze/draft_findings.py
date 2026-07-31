@@ -261,6 +261,7 @@ def build_system_prompt(defaults: dict[str, Any] | None = None) -> str:
 # clients/<name>/.env — см. докстринг модуля.
 LLM_MODEL_ENV_VAR = "ANALYZE_LLM_MODEL"
 DEFAULT_LLM_MODEL = "gpt-5.6-terra"
+PROXYAPI_OPENAI_BASE_URL = "https://api.proxyapi.ru/openai/v1"
 LLM_MAX_TOKENS = 8000          # предсказуемый бюджет одного структурированного вызова
 LLM_TIMEOUT_SECONDS = 180.0
 LLM_MAX_RETRIES = 2            # ретраи транспортного уровня SDK (сеть/429/5xx)
@@ -348,6 +349,7 @@ def _call_llm(
 
         client = OpenAI(
             api_key=api_key,
+            base_url=PROXYAPI_OPENAI_BASE_URL,
             timeout=LLM_TIMEOUT_SECONDS,
             max_retries=LLM_MAX_RETRIES,
         )
