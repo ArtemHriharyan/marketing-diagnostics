@@ -156,6 +156,57 @@ def test_type_downgrade_skipped_when_condition_false():
     assert result["type_effective"] == "A"
 
 
+def test_d11_permanent_degradation_with_full_sources_and_positive_flags():
+    """D11 остаётся permanent_LOW даже при полном API-покрытии и true-флагах."""
+    methodology = {
+        "checks": [
+            {
+                "id": "D11",
+                "requires": ["visits"],
+                "type_default": "A+B",
+                "type_downgrade_if": None,
+                "type_downgraded": "permanent_LOW",
+            }
+        ]
+    }
+    manifest = {
+        "sources": {
+            "metrika_logs": {
+                "canonical_tables": ["visits"],
+                "bot_detection_available": True,
+            }
+        },
+        "flags": {"bot_detection_available": True},
+    }
+
+    result = build_degradation_report(methodology, manifest=manifest)["checks"][0]
+
+    assert result["runnable"] is True
+    assert result["type_effective"] == "permanent_LOW"
+    assert result["confidence_cap"] == "LOW"
+
+
+def test_d11_permanent_degradation_with_missing_sources_and_flags():
+    """D11 сохраняет постоянный тип и cap при пустом manifest и без visits."""
+    methodology = {
+        "checks": [
+            {
+                "id": "D11",
+                "requires": ["visits"],
+                "type_default": "A+B",
+                "type_downgrade_if": None,
+                "type_downgraded": "permanent_LOW",
+            }
+        ]
+    }
+
+    result = build_degradation_report(methodology, manifest=None)["checks"][0]
+
+    assert result["runnable"] is False
+    assert result["type_effective"] == "permanent_LOW"
+    assert result["confidence_cap"] == "LOW"
+
+
 # ── 3. Один manual-источник в requires -> MED ────────────────────────────────
 
 def test_one_manual_required_caps_confidence_at_med():

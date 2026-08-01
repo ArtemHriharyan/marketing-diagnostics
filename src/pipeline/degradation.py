@@ -18,9 +18,9 @@
       "check_id": "...",
       "runnable": bool,
       "requires": ["...", ...],
-      "type_effective": "A"|"B"|"Q"|"A+B"|"A+Q",  # после downgrade-правил
+      "type_effective": "A"|"B"|"Q"|"A+B"|"A+Q"|"permanent_LOW",
       "source_modes": {"<requires-таблица>": "api"|"manual", ...},
-      "confidence_cap": "HIGH" | "MED",     # MED, если хоть одно requires manual
+      "confidence_cap": "HIGH" | "MED" | "LOW",
       "reason_if_not_runnable": "..." | None
     }
 
@@ -180,6 +180,8 @@ def evaluate_check(
     "MED", если ХОТЯ БЫ одно из requires закрыто источником mode=manual, иначе
     "HIGH". ``type_effective`` = ``type_downgraded`` при истинном
     ``type_downgrade_if`` (условие читает флаги манифеста), иначе ``type_default``.
+    Особое значение ``type_downgraded=permanent_LOW`` действует безусловно и
+    навсегда ограничивает ``confidence_cap`` уровнем LOW.
     """
     required = list(check.get("requires") or [])
     missing = [t for t in required if t not in available]
@@ -193,9 +195,12 @@ def evaluate_check(
     if any(mode == "manual" for mode in modes.values()):
         confidence_cap = min_confidence(confidence_cap, manual_cap)
 
-    # Эффективный тип с учётом пост-хок понижения по флагам манифеста.
+    # Эффективный тип с учётом постоянного ограничения и пост-хок понижения.
     type_effective = check.get("type_default", "A")
-    if _eval_downgrade(check.get("type_downgrade_if"), flags or {}):
+    if check.get("type_downgraded") == "permanent_LOW":
+        type_effective = "permanent_LOW"
+        confidence_cap = min_confidence(confidence_cap, "LOW")
+    elif _eval_downgrade(check.get("type_downgrade_if"), flags or {}):
         type_effective = check.get("type_downgraded") or type_effective
         # Опциональный доп. потолок confidence_cap для тех проверок, у которых
         # понижение типа означает потерю автоматической проверяемости (не все
