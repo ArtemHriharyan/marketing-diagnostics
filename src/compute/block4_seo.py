@@ -462,6 +462,130 @@ def _sample_confidence(sample_size: int, min_sample_visits: int) -> str:
     return "HIGH" if sample_size >= min_sample_visits else "MED"
 
 
+_SEO_ALWAYS_CANDIDATE_FINDINGS: frozenset[str] = frozenset({
+    "position_4_10_opportunity",
+    "strike_zone_11_20",
+    "monthly_shows_anomaly",
+    "commercial_demand_without_landing_page",
+    "query_page_overlap_overall",
+    "query_page_overlap_by_device",
+    "wrong_page_ranking_candidate",
+    "robots_blocks_important_page",
+    "canonical_points_elsewhere",
+    "traffic_page_missing_from_sitemap",
+    "sitemap_contains_broken_url",
+    "organic_traffic_to_broken_page",
+    "duplicate_cluster",
+    "missing_metadata",
+    "duplicate_title",
+    "orphan_page",
+    "low_inlink_page",
+    "page_too_deep",
+    "geo_demand_without_landing_page",
+})
+
+
+def _seo_candidate(row: dict[str, Any]) -> bool:
+    """Определить S-кандидата только по уже рассчитанным сигналам строки."""
+    finding = row.get("finding")
+    if finding in _SEO_ALWAYS_CANDIDATE_FINDINGS:
+        return True
+    if finding == "seasonality_reconciliation":
+        return row.get("verdict") in {
+            "seasonality_explains_anomaly",
+            "anomaly_not_fully_explained_by_seasonality",
+            "no_wordstat_data_for_anomaly_months",
+        }
+    if finding in {"field_cwv", "manual_lab_cwv"}:
+        return bool(row.get("any_metric_poor")) or any(
+            row.get(key) == "poor" for key in row if key.endswith("_rating")
+        )
+    return any(bool(row.get(key)) for key in (
+        "organic_demand_mix_brand_heavy",
+        "ctr_anomalously_low",
+        "intent_mismatch_candidate",
+        "excessive_redirect_chain",
+        "mobile_engagement_significantly_worse",
+        "cross_system_divergent",
+        "no_conversion_path",
+        "organic_significantly_worse",
+        "losing_visibility_candidate",
+        "snippet_gap_candidate",
+        "js_rendering_gap_candidate",
+    ))
+
+
+def _annotate_seo_rows(artifact: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Добавить единый candidate-контракт, сохранив смешанные S-артефакты."""
+    annotated: list[dict[str, Any]] = []
+    for index, source_row in enumerate(rows):
+        row = dict(source_row)
+        check_id = str(row.get("check_id") or artifact.upper())
+        finding = str(row.get("finding") or "")
+        candidate = _seo_candidate(row)
+
+        if (
+            row.get("status") in {"unavailable", "manual_required"}
+            or finding == "cwv_unavailable"
+            or (
+                finding == "seasonality_reconciliation"
+                and row.get("verdict") == "cannot_determine_without_wordstat"
+            )
+        ):
+            role = "limitation"
+            reason = f"{check_id.lower()}_source_unavailable"
+        elif candidate:
+            role = "candidate"
+            reason = f"{check_id.lower()}_{finding or 'signal'}"
+        elif finding == "summary":
+            role = "summary"
+            reason = f"{check_id.lower()}_summary"
+        elif finding in {
+            "by_source",
+            "monthly_shows_trend",
+            "mobile_seo_context",
+            "mobile_vs_desktop_organic_engagement",
+            "seasonality_reconciliation",
+        }:
+            role = "context"
+            reason = f"{check_id.lower()}_context"
+        else:
+            role = "detail"
+            reason = f"{check_id.lower()}_detail"
+
+        row.update({
+            "row_ref": f"{artifact}:{index}",
+            "candidate": candidate,
+            "row_role": role,
+            "candidate_reason": reason,
+            "context_refs": [],
+        })
+        annotated.append(row)
+
+    context_refs: dict[str, list[str]] = {}
+    for row in annotated:
+        if row["row_role"] in {"summary", "baseline", "context"}:
+            context_refs.setdefault(str(row["check_id"]), []).append(row["row_ref"])
+    for row in annotated:
+        if row["candidate"]:
+            row["context_refs"] = list(context_refs.get(str(row["check_id"]), []))
+    return annotated
+
+
+def _annotate_written_artifacts(metrics_dir: Path, artifacts: list[str]) -> None:
+    """Перезаписать только артефакты текущего запуска с S-разметкой."""
+    for artifact in artifacts:
+        path = metrics_dir / f"{artifact}.json"
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if isinstance(rows, list):
+            common.write_metric_artifact(
+                metrics_dir, artifact, _annotate_seo_rows(artifact, rows)
+            )
+
+
 def _write_unavailable(metrics_dir: Path, check_id: str, reason: str) -> None:
     """Явная запись «проверка недоступна» вместо молчаливого пропуска."""
     common.write_metric_artifact(
@@ -3316,4 +3440,5 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         _run_s27(paths, canonical, caps.get("S27", "HIGH"), metrics_dir)
         artifacts.append("s27")
 
+    _annotate_written_artifacts(metrics_dir, artifacts)
     return artifacts

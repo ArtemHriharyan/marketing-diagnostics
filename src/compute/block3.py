@@ -272,6 +272,103 @@ def _sample_confidence(sample_size: int, min_sample_visits: int) -> str:
     return "HIGH" if sample_size >= min_sample_visits else "MED"
 
 
+def _cro_candidate(row: dict[str, Any]) -> bool:
+    """Определить C-кандидата только по уже рассчитанным сигналам строки."""
+    finding = row.get("finding")
+    if finding in {"manual_pattern", "manual_conclusion"}:
+        return True
+    if finding in {"field_cwv", "manual_lab_cwv", "manual_lab_cwv_by_url"}:
+        return bool(row.get("any_metric_poor")) or any(
+            row.get(key) == "poor" for key in row if key.endswith("_rating")
+        )
+
+    check_id = row.get("check_id")
+    predicates = {
+        "C02": bool(row.get("template_significantly_slower")),
+        "C04": bool(row.get("broken_landing")),
+        "C05": bool(row.get("excessive_redirect_chain")),
+        "C06": bool(row.get("first_without_last_visits", 0)),
+        "C09": bool(row.get("device_underperforms_desktop")),
+        "C10": bool(
+            row.get("repeat_submit_visits", 0)
+            and not row.get("confounded_by_goal_overtrigger")
+        ),
+        "C12": bool(row.get("unclear_first_screen_candidate")),
+        "C13": row.get("price_shown_before_submit") is False,
+        "C21": bool(row.get("segment_underperforms_baseline")),
+    }
+    return predicates.get(str(check_id), False)
+
+
+def _annotate_cro_rows(artifact: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Добавить единый candidate-контракт, не изменяя расчётные поля."""
+    annotated: list[dict[str, Any]] = []
+    for index, source_row in enumerate(rows):
+        row = dict(source_row)
+        check_id = str(row.get("check_id") or artifact.upper())
+        finding = str(row.get("finding") or "")
+        candidate = _cro_candidate(row)
+
+        if row.get("status") in {"unavailable", "manual_required"}:
+            role = "limitation"
+            reason = f"{check_id.lower()}_source_unavailable"
+        elif candidate:
+            role = "candidate"
+            reason = f"{check_id.lower()}_{finding or 'signal'}"
+        elif row.get("is_baseline") is True or (
+            check_id == "C09" and row.get("device") == "desktop"
+        ):
+            role = "baseline"
+            reason = f"{check_id.lower()}_baseline"
+        elif finding == "funnel_summary":
+            role = "summary"
+            reason = f"{check_id.lower()}_summary"
+        elif finding in {
+            "mobile_visit_context",
+            "form_abandonment_context",
+            "repeat_submit_signal",
+            "client_fact_price_disclosure",
+            "client_fact_deposit",
+        }:
+            role = "context"
+            reason = f"{check_id.lower()}_context"
+        else:
+            role = "detail"
+            reason = f"{check_id.lower()}_detail"
+
+        row.update({
+            "row_ref": f"{artifact}:{index}",
+            "candidate": candidate,
+            "row_role": role,
+            "candidate_reason": reason,
+            "context_refs": [],
+        })
+        annotated.append(row)
+
+    context_refs: dict[str, list[str]] = {}
+    for row in annotated:
+        if row["row_role"] in {"summary", "baseline", "context"}:
+            context_refs.setdefault(str(row["check_id"]), []).append(row["row_ref"])
+    for row in annotated:
+        if row["candidate"]:
+            row["context_refs"] = list(context_refs.get(str(row["check_id"]), []))
+    return annotated
+
+
+def _annotate_written_artifacts(metrics_dir: Path, artifacts: list[str]) -> None:
+    """Перезаписать только артефакты текущего запуска с C-разметкой."""
+    for artifact in artifacts:
+        path = metrics_dir / f"{artifact}.json"
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if isinstance(rows, list):
+            common.write_metric_artifact(
+                metrics_dir, artifact, _annotate_cro_rows(artifact, rows)
+            )
+
+
 def _write_unavailable(metrics_dir: Path, check_id: str, reason: str) -> None:
     """Явная запись «проверка недоступна» вместо молчаливого пропуска."""
     common.write_metric_artifact(
@@ -1381,4 +1478,5 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         )
         artifacts.append("c25")
 
+    _annotate_written_artifacts(metrics_dir, artifacts)
     return artifacts

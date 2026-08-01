@@ -27,7 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 import pandas as pd
 import yaml
 
-from src.compute import block4_seo  # noqa: E402
+from src.compute import block4_seo, candidates  # noqa: E402
 from src.compute import common as compute_common  # noqa: E402
 
 
@@ -270,15 +270,12 @@ def test_s04_all_unknown_or_null_devices_requires_manual_check(tmp_path):
 
     block4_seo.run(paths, DEFAULTS, {"S04"})
 
-    assert _read_metric(paths, "s04") == [{
-        "check_id": "S04",
-        "status": "manual_required",
-        "reason": (
-            "S04 требует известного device: seo_queries.device не заполнен "
-            "или содержит только unknown"
-        ),
-        "confidence": "MED",
-    }]
+    row = _read_metric(paths, "s04")[0]
+    assert row["check_id"] == "S04"
+    assert row["status"] == "manual_required"
+    assert row["confidence"] == "MED"
+    assert row["row_role"] == "limitation"
+    assert row["candidate"] is False
 
 
 def test_s04_without_device_column_requires_manual_check(tmp_path):
@@ -311,11 +308,10 @@ def test_s05_is_unavailable_without_query_cluster(tmp_path):
 
     assert "s05" in artifacts
     rows = _read_metric(paths, "s05")
-    assert rows == [{
-        "check_id": "S05",
-        "status": "unavailable",
-        "reason": "кластер запросов для сравнения страниц не представлен в canonical seo_queries",
-    }]
+    assert rows[0]["check_id"] == "S05"
+    assert rows[0]["status"] == "unavailable"
+    assert rows[0]["row_role"] == "limitation"
+    assert rows[0]["candidate"] is False
 
 
 # ── S06 — сезонность vs SEO (легаси 5.5) ────────────────────────────────────
@@ -349,6 +345,9 @@ def test_s06_confidence_rises_to_med_when_seasonality_confirmed(tmp_path):
             ("2026-01", 100, 5.0), ("2026-02", 100, 5.0),
             ("2026-03", 100, 5.0), ("2026-04", 300, 4.0),
         ]
+    ] + [
+        _base_seo_row(query="q", page="/p", source="webmaster", month="2026-04",
+                      total_shows=100, total_clicks=10, avg_show_position=5.0)
     ])
     _write_wordstat(paths, [
         _base_wordstat_row(phrase="q", normalized_phrase="q", month=m, date=f"{m}-01",
@@ -368,6 +367,24 @@ def test_s06_confidence_rises_to_med_when_seasonality_confirmed(tmp_path):
     assert month_entry["seasonality_confirmed"] is True
     assert month_entry["wordstat_direction_matches_shows"] is True
     assert month_entry["position_direction"] == "improved"
+    webmaster = next(r for r in rows if r["finding"] == "webmaster_monthly_dynamics")
+    assert webmaster["row_role"] == "limitation"
+    assert reconciliation["candidate"] is True
+
+    result = candidates.build_analysis_candidates(paths.metrics)
+    assert result["coverage"]["contract_coverage"] == 1.0
+    assert result["coverage"]["missing_context_refs"] == []
+    packed = [dict(zip(result["columns"], values)) for values in result["rows"]]
+    assert any(
+        row["artifact"] == "s06"
+        and row["candidate"]
+        and row.get("finding") == "seasonality_reconciliation"
+        for row in packed
+    )
+    assert any(
+        row["artifact"] == "s06" and row["row_role"] == "limitation"
+        for row in packed
+    )
 
 
 def test_s06_confidence_rises_to_med_when_seasonality_not_confirmed(tmp_path):

@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 import pandas as pd
 import yaml
 
-from src.compute import block3  # noqa: E402
+from src.compute import block3, candidates  # noqa: E402
 
 
 class _Paths:
@@ -162,7 +162,10 @@ def test_c01_neither_source_available_is_unavailable(tmp_path):
 
     assert "c01" in artifacts
     rows = _read_metric(paths, "c01")
-    assert rows == [{"check_id": "C01", "status": "unavailable", "reason": rows[0]["reason"]}]
+    assert rows[0]["check_id"] == "C01"
+    assert rows[0]["status"] == "unavailable"
+    assert rows[0]["row_role"] == "limitation"
+    assert rows[0]["candidate"] is False
 
 
 def test_c01_crux_404_no_field_data_falls_back(tmp_path):
@@ -536,6 +539,29 @@ def test_confidence_cap_from_degradation_report_applied(tmp_path):
     summary = next(r for r in rows if r["finding"] == "funnel_summary")
     # Без capping выборка 600 >= 500 дала бы HIGH — degradation_report прижимает к MED.
     assert summary["confidence"] == "MED"
+
+
+def test_c_candidate_contract_has_full_coverage(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [
+        _base_visit(visit_id=f"v{i}", form_open=True, form_submit=i < 20)
+        for i in range(100)
+    ])
+    _write_visit_goals(paths, [
+        {"visit_id": f"v{i}", "goal_id": goal_id, "achievement_count": 1}
+        for i in range(100) for goal_id in ([1, 2] if i < 20 else [1])
+    ])
+    _write_funnels_config(paths)
+
+    block3.run(paths, DEFAULTS, {"C06"})
+
+    result = candidates.build_analysis_candidates(paths.metrics)
+    coverage = result["coverage"]
+    assert coverage["contract_coverage"] == 1.0
+    assert coverage["missing_context_refs"] == []
+    rows = [dict(zip(result["columns"], values)) for values in result["rows"]]
+    c06 = next(row for row in rows if row["artifact"] == "c06" and row["candidate"])
+    assert c06["candidate_reason"] == "c06_funnel_summary"
 
 
 def _write_client_answers(paths: _Paths, data: dict) -> None:
