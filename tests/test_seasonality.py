@@ -81,9 +81,9 @@ def test_funnel_final_stage_and_crm_series(tmp_path):
         for visit_id in ("v1", "v2", "v3") for goal_id in ("1", "2")
     ])
     _write_table(paths, "crm_records", [
-        {"created_at": "2026-01-12", "revenue": 100.0},
-        {"created_at": "2026-02-12", "revenue": 100.0},
-        {"created_at": "2026-02-13", "revenue": 300.0},
+        {"lead_date": "2026-01-12", "amount_rub": 100.0},
+        {"lead_date": "2026-02-12", "amount_rub": 100.0},
+        {"lead_date": "2026-02-13", "amount_rub": 300.0},
     ])
 
     result = seasonality.compute_seasonality(paths)
@@ -92,8 +92,18 @@ def test_funnel_final_stage_and_crm_series(tmp_path):
     assert funnel["status"] == "ok"
     assert funnel["funnel_id"] == "booking"
     assert funnel["stage"] == "submitted"
-    assert result["series"]["crm_records"]["status"] == "ok"
-    assert result["series"]["crm_revenue"]["status"] == "ok"
+    crm_bookings = result["series"]["crm_records"]
+    crm_revenue = result["series"]["crm_revenue"]
+    assert crm_bookings["status"] == "ok"
+    assert crm_bookings["months"] == [
+        {"month": "2026-01", "index": 66.7},
+        {"month": "2026-02", "index": 133.3, "mom_direction": "up"},
+    ]
+    assert crm_revenue["status"] == "ok"
+    assert crm_revenue["months"] == [
+        {"month": "2026-01", "index": 40.0},
+        {"month": "2026-02", "index": 160.0, "mom_direction": "up"},
+    ]
 
 
 def test_each_missing_source_degrades_independently_and_no_phrases_leak(tmp_path):

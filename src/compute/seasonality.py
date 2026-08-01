@@ -18,8 +18,8 @@ from . import common, funnels
 _PEAK_INDEX = 200.0
 _TROUGH_INDEX = 50.0
 _CRM_TABLE_PRIORITY = ("crm_records", "crm_deals", "crm_bookings", "crm", "bookings", "orders")
-_MONTH_COLUMNS = ("month", "created_at", "created_date", "date", "paid_at", "closed_at")
-_REVENUE_COLUMNS = ("revenue", "revenue_rub", "amount", "paid_amount", "payment_amount")
+_MONTH_COLUMNS = ("lead_date", "month", "created_at", "created_date", "date", "paid_at", "closed_at")
+_REVENUE_COLUMNS = ("amount_rub", "revenue", "revenue_rub", "amount", "paid_amount", "payment_amount")
 
 
 def _quote_identifier(value: str) -> str:
