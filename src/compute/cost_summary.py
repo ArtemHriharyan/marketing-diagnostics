@@ -20,7 +20,7 @@ from .common import write_json_atomic
 
 
 _SUPPORTED_SOURCES = {"canonical_costs", "monthly_fixed"}
-_CONFIG_PATH_ATTRIBUTES = ("config", "config_path", "client_config")
+_CONFIG_PATH_ATTRIBUTES = ("config_file", "config", "config_path", "client_config")
 
 
 def _require_text(component: dict[str, Any], field: str) -> str:

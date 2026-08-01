@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from src.compute.cost_summary import build_cost_summary, run, validate_spend_components
+from src.pipeline.orchestrator import ClientPaths
 
 
 def _config(components: list[dict]) -> dict:
@@ -157,3 +158,33 @@ def test_run_writes_cost_summary_json(tmp_path):
     assert artifacts == ["cost_summary.json"]
     payload = json.loads((metrics / "cost_summary.json").read_text(encoding="utf-8"))
     assert payload["total_rub"] == 20.0
+
+
+def test_run_reads_spend_components_from_client_paths_config_file(tmp_path):
+    paths = ClientPaths("_template")
+    paths.config_file = tmp_path / "config.yaml"
+    paths.canonical = tmp_path / "canonical"
+    paths.metrics = tmp_path / "metrics"
+    paths.config_file.write_text(
+        yaml.safe_dump(
+            _config(
+                [
+                    {
+                        "id": "management",
+                        "channel": "direct",
+                        "kind": "management",
+                        "source": "monthly_fixed",
+                        "amount_rub_month": 10,
+                    }
+                ]
+            ),
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+
+    run(paths, {}, set())
+
+    payload = json.loads((paths.metrics / "cost_summary.json").read_text(encoding="utf-8"))
+    assert payload["total_rub"] == 20.0
+    assert payload["total_rub"] > 0
