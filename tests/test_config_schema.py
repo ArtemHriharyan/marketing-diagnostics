@@ -80,6 +80,16 @@ class TestTemplateConfig:
         crux = self.cfg["sources"]["crux"]
         assert crux.get("api_key_env") == "CRUX_API_KEY"
 
+    def test_funnels_have_stage_and_goal_ids(self):
+        assert isinstance(self.cfg.get("funnels"), dict)
+        assert self.cfg["funnels"]
+        for stages in self.cfg["funnels"].values():
+            assert isinstance(stages, list)
+            assert len(stages) >= 2
+            for stage in stages:
+                assert isinstance(stage.get("stage"), str)
+                assert isinstance(stage.get("goal_ids"), list)
+
 
 # ── _template/inputs/client_answers.yaml ─────────────────────────────────────
 

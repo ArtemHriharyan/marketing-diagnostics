@@ -232,7 +232,7 @@ def write_metric_artifact(
 # S-проверки не считались ни в одном реальном прогоне. block5/block6 пока
 # остаются NotImplementedError-заглушками (вне скоупа этого фикса).
 BLOCK_MODULE_NAMES: tuple[str, ...] = (
-    "block0", "block1", "block2", "block3", "block4_seo", "block5", "block6",
+    "block0", "block1", "block2", "funnels", "block3", "block4_seo", "block5", "block6",
     "money_frame",
 )
 

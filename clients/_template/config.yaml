@@ -73,6 +73,13 @@ goals:                # маппинг id целей Метрики на сущ�
   call_click_goal_ids: []
   messenger_goal_ids: []
 
+funnels:              # последовательности этапов; несколько ID могут обозначать один этап
+  booking:
+    - stage: form_open
+      goal_ids: []
+    - stage: form_submit
+      goal_ids: []
+
 costs_manual:         # для клиентов без Директа или с ручными фиксами расходов
   agency_fee_rub_month: 0     # ведение контекста, руб/мес
   seo_fee_rub_month: 0        # ведение SEO, руб/мес

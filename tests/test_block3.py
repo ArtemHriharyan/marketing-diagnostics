@@ -51,6 +51,22 @@ def _write_visits(paths: _Paths, rows: list[dict]) -> None:
     pd.DataFrame(rows).to_parquet(paths.canonical / "visits.parquet")
 
 
+def _write_visit_goals(paths: _Paths, rows: list[dict]) -> None:
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(paths.canonical / "visit_goals.parquet")
+
+
+def _write_funnels_config(paths: _Paths) -> None:
+    paths.config_file.write_text(yaml.safe_dump({
+        "funnels": {
+            "booking": [
+                {"stage": "open", "goal_ids": [1]},
+                {"stage": "submit", "goal_ids": [2]},
+            ]
+        }
+    }), encoding="utf-8")
+
+
 def _write_site_pages(paths: _Paths, rows: list[dict]) -> None:
     paths.canonical.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_parquet(paths.canonical / "site_pages.parquet")
@@ -346,35 +362,45 @@ def test_c05_flags_excessive_redirect_chain(tmp_path):
 # ── C06 — воронка open->submit по сегментам ─────────────────────────────────
 def test_c06_funnel_summary_and_segments(tmp_path):
     paths = _Paths(tmp_path)
-    visits = (
-        [_base_visit(device="desktop", source_group="ad", form_open=True, form_submit=True) for _ in range(300)]
-        + [_base_visit(device="desktop", source_group="ad", form_open=True, form_submit=False) for _ in range(100)]
-        + [_base_visit(device="mobile", source_group="organic", form_open=True, form_submit=True) for _ in range(50)]
-        + [_base_visit(device="mobile", source_group="organic", form_open=True, form_submit=False) for _ in range(150)]
-        + [_base_visit(device="desktop", source_group="ad", form_open=False)]
-    )
+    visits = []
+    visit_goals = []
+    for index in range(601):
+        is_desktop = index < 400
+        submits = index < 300 or 400 <= index < 450
+        visit_id = f"v{index}"
+        visits.append(_base_visit(
+            visit_id=visit_id,
+            date="2026-01-01",
+            device="desktop" if is_desktop else "mobile",
+            source_group="ad" if is_desktop else "organic",
+        ))
+        if index < 600:
+            visit_goals.append({"visit_id": visit_id, "goal_id": 1, "achievement_count": 1})
+        if submits:
+            visit_goals.append({"visit_id": visit_id, "goal_id": 2, "achievement_count": 1})
     _write_visits(paths, visits)
+    _write_visit_goals(paths, visit_goals)
+    _write_funnels_config(paths)
 
     artifacts = block3.run(paths, DEFAULTS, {"C06"})
 
     assert "c06" in artifacts
     rows = _read_metric(paths, "c06")
     summary = next(r for r in rows if r["finding"] == "funnel_summary")
-    assert summary["form_open_visits"] == 600
-    assert summary["form_submit_visits"] == 350
-    assert summary["stage_start_available"] is False
+    assert summary["first_stage_visits"] == 600
+    assert summary["last_stage_visits"] == 350
     assert summary["confidence"] == "HIGH"  # 600 >= min_sample_visits=500
 
     device_segments = [r for r in rows if r["finding"] == "funnel_by_segment" and r["segment_dimension"] == "device"]
     desktop_seg = next(r for r in device_segments if r["segment_value"] == "desktop")
     mobile_seg = next(r for r in device_segments if r["segment_value"] == "mobile")
-    assert desktop_seg["form_open_visits"] == 400
-    assert desktop_seg["open_to_submit_rate"] == 0.75
-    assert mobile_seg["form_open_visits"] == 200
-    assert mobile_seg["open_to_submit_rate"] == 0.25
+    assert desktop_seg["first_stage_visits"] == 400
+    assert desktop_seg["first_to_last_rate"] == 0.75
+    assert mobile_seg["first_stage_visits"] == 200
+    assert mobile_seg["first_to_last_rate"] == 0.25
     assert mobile_seg["confidence"] == "MED"  # 200 < min_sample_visits=500
 
-    source_segments = [r for r in rows if r["finding"] == "funnel_by_segment" and r["segment_dimension"] == "source_group"]
+    source_segments = [r for r in rows if r["finding"] == "funnel_by_segment" and r["segment_dimension"] == "channel"]
     assert {r["segment_value"] for r in source_segments} == {"ad", "organic"}
 
 
@@ -496,7 +522,12 @@ def test_c12_flags_unclear_first_screen_candidate(tmp_path):
 # ── Диспетчер: confidence_cap из degradation_report ──────────────────────────
 def test_confidence_cap_from_degradation_report_applied(tmp_path):
     paths = _Paths(tmp_path)
-    _write_visits(paths, [_base_visit(form_open=True, form_submit=True) for _ in range(600)])
+    _write_visits(paths, [_base_visit(visit_id=f"v{i}") for i in range(600)])
+    _write_visit_goals(paths, [
+        {"visit_id": f"v{i}", "goal_id": goal_id, "achievement_count": 1}
+        for i in range(600) for goal_id in (1, 2)
+    ])
+    _write_funnels_config(paths)
     _write_degradation(paths, [{"check_id": "C06", "confidence_cap": "MED"}])
 
     block3.run(paths, DEFAULTS, {"C06"})

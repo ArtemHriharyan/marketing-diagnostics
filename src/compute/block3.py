@@ -110,12 +110,9 @@ docstring block1.py — один источник правды на одну ц�
    обогащение (inputs/webvisor_findings.yaml, inputs/manual_form_tests.yaml),
    без гейта на ручной источник.
 
-5. Каталог описывает C06 как воронку "open -> start -> submit". Промежуточный
-   признак "начал заполнять форму" НЕ существует в goal_flags()/config.goals
-   (src/transform/build_canonical.py: только form_open/form_submit/call_click/
-   messenger_click) — extract/transform вне allowed_files этой задачи. Считается
-   двухступенчатая воронка open->submit (соответствует легаси 1.1 в точности),
-   что явно помечено полем stage_start_available=false в артефакте.
+5. C06 использует пользовательские последовательности из config.funnels и
+   visit_goals.parquet. Несколько ID могут обозначать один этап; фиксированной
+   пары form_open/form_submit и обязательного промежуточного этапа в коде нет.
 
 6. C05: site_pages не хранит per-редиректный query string, только конечный
    final_url — сохранность UTM-параметров через цепочку редиректов проверить
@@ -199,7 +196,7 @@ from urllib.parse import urlsplit
 import pyarrow.parquet as pq
 from scipy import stats
 
-from . import common
+from . import common, funnels
 from ..pipeline import degradation as degradation_mod
 
 # ── Официальные пороги Google Core Web Vitals (web.dev/vitals) — общеизвестный
@@ -719,69 +716,59 @@ def _run_c05(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
     common.write_metric_artifact(metrics_dir, "c05", rows, confidence_cap=confidence_cap)
 
 
-# ── C06 — большой отвал между открытием и отправкой формы (легаси 1.1) ─────
-_C06_SEGMENT_DIMENSIONS: tuple[str, ...] = ("device", "source_group")
-
-
 def _run_c06(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_dir: Path) -> None:
     min_sample = int(defaults.get("min_sample_visits", 500))
 
-    con = common.open_duckdb(paths)
-    try:
-        total_open, total_submit = con.execute(
-            "SELECT COUNT(*) FILTER (WHERE form_open), "
-            "COUNT(*) FILTER (WHERE form_open AND form_submit) FROM visits"
-        ).fetchone()
-        segment_data = {
-            dim: con.execute(
-                f'SELECT "{dim}", COUNT(*) FILTER (WHERE form_open), '
-                f'COUNT(*) FILTER (WHERE form_open AND form_submit) '
-                f'FROM visits GROUP BY "{dim}"'
-            ).fetchall()
-            for dim in _C06_SEGMENT_DIMENSIONS
-        }
-    finally:
-        con.close()
+    funnel_metrics = funnels.compute_funnels(paths)
+    if funnel_metrics["status"] != "ok":
+        common.write_metric_artifact(metrics_dir, "c06", [{
+            "check_id": "C06",
+            "status": "unavailable",
+            "reason": funnel_metrics["reason"],
+        }], confidence_cap=confidence_cap)
+        return
 
-    total_open = int(total_open or 0)
-    total_submit = int(total_submit or 0)
-    completion_rate = (total_submit / total_open) if total_open else None
-
-    rows: list[dict[str, Any]] = [{
-        "check_id": "C06",
-        "finding": "funnel_summary",
-        "form_open_visits": total_open,
-        "form_submit_visits": total_submit,
-        "open_to_submit_rate": round(completion_rate, 4) if completion_rate is not None else None,
-        "stage_start_available": False,
-        "limitation": (
-            "Каталог описывает воронку open->start->submit; промежуточный признак "
-            "'начал заполнять форму' отсутствует в goal_flags()/config.goals "
-            "(src/transform/build_canonical.py) — структурное ограничение вне "
-            "allowed_files этой задачи. Считается двухступенчатая воронка "
-            "open->submit (соответствует легаси 1.1)."
-        ),
-        "confidence": _cap(
-            _sample_confidence(total_open, min_sample) if total_open > 0 else "LOW",
-            confidence_cap,
-        ),
-    }]
-
-    for dim, seg_rows in segment_data.items():
-        for seg_value, seg_open, seg_submit in seg_rows:
-            seg_open = int(seg_open or 0)
-            seg_submit = int(seg_submit or 0)
-            seg_rate = (seg_submit / seg_open) if seg_open else None
+    rows: list[dict[str, Any]] = []
+    for funnel in funnel_metrics["funnels"]:
+        first_to_last = funnel["first_to_last"]
+        first_visits = funnel["stages"][0]["visits"]
+        rows.append({
+            "check_id": "C06",
+            "finding": "funnel_summary",
+            "funnel_id": funnel["funnel_id"],
+            "first_stage": first_to_last["from_stage"],
+            "last_stage": first_to_last["to_stage"],
+            "first_stage_visits": first_visits,
+            "last_stage_visits": funnel["stages"][-1]["visits"],
+            "completed_visits": first_to_last["completed_visits"],
+            "first_to_last_rate": first_to_last["conversion_rate"],
+            "first_without_last_visits": first_to_last["first_without_last_visits"],
+            "later_without_first_visits": first_to_last["later_without_first_visits"],
+            "confidence": _cap(
+                _sample_confidence(first_visits, min_sample) if first_visits else "LOW",
+                confidence_cap,
+            ),
+        })
+        for segment in funnel["segments"]:
+            segment_first_to_last = segment["first_to_last"]
+            segment_first_visits = segment["stages"][0]["visits"]
             rows.append({
                 "check_id": "C06",
                 "finding": "funnel_by_segment",
-                "segment_dimension": dim,
-                "segment_value": seg_value,
-                "form_open_visits": seg_open,
-                "form_submit_visits": seg_submit,
-                "open_to_submit_rate": round(seg_rate, 4) if seg_rate is not None else None,
+                "funnel_id": funnel["funnel_id"],
+                "segment_dimension": segment["dimension"],
+                "segment_value": segment["value"],
+                "first_stage": segment_first_to_last["from_stage"],
+                "last_stage": segment_first_to_last["to_stage"],
+                "first_stage_visits": segment_first_visits,
+                "last_stage_visits": segment["stages"][-1]["visits"],
+                "completed_visits": segment_first_to_last["completed_visits"],
+                "first_to_last_rate": segment_first_to_last["conversion_rate"],
+                "first_without_last_visits": segment_first_to_last["first_without_last_visits"],
+                "later_without_first_visits": segment_first_to_last["later_without_first_visits"],
                 "confidence": _cap(
-                    _sample_confidence(seg_open, min_sample) if seg_open > 0 else "LOW",
+                    _sample_confidence(segment_first_visits, min_sample)
+                    if segment_first_visits else "LOW",
                     confidence_cap,
                 ),
             })
