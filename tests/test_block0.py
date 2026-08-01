@@ -22,6 +22,7 @@ import pyarrow.parquet as pq
 import yaml
 
 from src.compute import block0  # noqa: E402
+from src.compute.candidates import build_analysis_candidates  # noqa: E402
 from src.transform import build_canonical as bc  # noqa: E402
 
 
@@ -136,7 +137,13 @@ def _base_visit(**overrides) -> dict:
 
 def _read_metric(paths: _Paths, name: str) -> list[dict]:
     with (paths.metrics / f"{name}.json").open("r", encoding="utf-8") as fh:
-        return json.load(fh)
+        rows = json.load(fh)
+    for row in rows:
+        assert row["candidate"] is (row["row_role"] == "candidate")
+        assert row["candidate_reason"]
+        assert isinstance(row["context_refs"], list)
+        assert row["row_ref"].startswith(f"{name}:")
+    return rows
 
 
 # ── D01 — переотработка ключевой цели ───────────────────────────────────────
@@ -661,6 +668,8 @@ def test_d08_missing_campaign_status_writes_unavailable(tmp_path):
     assert artifacts == ["d08"]
     assert _read_metric(paths, "d08") == [{
         "check_id": "D08", "status": "unavailable", "reason": "нет источника: статусы кампаний Директа",
+        "row_ref": "d08:0", "candidate": False, "row_role": "limitation",
+        "candidate_reason": "d08_unavailable", "context_refs": [],
     }]
 
 
@@ -1098,7 +1107,24 @@ def test_d12_accepts_correct_one_to_one_join(tmp_path):
     paths = _Paths(tmp_path)
     rows = _run_d12(paths, [_join_record()])
     assert rows == [{"check_id": "D12", "join_id": "test_join", "status": "pass",
-                     "violations": [], "has_problem": False, "confidence": "HIGH"}]
+                     "violations": [], "has_problem": False, "confidence": "HIGH",
+                     "row_ref": "d12:0", "candidate": False, "row_role": "baseline",
+                     "candidate_reason": "d12_pass", "context_refs": []}]
+
+
+def test_d_candidate_contract_coverage_is_complete(tmp_path):
+    metrics_dir = tmp_path / "metrics"
+    block0._write_metric_artifact(metrics_dir, "d11", [
+        {"check_id": "D11", "finding": "high_frequency_client_id", "confidence": "LOW"},
+        {"check_id": "D11", "finding": "summary", "is_robot_available": False,
+         "test_marker_visit_count": 0, "confidence": "LOW"},
+    ], confidence_cap="LOW")
+
+    result = build_analysis_candidates(metrics_dir)
+
+    assert result["coverage"]["contract_coverage"] == 1.0
+    assert result["coverage"]["candidate_rows_declared"] == 1
+    assert result["coverage"]["context_refs_resolved"] == 1
 
 
 def test_d12_detects_fan_out(tmp_path):

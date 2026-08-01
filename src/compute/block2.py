@@ -131,6 +131,99 @@ _T09_CHANGE_LOG_CORRELATION_DAYS = 3
 # (единичный "тихий" визит — нормальное поведение, не спам).
 _T10_MIN_VISITS_FOR_SPAM_CANDIDATE = 5
 
+_T_CANDIDATE_FLAGS: tuple[str, ...] = (
+    "likely_untagged_external_traffic",
+    "demand_mix_brand_heavy",
+    "coverage_gap",
+)
+_T_CANDIDATE_FINDINGS: frozenset[str] = frozenset({"non_standardized_utm_source"})
+_T_LIMITATION_FINDINGS: frozenset[str] = frozenset({"cookie_visitor_segments"})
+_T_SUMMARY_FINDINGS: frozenset[str] = frozenset({
+    "utm_tagging_summary", "summary", "seo_brand_mix", "paid_brand_mix",
+    "offline_channel_coverage",
+})
+
+
+def _analysis_signal(row: dict[str, Any]) -> str | None:
+    """Вернуть стабильный код уже рассчитанного проблемного сигнала строки."""
+    for field in _T_CANDIDATE_FLAGS:
+        if row.get(field) is True:
+            return field
+    finding = row.get("finding")
+    if finding in _T_CANDIDATE_FINDINGS:
+        return str(finding)
+    if row.get("check_id") == "T02":
+        if finding == "summary" and int(row.get("mismatch_count") or 0) > 0:
+            return "attribution_mismatch"
+        if finding == "confusion_matrix":
+            return "attribution_confusion"
+        if finding == "channel_naive_vs_corrected" and int(row.get("delta") or 0) != 0:
+            return "channel_attribution_delta"
+    return None
+
+
+def _analysis_role(row: dict[str, Any], signal: str | None) -> str:
+    if signal is not None:
+        return "candidate"
+    finding = row.get("finding")
+    status = row.get("status")
+    if (
+        status in {"unavailable", "unavailable_for_cause"}
+        or finding in _T_LIMITATION_FINDINGS
+        or (row.get("check_id") == "T06" and bool(row.get("directories_not_answered")))
+    ):
+        return "limitation"
+    if finding in _T_SUMMARY_FINDINGS:
+        return "summary"
+    if finding == "channel_anomaly_context":
+        return "context"
+    return "baseline"
+
+
+def _annotate_analysis_rows(name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Добавить единый аналитический контракт, не меняя значения метрик."""
+    annotated: list[dict[str, Any]] = []
+    for index, source_row in enumerate(rows):
+        row = dict(source_row)
+        check_id = str(row.get("check_id") or name).lower()
+        signal = _analysis_signal(row)
+        role = _analysis_role(row, signal)
+        reason_token = signal or row.get("finding") or row.get("status") or role
+        row.update({
+            "row_ref": f"{name}:{index}",
+            "candidate": signal is not None,
+            "row_role": role,
+            "candidate_reason": f"{check_id}_{reason_token}",
+            "context_refs": [],
+        })
+        annotated.append(row)
+
+    context_row = next(
+        (row for role in ("summary", "limitation", "baseline", "context")
+         for row in annotated if row["row_role"] == role),
+        None,
+    )
+    if context_row is not None:
+        for row in annotated:
+            if row["candidate"] and row["row_ref"] != context_row["row_ref"]:
+                row["context_refs"] = [context_row["row_ref"]]
+    return annotated
+
+
+def _write_metric_artifact(
+    metrics_dir: Path,
+    name: str,
+    rows: list[dict[str, Any]],
+    *,
+    confidence_cap: str | None = None,
+) -> tuple[Path, Path]:
+    return common.write_metric_artifact(
+        metrics_dir,
+        name,
+        _annotate_analysis_rows(name, rows),
+        confidence_cap=confidence_cap,
+    )
+
 
 # ── Общие хелперы (дублируют паттерн block0.py/block1.py — блоки compute не
 # делят приватные хелперы через common.py, см. CLAUDE.md принцип 2) ─────────
@@ -181,7 +274,7 @@ def _sample_confidence(sample_size: int, min_sample_visits: int) -> str:
 
 def _write_unavailable(metrics_dir: Path, check_id: str, reason: str) -> None:
     """Явная запись «проверка недоступна» вместо молчаливого пропуска."""
-    common.write_metric_artifact(
+    _write_metric_artifact(
         metrics_dir,
         check_id.lower(),
         [{"check_id": check_id, "status": "unavailable", "reason": reason}],
@@ -328,7 +421,7 @@ def _run_t01(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "t01", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "t01", rows, confidence_cap=confidence_cap)
 
 
 # ── T02 — наивная модель vs corrected lastsign ───────────────────────────────
@@ -419,7 +512,7 @@ def _run_t02(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "t02", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "t02", rows, confidence_cap=confidence_cap)
 
 
 # ── T03 — self-referral / разрыв сессии (без домена, см. докстринг) ─────────
@@ -548,7 +641,7 @@ def _run_t05(
             "confidence": _cap("LOW", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "t05", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "t05", rows, confidence_cap=confidence_cap)
 
 
 # ── T06 — звонки, карты, мессенджеры и офлайн-обращения невидимы ───────────
@@ -597,7 +690,7 @@ def _run_t06(
         "confidence": _cap("MED", confidence_cap),
     }]
 
-    common.write_metric_artifact(metrics_dir, "t06", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "t06", rows, confidence_cap=confidence_cap)
 
 
 # ── T07 — cookie-визит трактуется как клиент ────────────────────────────────
@@ -658,7 +751,7 @@ def _run_t07(
         ),
     }]
 
-    common.write_metric_artifact(metrics_dir, "t07", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "t07", rows, confidence_cap=confidence_cap)
 
 
 # ── T08 — зависимость от одного канала или одной кампании ──────────────────
@@ -757,7 +850,7 @@ def _run_t09(
     }]
     rows.extend(anomaly_rows)
 
-    common.write_metric_artifact(metrics_dir, "t09", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "t09", rows, confidence_cap=confidence_cap)
 
 
 # ── T10 — реферальный спам, боты или технические домены ────────────────────

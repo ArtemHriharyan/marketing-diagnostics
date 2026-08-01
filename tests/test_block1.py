@@ -24,6 +24,7 @@ import pyarrow.parquet as pq
 import yaml
 
 from src.compute import block1  # noqa: E402
+from src.compute.candidates import build_analysis_candidates  # noqa: E402
 
 
 class _Paths:
@@ -128,7 +129,29 @@ def _base_visit(**overrides) -> dict:
 
 def _read_metric(paths: _Paths, name: str) -> list[dict]:
     with (paths.metrics / f"{name}.json").open("r", encoding="utf-8") as fh:
-        return json.load(fh)
+        rows = json.load(fh)
+    for row in rows:
+        assert row["candidate"] is (row["row_role"] == "candidate")
+        assert row["candidate_reason"]
+        assert isinstance(row["context_refs"], list)
+        assert row["row_ref"].startswith(f"{name}:")
+    return rows
+
+
+def test_a_candidate_contract_coverage_is_complete(tmp_path):
+    metrics_dir = tmp_path / "metrics"
+    block1._write_metric_artifact(metrics_dir, "a24", [
+        {"check_id": "A24", "finding": "manual_verification_required",
+         "reason": "нужна ручная сверка", "confidence": "LOW"},
+        {"check_id": "A24", "finding": "manual_check_candidate",
+         "ad_id": "1", "confidence": "LOW"},
+    ], confidence_cap="LOW")
+
+    result = build_analysis_candidates(metrics_dir)
+
+    assert result["coverage"]["contract_coverage"] == 1.0
+    assert result["coverage"]["candidate_rows_declared"] == 1
+    assert result["coverage"]["context_refs_resolved"] == 1
 
 
 def _write_degradation(paths: _Paths, checks: list[dict]) -> None:

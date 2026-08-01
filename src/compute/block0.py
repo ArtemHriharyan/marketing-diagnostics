@@ -95,6 +95,111 @@ _D11_HIGH_FREQUENCY_VISITS_THRESHOLD = 50
 _D11_TOP_CLIENT_IDS_LIMIT = 20
 _D11_TEST_MARKER_TOKENS: tuple[str, ...] = ("test", "internal", "employee", "qa")
 
+_D_CANDIDATE_FLAGS: tuple[str, ...] = (
+    "overtrigger",
+    "suspect_click_not_submit",
+    "has_overlap",
+    "has_uncategorized",
+    "goals_qa_mismatch",
+    "no_tracked_conversions",
+    "threshold_exceeded",
+    "utm_uncertain",
+    "answer_not_applied",
+    "mixed_basis_across_sources",
+    "missing_in_data",
+    "amount_mismatch",
+    "has_problem",
+    "has_gap",
+)
+_D_CANDIDATE_FINDINGS: frozenset[str] = frozenset(
+    {"goal_group_overlap", "possible_double_counted_budget", "high_frequency_client_id"}
+)
+_D_LIMITATION_FINDINGS: frozenset[str] = frozenset(
+    {"malformed_declared_cost_input", "conflicting_declared_cost_inputs"}
+)
+_D_SUMMARY_FINDINGS: frozenset[str] = frozenset({"goal_mix_summary", "summary"})
+
+
+def _analysis_signal(row: dict[str, Any]) -> str | None:
+    """Вернуть стабильный код уже рассчитанного проблемного сигнала строки."""
+    for field in _D_CANDIDATE_FLAGS:
+        if row.get(field) is True:
+            return field
+    finding = row.get("finding")
+    if finding in _D_CANDIDATE_FINDINGS:
+        return str(finding)
+    if (
+        row.get("check_id") == "D11"
+        and finding == "summary"
+        and int(row.get("test_marker_visit_count") or 0) > 0
+    ):
+        return "test_marker_visits"
+    if row.get("status") == "problem":
+        return "problem"
+    return None
+
+
+def _analysis_role(row: dict[str, Any], signal: str | None) -> str:
+    if signal is not None:
+        return "candidate"
+    finding = row.get("finding")
+    status = row.get("status")
+    if (
+        status in {"unavailable", "unverifiable", "not_applicable"}
+        or finding in _D_LIMITATION_FINDINGS
+        or (row.get("check_id") == "D06" and row.get("has_client_evidence") is False)
+        or (row.get("check_id") == "D11" and finding == "summary")
+    ):
+        return "limitation"
+    if finding in _D_SUMMARY_FINDINGS:
+        return "summary"
+    return "baseline"
+
+
+def _annotate_analysis_rows(name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Добавить единый аналитический контракт, не меняя значения метрик."""
+    annotated: list[dict[str, Any]] = []
+    for index, source_row in enumerate(rows):
+        row = dict(source_row)
+        check_id = str(row.get("check_id") or name).lower()
+        signal = _analysis_signal(row)
+        role = _analysis_role(row, signal)
+        reason_token = signal or row.get("finding") or row.get("status") or role
+        row.update({
+            "row_ref": f"{name}:{index}",
+            "candidate": signal is not None,
+            "row_role": role,
+            "candidate_reason": f"{check_id}_{reason_token}",
+            "context_refs": [],
+        })
+        annotated.append(row)
+
+    context_row = next(
+        (row for role in ("summary", "limitation", "baseline", "context")
+         for row in annotated if row["row_role"] == role),
+        None,
+    )
+    if context_row is not None:
+        for row in annotated:
+            if row["candidate"] and row["row_ref"] != context_row["row_ref"]:
+                row["context_refs"] = [context_row["row_ref"]]
+    return annotated
+
+
+def _write_metric_artifact(
+    metrics_dir: Path,
+    name: str,
+    rows: list[dict[str, Any]],
+    *,
+    confidence_cap: str | None = None,
+) -> tuple[Path, Path]:
+    return common.write_metric_artifact(
+        metrics_dir,
+        name,
+        _annotate_analysis_rows(name, rows),
+        confidence_cap=confidence_cap,
+    )
+
 
 def _sample_confidence(sample_size: int, min_sample_visits: int) -> str:
     """HIGH при выборке >= порога, иначе MED (CLAUDE.md, «Уверенность находок»)."""
@@ -135,7 +240,7 @@ def _table_nonempty(path: Path | None) -> bool:
 
 def _write_unavailable(metrics_dir: Path, check_id: str, reason: str) -> None:
     """Явная запись «проверка недоступна» вместо молчаливого пропуска."""
-    common.write_metric_artifact(
+    _write_metric_artifact(
         metrics_dir,
         check_id.lower(),
         [{"check_id": check_id, "status": "unavailable", "reason": reason}],
@@ -178,7 +283,7 @@ def _run_d01(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
     finally:
         con.close()
 
-    common.write_metric_artifact(metrics_dir, "d01", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d01", rows, confidence_cap=confidence_cap)
 
 
 # ── D02 — цель = клик/открытие, а не отправка ───────────────────────────────
@@ -207,7 +312,7 @@ def _run_d02(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "d02", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d02", rows, confidence_cap=confidence_cap)
 
 
 # ── D03 — смешаны бизнес-цели и микроконверсии ──────────────────────────────
@@ -259,7 +364,7 @@ def _run_d03(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
         "confidence": _cap("MED", confidence_cap),
     })
 
-    common.write_metric_artifact(metrics_dir, "d03", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d03", rows, confidence_cap=confidence_cap)
 
 
 # ── D04 — покрытие трекингом по устройствам ─────────────────────────────────
@@ -293,7 +398,7 @@ def _run_d04(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
             "confidence": _cap(_sample_confidence(total_visits, min_sample), confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "d04", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d04", rows, confidence_cap=confidence_cap)
 
 
 # ── D05 — UTM/click ID/источник теряются или перезаписываются ──────────────
@@ -332,7 +437,7 @@ def _run_d05(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
         "utm_uncertain": utm_uncertain_flag,
         "confidence": _cap(confidence, confidence_cap),
     }
-    common.write_metric_artifact(metrics_dir, "d05", [row], confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d05", [row], confidence_cap=confidence_cap)
 
 
 # ── D06 — расходы на разной базе НДС ────────────────────────────────────────
@@ -396,7 +501,7 @@ def _run_d06(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     for row in rows:
         row["mixed_basis_across_sources"] = mixed_basis_across_sources
 
-    common.write_metric_artifact(metrics_dir, "d06", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d06", rows, confidence_cap=confidence_cap)
 
 
 # ── D07 — расходы неполные или задвоены ─────────────────────────────────────
@@ -592,7 +697,7 @@ def _run_d07(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
         "confidence": _cap("MED", confidence_cap),
     })
 
-    common.write_metric_artifact(metrics_dir, "d07", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d07", rows, confidence_cap=confidence_cap)
 
 
 # ── D08 — архивные/остановленные кампании исключены из истории ─────────────
@@ -712,7 +817,7 @@ def _run_d08(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
         "confidence": _cap("HIGH" if coverage_complete else "MED", confidence_cap),
     })
 
-    common.write_metric_artifact(metrics_dir, "d08", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d08", rows, confidence_cap=confidence_cap)
 
 
 # ── D09 — периоды/часовые пояса/даты не приведены к единому правилу ────────
@@ -860,14 +965,14 @@ def _run_d09(
                          reason="canonical_temporal_manifest_missing")]
         rows.append(_d09_row("summary", confidence_cap=confidence_cap, unknown=True,
                              reason="canonical_temporal_manifest_missing", subcheck_count=1))
-        common.write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
         return
     except (OSError, json.JSONDecodeError):
         rows = [_d09_row("manifest", confidence_cap=confidence_cap, unknown=True,
                          reason="canonical_temporal_manifest_unreadable")]
         rows.append(_d09_row("summary", confidence_cap=confidence_cap, unknown=True,
                              reason="canonical_temporal_manifest_unreadable", subcheck_count=1))
-        common.write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
         return
 
     temporal = manifest.get("temporal_provenance") if isinstance(manifest, dict) else None
@@ -876,7 +981,7 @@ def _run_d09(
                          reason="canonical_temporal_provenance_missing")]
         rows.append(_d09_row("summary", confidence_cap=confidence_cap, unknown=True,
                              reason="canonical_temporal_provenance_missing", subcheck_count=1))
-        common.write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
         return
 
     raw_sources = temporal.get("raw_sources") or {}
@@ -1086,7 +1191,7 @@ def _run_d09(
         problem_subcheck_count=problem_count,
         unverifiable_subcheck_count=unknown_count,
     ))
-    common.write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
 
 
 # ── D10 — выгрузка неполная (пагинация/лимиты/фильтры/семплирование) ───────
@@ -1123,7 +1228,7 @@ def _run_d10(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
             "has_gap": False,
             "confidence": _cap("LOW", confidence_cap),
         }]
-        common.write_metric_artifact(metrics_dir, "d10", rows, confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "d10", rows, confidence_cap=confidence_cap)
         return
 
     days_in_range = (date_max - date_min).days + 1
@@ -1142,7 +1247,7 @@ def _run_d10(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
         "has_gap": len(missing_dates) > 0,
         "confidence": _cap(_sample_confidence(total_visits, min_sample), confidence_cap),
     }]
-    common.write_metric_artifact(metrics_dir, "d10", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d10", rows, confidence_cap=confidence_cap)
 
 
 # ── D11 — сотрудники/тесты/боты в данных ────────────────────────────────────
@@ -1203,7 +1308,7 @@ def _run_d11(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
         "confidence": _cap("LOW", confidence_cap),
     })
 
-    common.write_metric_artifact(metrics_dir, "d11", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d11", rows, confidence_cap=confidence_cap)
 
 
 # ── D12 — таблицы соединяются на неверном уровне детализации ───────────────
@@ -1306,7 +1411,7 @@ def _run_d12(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     if not manifest_path.exists():
         rows = [{"check_id": "D12", "status": "unavailable", "reason": "join_integrity_manifest_absent",
                  "confidence": _cap("LOW", confidence_cap)}]
-        common.write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
         return
     try:
         with manifest_path.open("r", encoding="utf-8") as fh:
@@ -1314,14 +1419,14 @@ def _run_d12(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     except (OSError, json.JSONDecodeError):
         rows = [{"check_id": "D12", "status": "unavailable", "reason": "join_integrity_manifest_unreadable",
                  "confidence": _cap("LOW", confidence_cap)}]
-        common.write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
         return
 
     records = manifest.get("join_integrity") if isinstance(manifest, dict) else None
     if not isinstance(records, list) or not records:
         rows = [{"check_id": "D12", "status": "unavailable", "reason": "join_integrity_records_absent",
                  "confidence": _cap("LOW", confidence_cap)}]
-        common.write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
         return
 
     rows: list[dict[str, Any]] = []
@@ -1346,7 +1451,7 @@ def _run_d12(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
                          "status": "problem" if violations else "pass",
                          "violations": sorted(set(violations)), "has_problem": bool(violations),
                          "confidence": _cap("HIGH", confidence_cap)})
-    common.write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
 
 
 # ── Диспетчер блока ──────────────────────────────────────────────────────────

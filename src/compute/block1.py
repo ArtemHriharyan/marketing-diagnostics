@@ -291,6 +291,119 @@ _A24_PROMO_WORDS: tuple[str, ...] = (
 _A26_MIN_MONTHS_FOR_JUDGMENT = 2
 _A26_MIN_NET_CONVERSIONS_FOR_JUDGMENT = 5
 
+_A_CANDIDATE_FLAGS: tuple[str, ...] = (
+    "paid_underperforms",
+    "suspect_wrong_objective",
+    "clicks_strategy_despite_stable_goal",
+    "auto_strategy_at_risk",
+    "at_risk_of_contaminated_signal",
+    "zero_conversion_campaign",
+    "cpa_persistently_worse",
+    "budget_misallocated",
+    "fragmented_structure",
+    "no_net_conversions",
+    "missing_negative_keyword_candidate",
+    "match_type_dilutes_semantics",
+    "zero_conversion_region",
+    "off_target_geo_worse",
+    "weekday_persistently_worse",
+    "device_cr_worse_than_overall",
+    "device_cpa_persistently_worse",
+    "notable_spend_share",
+    "possible_cannibalization",
+    "competing_campaigns",
+    "cpc_anomalously_high",
+    "anomalously_low_ctr",
+    "high_ctr_low_conversion",
+    "query_ad_keyword_mismatch",
+    "generic_landing_underperforms",
+    "insufficient_sample_for_judgment",
+)
+_A_CANDIDATE_FINDINGS: frozenset[str] = frozenset({"manual_check_candidate"})
+_A_LIMITATION_FINDINGS: frozenset[str] = frozenset({
+    "hour_of_day_unavailable",
+    "cpa_by_device_unavailable",
+    "net_conversions_unavailable",
+    "competitor_ads_not_checked",
+    "organic_brand_data_unavailable",
+    "manual_verification_required",
+    "wordstat_seasonality_unavailable",
+})
+_A_SUMMARY_FINDINGS: frozenset[str] = frozenset({
+    "summary", "paid_vs_site_gap", "outside_named_phrases",
+})
+
+
+def _analysis_signal(row: dict[str, Any]) -> str | None:
+    """Вернуть стабильный код уже рассчитанного проблемного сигнала строки."""
+    for field in _A_CANDIDATE_FLAGS:
+        if row.get(field) is True:
+            return field
+    finding = row.get("finding")
+    if finding in _A_CANDIDATE_FINDINGS:
+        return str(finding)
+    return None
+
+
+def _analysis_role(row: dict[str, Any], signal: str | None) -> str:
+    if signal is not None:
+        return "candidate"
+    finding = row.get("finding")
+    if (
+        row.get("status") == "unavailable"
+        or finding in _A_LIMITATION_FINDINGS
+        or row.get("insufficient_campaigns_for_check") is True
+    ):
+        return "limitation"
+    if finding in _A_SUMMARY_FINDINGS:
+        return "summary"
+    return "baseline"
+
+
+def _annotate_analysis_rows(name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Добавить единый аналитический контракт, не меняя значения метрик."""
+    annotated: list[dict[str, Any]] = []
+    for index, source_row in enumerate(rows):
+        row = dict(source_row)
+        check_id = str(row.get("check_id") or name).lower()
+        signal = _analysis_signal(row)
+        role = _analysis_role(row, signal)
+        reason_token = signal or row.get("finding") or row.get("status") or role
+        row.update({
+            "row_ref": f"{name}:{index}",
+            "candidate": signal is not None,
+            "row_role": role,
+            "candidate_reason": f"{check_id}_{reason_token}",
+            "context_refs": [],
+        })
+        annotated.append(row)
+
+    context_row = next(
+        (row for role in ("summary", "limitation", "baseline", "context")
+         for row in annotated if row["row_role"] == role),
+        None,
+    )
+    if context_row is not None:
+        for row in annotated:
+            if row["candidate"] and row["row_ref"] != context_row["row_ref"]:
+                row["context_refs"] = [context_row["row_ref"]]
+    return annotated
+
+
+def _write_metric_artifact(
+    metrics_dir: Path,
+    name: str,
+    rows: list[dict[str, Any]],
+    *,
+    confidence_cap: str | None = None,
+) -> tuple[Path, Path]:
+    return common.write_metric_artifact(
+        metrics_dir,
+        name,
+        _annotate_analysis_rows(name, rows),
+        confidence_cap=confidence_cap,
+    )
+
 
 # ── Общие хелперы (дублируют паттерн block0.py — блоки compute не делят
 # приватные хелперы через common.py, см. CLAUDE.md принцип 2) ───────────────
@@ -325,7 +438,7 @@ def _sample_confidence(sample_size: int, min_sample_visits: int) -> str:
 
 def _write_unavailable(metrics_dir: Path, check_id: str, reason: str) -> None:
     """Явная запись «проверка недоступна» вместо молчаливого пропуска."""
-    common.write_metric_artifact(
+    _write_metric_artifact(
         metrics_dir,
         check_id.lower(),
         [{"check_id": check_id, "status": "unavailable", "reason": reason}],
@@ -591,7 +704,7 @@ def _run_a01(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a01", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a01", rows, confidence_cap=confidence_cap)
 
 
 # ── A02 — "максимум кликов" там, где есть стабильная конверсионная цель ────
@@ -614,7 +727,7 @@ def _run_a02(
         con.close()
 
     if not strategies:
-        common.write_metric_artifact(metrics_dir, "a02", [], confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "a02", [], confidence_cap=confidence_cap)
         return
 
     if conversions is None:
@@ -640,7 +753,7 @@ def _run_a02(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a02", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a02", rows, confidence_cap=confidence_cap)
 
 
 # ── A03 — автостратегия учится на переотрабатывающей/смешанной цели ────────
@@ -705,7 +818,7 @@ def _run_a03(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a03", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a03", rows, confidence_cap=confidence_cap)
 
 
 # ── A04 — кампания тратит и не даёт ни одной чистой конверсии ──────────────
@@ -745,7 +858,7 @@ def _run_a04(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a04", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a04", rows, confidence_cap=confidence_cap)
 
 
 # ── A05 — CPA кампании устойчиво хуже сопоставимых ──────────────────────────
@@ -779,7 +892,7 @@ def _run_a05(
         comparable.append((campaign_id, info["campaign_name"], cost, net_conv))
 
     if not comparable:
-        common.write_metric_artifact(metrics_dir, "a05", [], confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "a05", [], confidence_cap=confidence_cap)
         return
 
     cpas = sorted((cost / net_conv) for _, _, cost, net_conv in comparable)
@@ -805,7 +918,7 @@ def _run_a05(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a05", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a05", rows, confidence_cap=confidence_cap)
 
 
 # ── A06 — бюджет распределён не по эффективности ────────────────────────────
@@ -839,7 +952,7 @@ def _run_a06(
     total_conv = sum(conv for _, _, _, conv in priced)
 
     if total_cost <= 0:
-        common.write_metric_artifact(metrics_dir, "a06", [], confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "a06", [], confidence_cap=confidence_cap)
         return
 
     rows: list[dict[str, Any]] = []
@@ -862,7 +975,7 @@ def _run_a06(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a06", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a06", rows, confidence_cap=confidence_cap)
 
 
 # ── A07 — эффективная кампания теряет показы (данных нет, см. докстринг) ───
@@ -904,7 +1017,7 @@ def _run_a08(
             "min_campaigns_threshold": _A08_MIN_CAMPAIGNS_FOR_FRAGMENTATION_CHECK,
             "confidence": _cap("LOW", confidence_cap),
         }]
-        common.write_metric_artifact(metrics_dir, "a08", rows, confidence_cap=confidence_cap)
+        _write_metric_artifact(metrics_dir, "a08", rows, confidence_cap=confidence_cap)
         return
 
     small_campaigns = [
@@ -934,7 +1047,7 @@ def _run_a08(
         "avg_conversions_per_campaign": avg_conversions_per_campaign,
         "confidence": _cap("MED", confidence_cap),
     }]
-    common.write_metric_artifact(metrics_dir, "a08", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a08", rows, confidence_cap=confidence_cap)
 
 
 # ── A09 — оплачиваются нецелевые поисковые запросы ──────────────────────────
@@ -1013,7 +1126,7 @@ def _run_a09(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a09", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a09", rows, confidence_cap=confidence_cap)
 
 
 # ── A10 — не хватает минус-слов ──────────────────────────────────────────────
@@ -1080,7 +1193,7 @@ def _run_a10(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a10", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a10", rows, confidence_cap=confidence_cap)
 
 
 # ── A11 — автотаргетинг/широкие соответствия размывают семантику ───────────
@@ -1172,7 +1285,7 @@ def _run_a11(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a11", rows, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a11", rows, confidence_cap=confidence_cap)
 
 
 # ── A12 — реклама показывается в нерелевантной географии ────────────────────
@@ -1274,7 +1387,7 @@ def _run_a12(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a12", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a12", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A13 — день недели/время показа даёт устойчиво слабую экономику ─────────
@@ -1374,7 +1487,7 @@ def _run_a13(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a13", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a13", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A14 — устройства различаются по CPA и конверсии ─────────────────────────
@@ -1491,7 +1604,7 @@ def _run_a14(
                 "confidence": _cap("MED", confidence_cap),
             })
 
-    common.write_metric_artifact(metrics_dir, "a14", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a14", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A15 — площадки РСЯ/приложения дают мусорный трафик ──────────────────────
@@ -1555,7 +1668,7 @@ def _run_a15(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a15", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a15", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A16 — ретаргетинг (данных нет структурно, см. докстринг модуля) ────────
@@ -1667,7 +1780,7 @@ def _run_a17(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a17", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a17", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A18 — кампании конкурируют друг с другом за одинаковый спрос ───────────
@@ -1717,7 +1830,7 @@ def _run_a18(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a18", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a18", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A19 — CPC аномально высок относительно близких запросов ────────────────
@@ -1765,7 +1878,7 @@ def _run_a19(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a19", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a19", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A20 — низкий CTR у релевантных показов ──────────────────────────────────
@@ -1813,7 +1926,7 @@ def _run_a20(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a20", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a20", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A21 — высокий CTR сочетается с низкой конверсией ────────────────────────
@@ -1885,7 +1998,7 @@ def _run_a21(
             "confidence": _cap("MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a21", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a21", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A22 — запрос, объявление и посадочная не соответствуют друг другу ──────
@@ -1959,7 +2072,7 @@ def _run_a22(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             "confidence": _cap("LOW", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a22", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a22", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A23 — конкретный спрос ведётся на слишком общую страницу ───────────────
@@ -2029,7 +2142,7 @@ def _run_a23(
             confidence_cap,
         ),
     }]
-    common.write_metric_artifact(metrics_dir, "a23", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a23", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A24 — устаревшая цена/акция/наличие в объявлении ────────────────────────
@@ -2082,7 +2195,7 @@ def _run_a24(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             "confidence": "LOW",
         })
 
-    common.write_metric_artifact(metrics_dir, "a24", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a24", rows_out, confidence_cap=confidence_cap)
 
 
 # ── A25 — товарный фид (данных нет структурно, см. докстринг модуля) ───────
@@ -2171,7 +2284,7 @@ def _run_a26(
             "confidence": _cap("LOW" if insufficient else "MED", confidence_cap),
         })
 
-    common.write_metric_artifact(metrics_dir, "a26", rows_out, confidence_cap=confidence_cap)
+    _write_metric_artifact(metrics_dir, "a26", rows_out, confidence_cap=confidence_cap)
 
 
 # ── Диспетчер блока ──────────────────────────────────────────────────────────

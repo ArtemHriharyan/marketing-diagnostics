@@ -24,6 +24,7 @@ import pytest
 import yaml
 
 from src.compute import block2  # noqa: E402
+from src.compute.candidates import build_analysis_candidates  # noqa: E402
 from src.pipeline import degradation  # noqa: E402
 
 
@@ -124,7 +125,28 @@ def _base_visit(**overrides) -> dict:
 
 def _read_metric(paths: _Paths, name: str) -> list[dict]:
     with (paths.metrics / f"{name}.json").open("r", encoding="utf-8") as fh:
-        return json.load(fh)
+        rows = json.load(fh)
+    for row in rows:
+        assert row["candidate"] is (row["row_role"] == "candidate")
+        assert row["candidate_reason"]
+        assert isinstance(row["context_refs"], list)
+        assert row["row_ref"].startswith(f"{name}:")
+    return rows
+
+
+def test_t_candidate_contract_coverage_is_complete(tmp_path):
+    metrics_dir = tmp_path / "metrics"
+    block2._write_metric_artifact(metrics_dir, "t01", [
+        {"check_id": "T01", "finding": "utm_tagging_summary", "confidence": "MED"},
+        {"check_id": "T01", "finding": "non_standardized_utm_source",
+         "normalized_value": "source", "confidence": "MED"},
+    ], confidence_cap="MED")
+
+    result = build_analysis_candidates(metrics_dir)
+
+    assert result["coverage"]["contract_coverage"] == 1.0
+    assert result["coverage"]["candidate_rows_declared"] == 1
+    assert result["coverage"]["context_refs_resolved"] == 1
 
 
 # ── T01 — внешние ссылки не размечены UTM ────────────────────────────────────
@@ -491,4 +513,9 @@ def test_registry_unavailable_overwrites_contract_metric(tmp_path, check_id):
         "check_id": check_id,
         "status": "unavailable",
         "reason": "нет источника: обязательный контракт",
+        "row_ref": f"{check_id.lower()}:0",
+        "candidate": False,
+        "row_role": "limitation",
+        "candidate_reason": f"{check_id.lower()}_unavailable",
+        "context_refs": [],
     }]
