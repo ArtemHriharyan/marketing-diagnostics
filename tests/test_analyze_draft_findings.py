@@ -137,6 +137,20 @@ def test_build_input_pack_missing_sources_are_empty_not_broken(tmp_path):
     assert pack["confidence_ceilings"]["source_cap_by_check"] == {}
 
 
+def test_build_input_pack_excludes_non_finding_metrics(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_json(paths.metrics, "t03", [{"check_id": "T03", "status": "unavailable"}])
+    _write_json(paths.metrics, "t09", {
+        "summary": {"status": "unavailable_for_cause"},
+        "anomalies": [{"finding": "channel_anomaly_context"}],
+    })
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+
+    assert "t03" not in pack["metrics"]
+    assert "t09" not in pack["metrics"]
+
+
 def test_input_pack_round_trips_through_json(tmp_path):
     paths = _Paths(tmp_path)
     _write_degradation(paths, [{"check_id": "D01", "runnable": True, "confidence_cap": "HIGH"}])
@@ -148,6 +162,89 @@ def test_input_pack_round_trips_through_json(tmp_path):
     serialized = json.dumps(pack, ensure_ascii=False)
     restored = json.loads(serialized)
     assert restored == pack
+
+
+def test_build_input_pack_projects_only_reportable_a19_a20_c21_rows(tmp_path):
+    paths = _Paths(tmp_path)
+    a19_rows = [
+        {"campaign": "high", "cpc_anomalously_high": True, "cost": 1500.0},
+        {"campaign": "normal", "cpc_anomalously_high": False, "cost": 500.0},
+    ]
+    a20_rows = [
+        {"campaign": "low", "anomalously_low_ctr": True, "ctr": 0.01},
+        {"campaign": "normal", "anomalously_low_ctr": False, "ctr": 0.04},
+    ]
+    c21_rows = [
+        {"segment": "bad", "segment_underperforms_baseline": True, "sessions": 20},
+        {"segment": "control", "is_baseline": True, "sessions": 100},
+        {"segment": "other", "segment_underperforms_baseline": False, "sessions": 80},
+    ]
+    _write_json(paths.metrics, "a19", a19_rows)
+    _write_json(paths.metrics, "a20", a20_rows)
+    _write_json(paths.metrics, "c21", c21_rows)
+    _write_json(paths.metrics, "a04", [{"check_id": "A04", "some_bool": False}])
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+
+    assert json.loads((paths.metrics / "a19.json").read_text(encoding="utf-8")) == a19_rows
+    assert json.loads((paths.metrics / "a20.json").read_text(encoding="utf-8")) == a20_rows
+    assert json.loads((paths.metrics / "c21.json").read_text(encoding="utf-8")) == c21_rows
+    assert pack["metrics"]["a19"] == {
+        "summary": {
+            "total_rows": 2,
+            "candidate_rows": 1,
+            "context_rows": 0,
+            "candidate_flag": "cpc_anomalously_high",
+        },
+        "candidates": [a19_rows[0]],
+    }
+    assert pack["metrics"]["a20"]["candidates"] == [a20_rows[0]]
+    assert pack["metrics"]["c21"]["candidates"] == [c21_rows[0]]
+    assert pack["metrics"]["c21"]["context"] == [c21_rows[1]]
+    assert pack["metrics"]["a04"] == [{"check_id": "A04", "some_bool": False}]
+
+
+def test_build_input_pack_omits_rows_when_projected_artifact_has_no_candidates(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_json(paths.metrics, "a19", [{"cpc_anomalously_high": False}])
+    _write_json(paths.metrics, "a20", [{"anomalously_low_ctr": False}])
+    _write_json(paths.metrics, "c21", [{"is_baseline": True, "segment_underperforms_baseline": False}])
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+
+    assert pack["metrics"]["a19"] == {
+        "summary": {
+            "total_rows": 1,
+            "candidate_rows": 0,
+            "context_rows": 0,
+            "candidate_flag": "cpc_anomalously_high",
+        }
+    }
+    assert pack["metrics"]["a20"]["summary"]["candidate_rows"] == 0
+    assert pack["metrics"]["c21"] == {
+        "summary": {
+            "total_rows": 1,
+            "candidate_rows": 0,
+            "context_rows": 1,
+            "candidate_flag": "segment_underperforms_baseline",
+        }
+    }
+
+
+def test_llm_metric_projection_is_deterministic_and_substantially_smaller(tmp_path):
+    paths = _Paths(tmp_path)
+    rows = [
+        {"campaign": f"normal-{i}", "cpc_anomalously_high": False, "details": "x" * 200}
+        for i in range(50)
+    ]
+    rows.append({"campaign": "high", "cpc_anomalously_high": True, "details": "x" * 200})
+    _write_json(paths.metrics, "a19", rows)
+
+    first_pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+    second_pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+
+    assert first_pack == second_pack
+    assert len(json.dumps(first_pack["metrics"]["a19"])) < len(json.dumps(rows)) / 2
 
 
 # ── 3. draft(): аудиторский артефакт всегда пишется первым ─────────────────

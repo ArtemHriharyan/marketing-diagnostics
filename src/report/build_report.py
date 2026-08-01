@@ -139,6 +139,13 @@ _CONFIDENCE_RANK: dict[str, int] = {
     "LOW": 2,
 }
 _BLOCK_ORDER: dict[str, int] = {"D": 0, "A": 1, "T": 2, "C": 3, "S": 4}
+_NON_PUBLISHABLE_STATUSES = frozenset({"unavailable", "unavailable_for_cause"})
+_DIAGNOSTIC_CONTEXT_MARKERS = frozenset({"channel_anomaly_context"})
+_T09_CAUSE_LIMITATION = {
+    "id": "T09",
+    "block": 2,
+    "reason": "аномалия наблюдается, причина не установлена",
+}
 
 
 # ── Загрузка входов ──────────────────────────────────────────────────────
@@ -156,6 +163,35 @@ def _load_json(path: Path) -> dict[str, Any]:
         return json.load(fh) or {}
 
 
+def _is_publishable_finding(data: dict[str, Any]) -> bool:
+    """Не публиковать сохранённые ограничения и диагностический контекст как finding."""
+    if data.get("status") in _NON_PUBLISHABLE_STATUSES:
+        return False
+    if data.get("finding") in _DIAGNOSTIC_CONTEXT_MARKERS:
+        return False
+    return not (data.get("check_id") == "T09" and data.get("causal_claim") is False)
+
+
+def _contains_status(payload: Any, status: str) -> bool:
+    if isinstance(payload, dict):
+        return payload.get("status") == status or any(
+            _contains_status(value, status) for value in payload.values()
+        )
+    if isinstance(payload, list):
+        return any(_contains_status(value, status) for value in payload)
+    return False
+
+
+def _report_limitations(skipped: list[dict[str, Any]], t09_metric: Any) -> list[dict[str, Any]]:
+    """Дополнить реестровые пропуски запретом T09 на причинный вывод."""
+    limitations = list(skipped)
+    if _contains_status(t09_metric, "unavailable_for_cause") and not any(
+        item.get("id") == "T09" for item in limitations
+    ):
+        limitations.append(dict(_T09_CAUSE_LIMITATION))
+    return limitations
+
+
 def load_approved_findings(findings_approved_dir: Path) -> list[dict[str, Any]]:
     """Загрузить утверждённые находки как словари, отсортированные по имени файла."""
     directory = Path(findings_approved_dir)
@@ -164,7 +200,7 @@ def load_approved_findings(findings_approved_dir: Path) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for path in sorted(directory.glob("*.yaml")):
         data = _load_yaml(path)
-        if data:
+        if data and _is_publishable_finding(data):
             findings.append(data)
     return findings
 
@@ -698,6 +734,9 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> str:
     metrics_dir = Path(paths.metrics)
     degradation = _load_json(metrics_dir / "degradation_report.json")
     metrics_summary = _load_json(metrics_dir / "metrics_summary.json")
+    report_limitations = _report_limitations(
+        degradation.get("skipped") or [], _load_json(metrics_dir / "t09.json")
+    )
     glossary = load_glossary()
 
     currency_round = int(defaults.get("currency_round") or 0)
@@ -713,7 +752,7 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> str:
     lines.append(
         _build_findings_section(shown_findings, main_candidate_count, bool(findings), currency_round)
     )
-    lines.append(_build_skipped_section(degradation.get("skipped") or []))
+    lines.append(_build_skipped_section(report_limitations))
     lines.append(_build_appendix_section(appendix_findings, degradation, currency_round))
     lines.append(_build_footnotes_section())
     lines.append(_build_glossary_section(glossary))
@@ -724,7 +763,7 @@ def build(paths: Any, config: dict[str, Any], defaults: dict[str, Any]) -> str:
     out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
     _build_appendix_tables(
-        report_dir, appendix_findings, degradation.get("skipped") or [], currency_round
+        report_dir, appendix_findings, report_limitations, currency_round
     )
 
     agenda_text = build_oral_review_agenda(findings, config, currency_round)

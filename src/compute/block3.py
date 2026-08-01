@@ -20,17 +20,17 @@ browser/OS-специфика, корзина/бронирование, нали
     C11  submit фиксируется, но данные фактически не доставлены [manual_form_tests]
     C12  на первом экране непонятно, что предлагает компания  [visits] (+webvisor_findings)
     C13  цена/условия/следующий шаг раскрываются поздно       [visits] (+webvisor_findings)
-    C14  недостаточно доверия (гарантии/реквизиты/отзывы)     [site_crawl] (+webvisor_findings)
+    C14  недостаточно доверия (гарантии/реквизиты/отзывы)     [site_crawl + manual_form_tests] (+webvisor_findings)
     C15  основной CTA незаметен/неоднозначен                  [visits] (+site_crawl)
     C16  слишком много конкурирующих действий на странице     [visits]
     C17  нет альтернативы основной форме (звонок/мессенджер)  [manual_form_tests]
     C18  навигация/категории/фильтры/поиск не помогают        [visits]
     C19  внутренний поиск часто даёт ноль результатов         [visits]
-    C20  попап/чат/cookie-баннер перекрывает контент и CTA    [visits] (+webvisor_findings)
+    C20  попап/чат/cookie-баннер перекрывает контент и CTA    [webvisor_findings]
     C21  проблема в конкретном браузере/ОС/разрешении         [visits]
     C22  корзина/запись/бронирование теряют на конкретном шаге [visits]
     C23  платёжный/бронирующий модуль выдаёт ошибки           [manual_form_tests] (+visits)
-    C24  реклама/SEO ведут на отсутствующий товар/услугу      [visits] (+site_crawl)
+    C24  реклама/SEO ведут на отсутствующий товар/услугу      [visits + site_crawl; без availability -> UNVERIFIABLE]
     C25  информационные страницы не ведут к коммерции          [visits]
 
 Контракт:
@@ -1073,10 +1073,8 @@ def _run_c20(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     """Нет данных о наложении элементов в канонической схеме (см. докстринг
 
     модуля, разрыв 9) — единственный источник вывода inputs/webvisor_findings.yaml
-    (optional по methodology.yaml). Device-конверсия (потенциальный косвенный
-    сигнал "мобильный сегмент теряет конверсию") уже полностью посчитана в C09
-    под своей причинной рамкой — здесь НЕ пересчитывается (разрыв 10), только
-    упоминается как пойнтер для аналитика.
+    (required G2 по methodology.yaml). CWV и device-конверсия не являются
+    входами C20 и здесь не пересчитываются.
     """
     inputs = common.load_inputs(paths)
     webvisor = inputs.get("webvisor_findings")
@@ -1086,8 +1084,7 @@ def _run_c20(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
             "inputs/webvisor_findings.yaml не заполнен (meta.date/"
             "sessions_reviewed пусты) — попап/чат/cookie-баннер не "
             "детектируются автоматически, в канонической схеме нет данных о "
-            "наложении элементов; при заполнении сверить с device-конверсией "
-            "C09 вручную (не пересчитывается повторно под C20)",
+            "наложении элементов; C20 не использует CWV или device-конверсию",
         )
         return
 
@@ -1165,50 +1162,33 @@ def _run_c21(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
 
 
 # ── C24 — реклама/SEO ведут на отсутствующий товар/недоступную услугу ──────
-def _run_c24(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
-    """client_facts (Q04 capacity_limits) — единственный источник: site_pages
+def _run_c24(paths: Any, canonical: dict[str, Path], metrics_dir: Path) -> None:
+    """Явно вернуть UNVERIFIABLE, пока в site_pages нет URL-level availability.
 
-    не хранит наличие/доступность (нет поля stock/availability в схеме, см.
-    докстринг модуля, разрыв 9), а C04 отдельно уже покрывает чисто битые
-    (4xx/5xx) посадочные — здесь нужен именно случай "страница отвечает 200,
-    но услуга/товар недоступны", который без клиентского факта не восстановить.
+    C24 не вправе подменять наличие товара общим client_fact: для угрозы нужны
+    посадочная URL, её трафик/расход и availability этой URL. Стандартный
+    артефакт ``status: unavailable`` — единственное честное представление
+    UNVERIFIABLE в текущем контракте metrics; confidence не применяется.
     """
-    inputs = common.load_inputs(paths)
-    client = inputs.get("client_answers") or {}
-    capacity_limits = client.get("capacity_limits") or []
-
-    rows: list[dict[str, Any]] = []
-    for limit in capacity_limits:
-        if not isinstance(limit, dict):
-            continue
-        text = (limit.get("limit") or "").strip()
-        if not text:
-            continue
-        rows.append({
-            "check_id": "C24", "finding": "client_fact_capacity_limit",
-            "limit": text, "period": limit.get("period"),
-            "source": "client_answers", "confidence": "client-HIGH",
-        })
-
-    if not rows:
+    if "site_pages" not in canonical or not _table_nonempty(canonical["site_pages"]):
         _write_unavailable(
             metrics_dir, "C24",
-            "inputs/client_answers.yaml: capacity_limits (Q04) не заполнен — "
-            "наличие/доступность товара или услуги не выгружается ни в "
-            "site_pages (нет поля stock/availability в канонической схеме), "
-            "ни в visits; C04 отдельно уже покрывает чисто битые (4xx/5xx) "
-            "посадочные, здесь нужен именно случай \"страница отвечает 200, "
-            "но услуга недоступна\", который без клиентского факта не "
-            "восстановить",
+            "site_pages недоступна (site_crawl не выполнен) — без списка "
+            "проверенных URL C24 имеет статус UNVERIFIABLE",
         )
         return
 
-    common.write_metric_artifact(metrics_dir, "c24", rows, confidence_cap=confidence_cap)
+    _write_unavailable(
+        metrics_dir, "C24",
+        "в site_pages нет URL-level availability: статусы HTTP не доказывают "
+        "наличие товара/слота; C24 имеет статус UNVERIFIABLE и не использует "
+        "inputs/client_answers.yaml как замену",
+    )
 
 
 # ── C14 — недостаточно доверия (гарантии/реквизиты/кейсы/отзывы) ───────────
-# Тип B (полностью ручная, как C03/C08/C11), плюс optional webvisor_findings
-# по methodology.yaml — единственная из manual-only проверок 5H с обогащением.
+# Тип B: site_crawl задаёт URL проверки, manual_form_tests содержит обязательный
+# G2, webvisor_findings — только optional обогащение.
 def _run_c14(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     inputs = common.load_inputs(paths)
     manual = inputs.get("manual_form_tests")
@@ -1216,21 +1196,18 @@ def _run_c14(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     manual_ok = _yaml_populated(manual, ("tested_at",))
     webvisor_ok = _yaml_populated(webvisor, ("date", "sessions_reviewed"))
 
-    if not manual_ok and not webvisor_ok:
+    if not manual_ok:
         _write_unavailable(
             metrics_dir, "C14",
-            "ни inputs/manual_form_tests.yaml (meta.tested_at пуст), ни "
-            "inputs/webvisor_findings.yaml (meta.date/sessions_reviewed пусты) "
-            "не заполнены — элементы доверия (гарантии, реквизиты, кейсы, "
-            "отзывы, процесс) не автоматизируются, site_pages не хранит их "
-            "присутствие/расположение (см. докстринг модуля, разрыв 9)",
+            "inputs/manual_form_tests.yaml не заполнен (meta.tested_at пуст) — "
+            "после отбора URL через site_crawl обязателен ручной G2-аудит "
+            "элементов доверия; Webvisor является только обогащением",
         )
         return
 
     rows: list[dict[str, Any]] = []
-    if manual_ok:
-        rows.extend(_manual_pattern_rows("C14", manual, confidence_cap, "MED"))
-        rows.extend(_manual_conclusions_rows("C14", manual, confidence_cap, "MED"))
+    rows.extend(_manual_pattern_rows("C14", manual, confidence_cap, "MED"))
+    rows.extend(_manual_conclusions_rows("C14", manual, confidence_cap, "MED"))
     if webvisor_ok:
         rows.extend(_manual_pattern_rows("C14", webvisor, confidence_cap, "MED"))
         rows.extend(_manual_conclusions_rows("C14", webvisor, confidence_cap, "MED"))
@@ -1379,7 +1356,7 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         )
         artifacts.append("c19")
 
-    if "C20" in runnable_ids and "visits" in canonical:
+    if "C20" in runnable_ids:
         _run_c20(paths, caps.get("C20", "HIGH"), metrics_dir)
         artifacts.append("c20")
 
@@ -1405,7 +1382,7 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         artifacts.append("c23")
 
     if "C24" in runnable_ids and "visits" in canonical:
-        _run_c24(paths, caps.get("C24", "HIGH"), metrics_dir)
+        _run_c24(paths, canonical, metrics_dir)
         artifacts.append("c24")
 
     if "C25" in runnable_ids and "visits" in canonical:

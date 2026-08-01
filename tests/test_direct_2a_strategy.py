@@ -146,6 +146,63 @@ def test_campaigns_get_call_includes_strategy_field(tmp_path):
         assert params.get("TextCampaignFieldNames") == ["BiddingStrategy"]
 
 
+def test_campaigns_get_requests_all_states_and_records_status_provenance(tmp_path):
+    """D08 получает полный доступный набор State и сохраняет его provenance."""
+    paths = Paths(tmp_path / "data" / "raw")
+    (tmp_path / "data" / "raw").mkdir(parents=True, exist_ok=True)
+    box = {}
+    session = FakeSession(_routes(box, campaigns_result=[
+        {"Id": 1, "State": "ARCHIVED", "Status": "ACCEPTED"},
+    ]))
+    box["session"] = session
+
+    direct.extract(CONFIG_DIRECT, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    calls = [kwargs for _m, url, kwargs in session.calls if "/campaigns" in url]
+    assert calls
+    params = calls[0]["json"]["params"]
+    assert params["SelectionCriteria"]["States"] == direct.CAMPAIGN_STATES_ALL
+    assert {"State", "Status", "StatusPayment", "StatusClarification"} <= set(params["FieldNames"])
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["direct"]
+    assert "campaign_status" in entry["canonical_tables"]
+    assert entry["campaign_status_provenance"] == {
+        "source": "direct.campaigns.get",
+        "requested_states": direct.CAMPAIGN_STATES_ALL,
+        "raw_path": "direct/campaign_strategies.json",
+    }
+
+
+def test_direct_temporal_provenance_uses_reports_contract_not_campaign_timezone(tmp_path):
+    """campaigns.get.TimeZone — настройка расписания, не timezone статистики."""
+    paths = Paths(tmp_path / "data" / "raw")
+    (tmp_path / "data" / "raw").mkdir(parents=True, exist_ok=True)
+    box = {}
+    session = FakeSession(_routes(box, campaigns_result=[
+        {"Id": 1, "Name": "Поиск", "State": "ON", "TimeZone": "Asia/Vladivostok"},
+    ]))
+    box["session"] = session
+
+    direct.extract(CONFIG_DIRECT, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    provenance = manifest_mod.load_manifest(paths.raw)["sources"]["direct"]["temporal_provenance"]
+    assert provenance == {
+        "requested_window": {
+            "date_from": "2026-06-01",
+            "date_to": "2026-06-30",
+            "boundary_semantics": "unknown",
+        },
+        "zero_day_policy": "unknown",
+        "fields": {
+            "Date": {
+                "event": "direct_statistics_day",
+                "data_type": "date",
+                "timezone_contract": "Europe/Moscow",
+                "evidence": "direct_reports_contract",
+            },
+        },
+    }
+
+
 # ── strategy_field_present: факт наличия, не предположение ──────────────────
 def test_strategy_field_present_true_when_api_returns_it(tmp_path):
     """Если API вернул TextCampaign.BiddingStrategy хотя бы у одной кампании —

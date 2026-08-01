@@ -80,16 +80,9 @@
    (LOW, cannot_determine_without_wordstat).
 
 2. month-гранулярность seo_queries: build_seo_queries_gsc агрегирует по
-   (query, page, device, month) — по одной строке на месяц, как и нужно для
-   S05/S06 ("сравнить месяцы"). Но later build_canonical.py делает
-   `drop_duplicates(subset=["query","page","source","device"], keep="first")`
-   БЕЗ "month" в ключе (см. build_canonical.py:2016-2018) — это дедуп-ключ
-   слоя transform, не в allowed_files этой задачи, менять нельзя. Практическое
-   следствие: на части выгрузок seo_queries может нести только один month на
-   комбинацию (query,page,device), даже если сырьё имело несколько месяцев.
-   S05/S06 здесь написаны так, чтобы КОРРЕКТНО работать при любом фактическом
-   числе различимых месяцев — если для страницы доступен только один месяц,
-   тренд не строится (запись "insufficient_month_history", не имитируется).
+   (query, page, device, month), а финальный transform-дедуп также включает
+   month. Поэтому месячные ряды не схлопываются до page-level агрегатов S09
+   и S24.
 
 3. "Целевой URL" (S10, "Сопоставить целевой URL, фактический URL и конверсию"):
    в схеме клиента (config.yaml) и в canonical-слое нет поля/таблицы, явно
@@ -300,8 +293,8 @@ _S02_POSITION_MIN, _S02_POSITION_MAX = 4.0, 10.0
 _S03_POSITION_MIN, _S03_POSITION_MAX = 11.0, 20.0
 
 # S04: диапазоны позиций для сравнения CTR внутри бакета (каталог требует
-# "диапазон позиций, устройств и типов запросов" — device здесь сознательно
-# не участвует, см. докстринг модуля, "S08-S10: обязательный device-разрез").
+# "диапазон позиций, устройств и типов запросов" — S04 использует только
+# известные device; unknown/null не участвуют в CTR-прокси.
 # Второе измерение сравнения — is_brand (бренд/небренд, "типы запросов").
 _S04_POSITION_BUCKETS: tuple[tuple[str, float, float | None], ...] = (
     ("top_1_3", 1.0, 3.0),
@@ -971,9 +964,46 @@ def _run_s03(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
 def _run_s04(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     con = common.open_duckdb(paths)
     try:
-        groups = _aggregate_query_page(con)
+        columns = {str(column[1]) for column in con.execute(
+            "PRAGMA table_info('seo_queries')"
+        ).fetchall()}
+        if "device" not in columns:
+            device_reason = "колонка seo_queries.device отсутствует"
+            groups: list[dict[str, Any]] = []
+        else:
+            known_devices = con.execute(
+                "SELECT DISTINCT lower(trim(CAST(device AS VARCHAR))) FROM seo_queries "
+                "WHERE device IS NOT NULL AND trim(CAST(device AS VARCHAR)) <> '' "
+                f"AND lower(trim(CAST(device AS VARCHAR))) <> '{_UNKNOWN_DEVICE}'"
+            ).fetchall()
+            if not known_devices:
+                device_reason = (
+                    "seo_queries.device не заполнен или содержит только unknown"
+                )
+                groups = []
+            else:
+                device_reason = None
+                groups = _aggregate_query_page(
+                    con,
+                    "WHERE device IS NOT NULL AND trim(CAST(device AS VARCHAR)) <> '' "
+                    f"AND lower(trim(CAST(device AS VARCHAR))) <> '{_UNKNOWN_DEVICE}'",
+                )
     finally:
         con.close()
+
+    if device_reason is not None:
+        common.write_metric_artifact(
+            metrics_dir,
+            "s04",
+            [{
+                "check_id": "S04",
+                "status": "manual_required",
+                "reason": f"S04 требует известного device: {device_reason}",
+                "confidence": _cap("MED", confidence_cap),
+            }],
+            confidence_cap=confidence_cap,
+        )
+        return
 
     by_bucket: dict[tuple[str, bool], list[dict[str, Any]]] = {}
     for g in groups:
@@ -1034,68 +1064,11 @@ def _run_s04(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
 
 # ── S05 — отдельные страницы теряют клики и позиции ─────────────────────────
 def _run_s05(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
-    con = common.open_duckdb(paths)
-    try:
-        by_page_month = con.execute(
-            "SELECT page, month, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
-            "GROUP BY page, month"
-        ).fetchall()
-    finally:
-        con.close()
-
-    by_page: dict[str, dict[str, tuple[int, int]]] = {}
-    for page, month, shows, clicks in by_page_month:
-        by_page.setdefault(page, {})[month] = (int(shows or 0), int(clicks or 0))
-
-    rows: list[dict[str, Any]] = []
-    insufficient_history_count = 0
-    declining_count = 0
-    for page, months_map in sorted(by_page.items()):
-        months = sorted(months_map)
-        if len(months) < 2:
-            insufficient_history_count += 1
-            continue
-        # len(months) >= 2 гарантировано проверкой выше -> mid всегда >= 1.
-        mid = len(months) // 2
-        early_months, late_months = months[:mid], months[mid:]
-        early_shows = sum(months_map[m][0] for m in early_months)
-        early_clicks = sum(months_map[m][1] for m in early_months)
-        late_shows = sum(months_map[m][0] for m in late_months)
-        late_clicks = sum(months_map[m][1] for m in late_months)
-        if early_shows < _S05_MIN_SHOWS_FOR_TREND:
-            continue
-        click_ratio = (late_clicks / early_clicks) if early_clicks > 0 else None
-        declining = click_ratio is not None and click_ratio <= _S05_DECLINE_CLICK_RATIO
-        if declining:
-            declining_count += 1
-        rows.append({
-            "check_id": "S05",
-            "finding": "page_trend",
-            "page": page,
-            "months_available": months,
-            "early_period_months": early_months,
-            "late_period_months": late_months,
-            "early_shows": early_shows,
-            "early_clicks": early_clicks,
-            "late_shows": late_shows,
-            "late_clicks": late_clicks,
-            "click_ratio_late_to_early": round(click_ratio, 3) if click_ratio is not None else None,
-            "decline_ratio_threshold": _S05_DECLINE_CLICK_RATIO,
-            "min_shows_threshold": _S05_MIN_SHOWS_FOR_TREND,
-            "page_declining": bool(declining),
-            "confidence": _cap("MED", confidence_cap),
-        })
-
-    rows.insert(0, {
-        "check_id": "S05",
-        "finding": "summary",
-        "pages_evaluated": len(rows),
-        "pages_declining": declining_count,
-        "pages_with_insufficient_month_history": insufficient_history_count,
-        "confidence": _cap("MED", confidence_cap),
-    })
-
-    common.write_metric_artifact(metrics_dir, "s05", rows, confidence_cap=confidence_cap)
+    _write_unavailable(
+        metrics_dir,
+        "S05",
+        "кластер запросов для сравнения страниц не представлен в canonical seo_queries",
+    )
 
 
 # ── S06 — сезонность vs падение/рост SEO (легаси 5.5) ───────────────────────
@@ -1124,15 +1097,13 @@ def _reconcile_seasonality(
     wordstat_available: bool,
     confidence_cap: str,
 ) -> dict[str, Any]:
-    """Сверить месяцы-аномалии показов seo_queries с недельным спросом Wordstat.
+    """Сверить GSC-анoмалии показов и позиции с недельным спросом Wordstat.
 
-    Если Wordstat подтверждает то же направление отклонения в том же месяце
-    (рыночный спрос тоже вырос/упал) — аномалию объясняет сезонность, а не
-    SEO-проблема; это РЕАЛЬНАЯ проверка (каталог §11, "Что Claude не должен
-    утверждать", п.9 запрещает утверждать SEO-проблему БЕЗ проверки
-    сезонности — здесь сезонность именно проверяется), поэтому confidence
-    поднимается до MED. Без Wordstat (wordstat_available=False) поведение не
-    меняется — LOW/cannot_determine_without_wordstat, как и раньше.
+    Сезонность объясняет аномалию только когда Wordstat движется в ту же
+    сторону, что показы GSC, а средняя позиция не ухудшается. Ухудшение
+    позиции при совпадающем спросе — конфликт направлений: спрос мог изменить
+    объём показов, но есть отдельный SEO-сигнал. Без Wordstat
+    (wordstat_available=False) вердикт остаётся LOW/cannot_determine_without_wordstat.
     """
     base: dict[str, Any] = {
         "check_id": "S06",
@@ -1178,18 +1149,31 @@ def _reconcile_seasonality(
         other_months = [v for m, v in wordstat_monthly.items() if m != month]
         baseline = _median(other_months) if other_months else None
         ratio = (demand / baseline) if baseline else None
-        if anomaly["type"] == "spike":
-            confirmed = ratio is not None and ratio >= _S06_SPIKE_RATIO
+        if ratio is None:
+            wordstat_direction = None
+        elif ratio >= _S06_SPIKE_RATIO:
+            wordstat_direction = "spike"
+        elif ratio <= _S06_DROP_RATIO:
+            wordstat_direction = "drop"
         else:
-            confirmed = ratio is not None and ratio <= _S06_DROP_RATIO
+            wordstat_direction = "stable"
+        directions_match = wordstat_direction == anomaly["type"]
+        position_worsened = anomaly["position_direction"] == "worsened"
+        position_supports_seasonality = anomaly["position_direction"] in {"stable", "improved"}
+        direction_conflict = bool(directions_match and position_worsened)
+        confirmed = bool(directions_match and position_supports_seasonality)
         if not confirmed:
             all_confirmed = False
         per_month.append({
             "month": month,
             "anomaly_type": anomaly["type"],
+            "position_direction": anomaly["position_direction"],
             "wordstat_demand": demand,
             "wordstat_baseline": round(baseline, 2) if baseline is not None else None,
             "wordstat_ratio_to_baseline": round(ratio, 3) if ratio is not None else None,
+            "wordstat_direction": wordstat_direction,
+            "wordstat_direction_matches_shows": directions_match,
+            "direction_conflict": direction_conflict,
             "seasonality_confirmed": confirmed,
         })
 
@@ -1220,44 +1204,101 @@ def _run_s06(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
     con = common.open_duckdb(paths)
     try:
         by_month = con.execute(
-            "SELECT month, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
-            "GROUP BY month ORDER BY month"
+            "SELECT month, SUM(total_shows), SUM(total_clicks), "
+            "SUM(avg_show_position * total_shows) FILTER (WHERE avg_show_position IS NOT NULL), "
+            "SUM(total_shows) FILTER (WHERE avg_show_position IS NOT NULL) "
+            "FROM seo_queries WHERE source = 'gsc' GROUP BY month ORDER BY month"
         ).fetchall()
+        webmaster_present = con.execute(
+            "SELECT COUNT(*) FROM seo_queries WHERE source = 'webmaster'"
+        ).fetchone()[0] > 0
         wordstat_monthly = _wordstat_monthly_demand(con) if wordstat_available else {}
     finally:
         con.close()
 
-    months = [(m, int(s or 0), int(c or 0)) for m, s, c in by_month]
-    rows: list[dict[str, Any]] = [{
+    months = [
+        (m, int(s or 0), int(c or 0), (pos_w / shows_pos) if (pos_w is not None and shows_pos) else None)
+        for m, s, c, pos_w, shows_pos in by_month
+    ]
+    rows: list[dict[str, Any]] = []
+    if webmaster_present:
+        rows.append({
+            "check_id": "S06",
+            "finding": "webmaster_monthly_dynamics",
+            "source": "webmaster",
+            "status": "unavailable",
+            "reason": (
+                "Вебмастер доступен только как снимок за окно; помесячную "
+                "динамику показов и позиции для S06 он не подтверждает."
+            ),
+        })
+
+    if not months:
+        rows.append({
+            "check_id": "S06",
+            "finding": "gsc_monthly_dynamics",
+            "source": "gsc",
+            "status": "unavailable",
+            "reason": "В canonical[\"seo_queries\"] нет помесячных строк GSC для S06.",
+        })
+        common.write_metric_artifact(metrics_dir, "s06", rows, confidence_cap=confidence_cap)
+        return
+
+    rows.append({
         "check_id": "S06",
         "finding": "monthly_shows_trend",
-        "months": [{"month": m, "total_shows": s, "total_clicks": c} for m, s, c in months],
+        "source": "gsc",
+        "months": [
+            {
+                "month": m,
+                "total_shows": s,
+                "total_clicks": c,
+                "avg_show_position": round(position, 4) if position is not None else None,
+            }
+            for m, s, c, position in months
+        ],
         "months_count": len(months),
         "min_months_for_trend": _S06_MIN_MONTHS_FOR_TREND,
         "confidence": _cap("MED", confidence_cap),
-    }]
+    })
 
     anomalies: list[dict[str, Any]] = []
     if len(months) >= _S06_MIN_MONTHS_FOR_TREND:
-        shows_series = [s for _, s, _ in months]
-        med = _median(shows_series)
-        for m, s, c in months:
-            ratio = (s / med) if med else None
+        shows_median = _median([s for _, s, _, _ in months])
+        position_median = _median([p for _, _, _, p in months if p is not None])
+        for m, s, c, position in months:
+            ratio = (s / shows_median) if shows_median else None
             is_spike = ratio is not None and ratio >= _S06_SPIKE_RATIO
             is_drop = ratio is not None and ratio <= _S06_DROP_RATIO
             if not (is_spike or is_drop):
                 continue
             anomaly_type = "spike" if is_spike else "drop"
-            anomalies.append({"month": m, "type": anomaly_type})
+            if position is None or position_median is None:
+                position_direction = "unavailable"
+            elif position > position_median:
+                position_direction = "worsened"
+            elif position < position_median:
+                position_direction = "improved"
+            else:
+                position_direction = "stable"
+            anomalies.append({
+                "month": m,
+                "type": anomaly_type,
+                "position_direction": position_direction,
+            })
             rows.append({
                 "check_id": "S06",
                 "finding": "monthly_shows_anomaly",
+                "source": "gsc",
                 "month": m,
                 "total_shows": s,
                 "total_clicks": c,
-                "baseline_median_shows": round(med, 2) if med is not None else None,
+                "avg_show_position": round(position, 4) if position is not None else None,
+                "baseline_median_shows": round(shows_median, 2) if shows_median is not None else None,
+                "baseline_median_position": round(position_median, 4) if position_median is not None else None,
                 "ratio_to_baseline": round(ratio, 3) if ratio is not None else None,
                 "anomaly_type": anomaly_type,
+                "position_direction": position_direction,
                 "spike_ratio_threshold": _S06_SPIKE_RATIO,
                 "drop_ratio_threshold": _S06_DROP_RATIO,
                 "confidence": _cap("MED", confidence_cap),
@@ -1591,12 +1632,28 @@ def _run_s08(
 def _run_s09(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     con = common.open_duckdb(paths)
     try:
+        usable_gsc_pages = con.execute(
+            "SELECT COUNT(*) FROM seo_queries "
+            "WHERE source = 'gsc' "
+            "AND NULLIF(TRIM(CAST(page AS VARCHAR)), '') IS NOT NULL"
+        ).fetchone()[0]
+        if not usable_gsc_pages:
+            common.write_metric_artifact(metrics_dir, "s09", [{
+                "check_id": "S09",
+                "status": "manual_required",
+                "reason": "S09 требует GSC page-dimension: все релевантные GSC page пусты",
+                "confidence": _cap("MED", confidence_cap),
+            }], confidence_cap=confidence_cap)
+            return
         overall = con.execute(
-            "SELECT query, page, SUM(total_shows) FROM seo_queries GROUP BY query, page"
+            "SELECT query, page, SUM(total_shows) FROM seo_queries "
+            "WHERE NULLIF(TRIM(CAST(page AS VARCHAR)), '') IS NOT NULL "
+            "GROUP BY query, page"
         ).fetchall()
         by_device = con.execute(
             "SELECT query, device, page, SUM(total_shows) FROM seo_queries "
-            f"WHERE {_exclude_unknown_device_sql()} GROUP BY query, device, page"
+            "WHERE NULLIF(TRIM(CAST(page AS VARCHAR)), '') IS NOT NULL "
+            f"AND {_exclude_unknown_device_sql()} GROUP BY query, device, page"
         ).fetchall()
     finally:
         con.close()
@@ -2802,13 +2859,35 @@ def _run_s24(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     """
     con = common.open_duckdb(paths)
     try:
+        usable_gsc_page_history = con.execute(
+            "SELECT COUNT(*) FROM ("
+            "SELECT page FROM seo_queries "
+            "WHERE source = 'gsc' "
+            "AND NULLIF(TRIM(CAST(page AS VARCHAR)), '') IS NOT NULL "
+            "GROUP BY page HAVING COUNT(DISTINCT month) >= 2"
+            ")"
+        ).fetchone()[0]
+        if not usable_gsc_page_history:
+            common.write_metric_artifact(metrics_dir, "s24", [{
+                "check_id": "S24",
+                "status": "manual_required",
+                "reason": (
+                    "S24 требует GSC page-dimension с минимум двумя месяцами visibility"
+                ),
+                "confidence": _cap("MED", confidence_cap),
+            }], confidence_cap=confidence_cap)
+            return
         by_page_month = con.execute(
             "SELECT page, month, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
+            "WHERE source = 'gsc' "
+            "AND NULLIF(TRIM(CAST(page AS VARCHAR)), '') IS NOT NULL "
             "GROUP BY page, month"
         ).fetchall()
         by_page_device_month = con.execute(
             "SELECT page, device, month, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
-            f"WHERE {_exclude_unknown_device_sql()} GROUP BY page, device, month"
+            "WHERE source = 'gsc' "
+            "AND NULLIF(TRIM(CAST(page AS VARCHAR)), '') IS NOT NULL "
+            f"AND {_exclude_unknown_device_sql()} GROUP BY page, device, month"
         ).fetchall()
         organic_by_page = _organic_visits_by_page(con)
         organic_by_page_device = _organic_visits_by_page_device(con)

@@ -3,14 +3,17 @@
 Проверки (config/methodology.yaml, catalog-proveryaemyh-marketingovyh-ugroz-v2.md §7):
     T01  внешние ссылки не размечены UTM                       [visits]
     T02  наивная модель против corrected lastsign               [visits]
-    T03  self-referral через смену домена/платёжки/виджета      [visits]
-    T04  каналы сравниваются по разным моделям атрибуции        [visits, costs]
+    T03  self-referral через смену домена/платёжки/виджета      [visits, referer_domains]
+    T04  каналы сравниваются по разным моделям атрибуции        [visits, costs,
+                                                                  goal_attribution_models]
     T05  брендовый и небрендовый спрос смешаны                  [seo_queries] (+direct_queries)
     T06  звонки/карты/мессенджеры/офлайн-обращения невидимы     [client_answers] (+visits)
     T07  cookie-визит трактуется как клиент                     [visits]
-    T08  зависимость от одного канала/кампании                  [visits] (+costs)
+    T08  зависимость от одного канала/кампании                  [visits, costs,
+                                                                  visit_campaign_map]
     T09  аномалия канала — поломка измерений                    [visits] (+costs, client_answers)
-    T10  реферальный спам/боты/технические домены                [visits]
+    T10  реферальный спам/боты/технические домены                [visits, referer_domains,
+                                                                  referral_geo]
 
 Контракт:
     Читает   — data/canonical/{visits,costs,direct_campaigns,direct_queries,
@@ -49,34 +52,19 @@ per-channel наивный/corrected дельта для ad/organic). Прямо
 пишет unavailable, а не считает по суррогату (не подменять отсутствующие
 данные).
 
-── T03 — session-break, БЕЗ домена (структурное ограничение) ───────────────
+── T03 — self-referral: реестровая недоступность без домена ─────────────────
 Каталог требует «цепочки доменов, рефереры и разрывы сессий». Сырой referer/
 домен перехода (``ym:s:referer``) НЕ входит в SCHEMAS["visits"]
 (build_canonical.py) — экстрактор запрашивает поле у Logs API (см.
 VISIT_FIELDS_BASE, src/extract/metrika_logs.py), но transform не переносит
-его в canonical; расширение схемы вне allowed_files этой задачи (тот же
-прецедент, что A07/A16/A25 в block1.py — «нет данных, проверка не
-придумывается»). Автоматически доступна только ЧАСТЬ угрозы — частота и
-доля разрывов сессии (internal/undefined -> carry-forward, тот же признак,
-что и T02) — это и считается здесь. Определение КОНКРЕТНОГО домена
-(платёжка/виджет/поддомен), ответственного за разрыв, — ручная проверка
-(site_crawl/Вебвизор), что и отражено в methodology.yaml как
-``type_default: "A+B"`` (частичная автоматизация). Артефакт t03 явно
-помечает эту границу полем ``domain_level_detection_available: false``,
-не молчит о сужении.
+его в canonical. Поэтому T03 требует реестровый вход ``referer_domains``
+и без него не запускается; частота internal/undefined не является
+заменой проверки self-referral и не публикуется как её verdict.
 
-── T10 — эвристика referral-спама, БЕЗ данных о боте/UA ─────────────────────
-Тот же структурный пробел (нет referer-домена, нет user-agent/бот-флага —
-D11, постоянное ограничение) не позволяет опознать конкретный
-спам-домен/бота по имени. Доступный прокси — повторяемость визитов одного
-client_id в группе source_final='referral' в сочетании с нулевой
-вовлечённостью (ни одного form_open/form_submit/call_click/messenger_click
-за все визиты этого client_id) — оба сигнала прямо названы каталогом
-(«поведение», «повторяемость визитов»). «Географию» каталог тоже называет,
-но в visits нет достаточно гранулярного признака происхождения именно
-referral-визита (region_country/region_city — это гео пользователя, не
-гео реферера) — не используется здесь, чтобы не выдавать несвязанный сигнал
-за подтверждение спама.
+── T10 — реестровая недоступность без referer и гео ─────────────────────────
+Каталог требует одновременно реферер, поведение, географию и повторяемость.
+Без ``referer_domains`` и ``referral_geo`` T10 не запускается реестром:
+повторяемость cookie с нулевой вовлечённостью не подменяет этот контракт.
 """
 
 from __future__ import annotations
@@ -170,6 +158,17 @@ def _confidence_caps(paths: Any) -> dict[str, str]:
     }
 
 
+def _registry_unavailable_reasons(paths: Any) -> dict[str, str]:
+    """Причины невыполнимости из реестра текущего compute-прогона."""
+    report = common.load_degradation(paths)
+    return {
+        check.get("check_id"): check.get("reason_if_not_runnable")
+        for check in (report.get("checks") or [])
+        if check.get("check_id") and check.get("runnable") is False
+        and check.get("reason_if_not_runnable")
+    }
+
+
 def _cap(confidence: str, confidence_cap: str) -> str:
     """Прижать confidence к потолку проверки (compute капает вниз, не поднимает)."""
     return degradation_mod.min_confidence(confidence, confidence_cap)
@@ -186,6 +185,16 @@ def _write_unavailable(metrics_dir: Path, check_id: str, reason: str) -> None:
         metrics_dir,
         check_id.lower(),
         [{"check_id": check_id, "status": "unavailable", "reason": reason}],
+    )
+
+
+def _write_contract_unavailable(metrics_dir: Path, check_id: str, requirement: str) -> None:
+    """Не выдавать verdict при обходе реестра без обязательного контракта."""
+    _write_unavailable(
+        metrics_dir,
+        check_id,
+        f"обязательный контракт {requirement} отсутствует; проверка должна быть "
+        "остановлена реестром деградации",
     )
 
 
@@ -417,85 +426,7 @@ def _run_t02(
 def _run_t03(
     paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_dir: Path,
 ) -> None:
-    min_sample = int(defaults.get("min_sample_visits", 500))
-    required_columns = {
-        "last_sign_traffic_source_raw", "traffic_source_resolved", "source_group_resolved",
-    }
-
-    con = common.open_duckdb(paths)
-    try:
-        columns = _table_columns(con, "visits")
-        if not required_columns <= columns:
-            con.close()
-            _write_unavailable(
-                metrics_dir, "T03",
-                "колонки carry-forward (last_sign_traffic_source_raw / "
-                "traffic_source_resolved / source_group_resolved) отсутствуют в "
-                "visits.parquet — обязательный шаг methodology v2 §5 не выполнен "
-                "на этапе transform для этой выгрузки",
-            )
-            return
-
-        total_visits, ambiguous_total, ambiguous_resolved = con.execute(
-            "SELECT COUNT(*), "
-            "COUNT(*) FILTER (WHERE lower(trim(last_sign_traffic_source_raw)) "
-            "IN ('internal', 'undefined')), "
-            "COUNT(*) FILTER (WHERE lower(trim(last_sign_traffic_source_raw)) "
-            "IN ('internal', 'undefined') AND traffic_source_resolved) "
-            "FROM visits"
-        ).fetchone()
-
-        by_resolved_group = con.execute(
-            "SELECT source_group_resolved, COUNT(*) FROM visits "
-            "WHERE lower(trim(last_sign_traffic_source_raw)) IN ('internal', 'undefined') "
-            "AND traffic_source_resolved "
-            "GROUP BY source_group_resolved"
-        ).fetchall()
-    finally:
-        con.close()
-
-    total_visits = int(total_visits or 0)
-    ambiguous_total = int(ambiguous_total or 0)
-    ambiguous_resolved = int(ambiguous_resolved or 0)
-    ambiguous_unresolved = ambiguous_total - ambiguous_resolved
-    ambiguous_share = (ambiguous_total / total_visits) if total_visits else None
-    resolved_share = (ambiguous_resolved / ambiguous_total) if ambiguous_total else None
-
-    rows: list[dict[str, Any]] = [{
-        "check_id": "T03",
-        "finding": "session_break_summary",
-        "total_visits": total_visits,
-        "session_break_visits": ambiguous_total,
-        "session_break_share": round(ambiguous_share, 4) if ambiguous_share is not None else None,
-        "session_break_resolved": ambiguous_resolved,
-        "session_break_unresolved": ambiguous_unresolved,
-        "session_break_resolved_share": (
-            round(resolved_share, 4) if resolved_share is not None else None
-        ),
-        "domain_level_detection_available": False,
-        "limitation": (
-            "Сырой referer/домен перехода не входит в canonical-слой visits "
-            "(структурное ограничение extract/transform, вне allowed_files этой "
-            "задачи) — автоматически оценена только частота разрывов сессии, "
-            "конкретный домен-источник требует ручной проверки (site_crawl/"
-            "Вебвизор), см. type_default=A+B в methodology.yaml."
-        ),
-        "confidence": _cap(
-            _sample_confidence(total_visits, min_sample) if total_visits > 0 else "LOW",
-            confidence_cap,
-        ),
-    }]
-
-    for group, cnt in by_resolved_group:
-        rows.append({
-            "check_id": "T03",
-            "finding": "resolved_into_group",
-            "source_group_resolved": group,
-            "visit_count": int(cnt or 0),
-            "confidence": _cap("MED", confidence_cap),
-        })
-
-    common.write_metric_artifact(metrics_dir, "t03", rows, confidence_cap=confidence_cap)
+    _write_contract_unavailable(metrics_dir, "T03", "referer_domains")
 
 
 # ── T04 — каналы сравниваются по разным моделям атрибуции ──────────────────
@@ -503,93 +434,7 @@ def _run_t04(
     paths: Any, config: dict[str, Any], canonical: dict[str, Path],
     confidence_cap: str, metrics_dir: Path,
 ) -> None:
-    goal_ids = _macro_goal_ids(config)
-
-    con = common.open_duckdb(paths)
-    try:
-        ad_visits, ad_conversions = con.execute(
-            "SELECT COUNT(*), COUNT(*) FILTER (WHERE form_submit) "
-            "FROM visits WHERE source_final = 'ad'"
-        ).fetchone()
-
-        direct_clicks = None
-        if "costs" in canonical and _table_nonempty(canonical["costs"]):
-            r = con.execute(
-                "SELECT SUM(clicks) FROM costs WHERE source_tag = 'direct'"
-            ).fetchone()
-            direct_clicks = int(r[0]) if r and r[0] is not None else None
-
-        direct_conversions = None
-        if "direct_campaigns" in canonical and _table_nonempty(canonical["direct_campaigns"]):
-            expr = _net_conversions_expr(con, "direct_campaigns", goal_ids)
-            if expr is not None:
-                r = con.execute(f"SELECT SUM({expr}) FROM direct_campaigns").fetchone()
-                direct_conversions = int(r[0] or 0) if r else None
-    finally:
-        con.close()
-
-    ad_visits = int(ad_visits or 0)
-    ad_conversions = int(ad_conversions or 0)
-
-    visit_click_ratio = (ad_visits / direct_clicks) if direct_clicks else None
-    rows: list[dict[str, Any]] = [{
-        "check_id": "T04",
-        "finding": "visit_click_reconciliation",
-        "ad_visits": ad_visits,
-        "direct_clicks": direct_clicks,
-        "visit_to_click_ratio": (
-            round(visit_click_ratio, 3) if visit_click_ratio is not None else None
-        ),
-        "spend_attribution_model": "direct_platform_clicks",
-        "visit_attribution_model": "metrika_lastsign_visit_level",
-        "confidence": _cap("MED", confidence_cap),
-    }]
-
-    if direct_conversions is None:
-        rows.append({
-            "check_id": "T04",
-            "finding": "conversion_model_reconciliation",
-            "status": "unavailable",
-            "reason": (
-                "нет чистых конверсий по кампаниям Директа: macro_goals не "
-                "настроены в config.sources.direct или direct_campaigns недоступна"
-            ),
-            "confidence": _cap("LOW", confidence_cap),
-        })
-    elif (
-        ad_conversions < _T04_MIN_CONVERSIONS_FOR_COMPARISON
-        or direct_conversions < _T04_MIN_CONVERSIONS_FOR_COMPARISON
-    ):
-        rows.append({
-            "check_id": "T04",
-            "finding": "conversion_model_reconciliation",
-            "metrika_ad_conversions": ad_conversions,
-            "direct_conversions": direct_conversions,
-            "min_conversions_threshold": _T04_MIN_CONVERSIONS_FOR_COMPARISON,
-            "insufficient_sample_for_comparison": True,
-            "confidence": _cap("LOW", confidence_cap),
-        })
-    else:
-        ratio = direct_conversions / ad_conversions if ad_conversions else None
-        diverges = ratio is not None and not (
-            _T04_ATTRIBUTION_MISMATCH_RATIO_LOW <= ratio <= _T04_ATTRIBUTION_MISMATCH_RATIO_HIGH
-        )
-        rows.append({
-            "check_id": "T04",
-            "finding": "conversion_model_reconciliation",
-            "metrika_ad_conversions": ad_conversions,
-            "direct_conversions": direct_conversions,
-            "direct_to_metrika_ratio": round(ratio, 3) if ratio is not None else None,
-            "mismatch_ratio_band": [
-                _T04_ATTRIBUTION_MISMATCH_RATIO_LOW, _T04_ATTRIBUTION_MISMATCH_RATIO_HIGH,
-            ],
-            "attribution_models_diverge": bool(diverges),
-            "spend_attribution_model": "direct_server_side_goal_conv",
-            "visit_conversion_attribution_model": "metrika_lastsign_visit_level",
-            "confidence": _cap("MED", confidence_cap),
-        })
-
-    common.write_metric_artifact(metrics_dir, "t04", rows, confidence_cap=confidence_cap)
+    _write_contract_unavailable(metrics_dir, "T04", "goal_attribution_models")
 
 
 # ── T05 — брендовый и небрендовый спрос смешаны ─────────────────────────────
@@ -821,104 +666,13 @@ def _run_t08(
     paths: Any, defaults: dict[str, Any], canonical: dict[str, Path],
     confidence_cap: str, metrics_dir: Path,
 ) -> None:
-    min_sample = int(defaults.get("min_sample_visits", 500))
-
-    con = common.open_duckdb(paths)
-    try:
-        total_visits = int(con.execute("SELECT COUNT(*) FROM visits").fetchone()[0] or 0)
-        by_channel = con.execute(
-            "SELECT source_final, COUNT(*), COUNT(*) FILTER (WHERE form_submit) "
-            "FROM visits GROUP BY source_final"
-        ).fetchall()
-
-        campaign_spend: list[tuple[Any, ...]] = []
-        if "costs" in canonical and _table_nonempty(canonical["costs"]):
-            campaign_spend = con.execute(
-                "SELECT campaign_id, "
-                "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
-                "COUNT(*) FILTER (WHERE cost_normalized IS NULL) "
-                "FROM costs WHERE source_tag = 'direct' AND campaign_id IS NOT NULL "
-                "GROUP BY campaign_id"
-            ).fetchall()
-    finally:
-        con.close()
-
-    total_conversions = sum(int(conv or 0) for _, _, conv in by_channel)
-
-    channel_rows: list[dict[str, Any]] = []
-    dominant_channel = None
-    dominant_channel_share = None
-    for source_final, cnt, conv in by_channel:
-        cnt = int(cnt or 0)
-        conv = int(conv or 0)
-        visit_share = (cnt / total_visits) if total_visits else 0.0
-        conv_share = (conv / total_conversions) if total_conversions else None
-        if dominant_channel_share is None or visit_share > dominant_channel_share:
-            dominant_channel_share = visit_share
-            dominant_channel = source_final
-        channel_rows.append({
-            "check_id": "T08",
-            "finding": "channel_share",
-            "channel": source_final,
-            "visit_count": cnt,
-            "visit_share": round(visit_share, 4),
-            "conversion_count": conv,
-            "conversion_share": round(conv_share, 4) if conv_share is not None else None,
-            "confidence": _cap(
-                _sample_confidence(cnt, min_sample) if cnt > 0 else "LOW", confidence_cap,
-            ),
-        })
-
-    rows: list[dict[str, Any]] = [{
-        "check_id": "T08",
-        "finding": "channel_concentration_summary",
-        "total_visits": total_visits,
-        "dominant_channel": dominant_channel,
-        "dominant_channel_share": (
-            round(dominant_channel_share, 4) if dominant_channel_share is not None else None
-        ),
-        "concentration_threshold": _T08_CHANNEL_CONCENTRATION_SHARE,
-        "channel_concentration_risk": bool(
-            total_visits >= _T08_MIN_VISITS_FOR_CHECK
-            and dominant_channel_share is not None
-            and dominant_channel_share >= _T08_CHANNEL_CONCENTRATION_SHARE
-        ),
-        "confidence": _cap(
-            _sample_confidence(total_visits, min_sample) if total_visits > 0 else "LOW",
-            confidence_cap,
-        ),
-    }]
-    rows.extend(channel_rows)
-
-    if campaign_spend:
-        priced = [
-            (cid, _money(cost_sum, int(null_rows or 0)))
-            for cid, cost_sum, null_rows in campaign_spend
-        ]
-        priced = [(cid, cost) for cid, cost in priced if cost is not None]
-        total_cost = sum(cost for _, cost in priced)
-        if priced and total_cost > 0:
-            dominant_campaign_id, dominant_campaign_cost = max(priced, key=lambda p: p[1])
-            dominant_campaign_share = dominant_campaign_cost / total_cost
-            rows.append({
-                "check_id": "T08",
-                "finding": "campaign_spend_concentration",
-                "total_campaigns": len(priced),
-                "dominant_campaign_id": dominant_campaign_id,
-                "dominant_campaign_spend_rub": round(dominant_campaign_cost, 2),
-                "dominant_campaign_spend_share": round(dominant_campaign_share, 4),
-                "concentration_threshold": _T08_CAMPAIGN_CONCENTRATION_SHARE,
-                "campaign_concentration_risk": bool(
-                    dominant_campaign_share >= _T08_CAMPAIGN_CONCENTRATION_SHARE
-                ),
-                "confidence": _cap("MED", confidence_cap),
-            })
-
-    common.write_metric_artifact(metrics_dir, "t08", rows, confidence_cap=confidence_cap)
+    _write_contract_unavailable(metrics_dir, "T08", "visit_campaign_map")
 
 
 # ── T09 — резкий рост/падение канала вызван поломкой измерений ─────────────
-def _run_t09(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
+def _run_t09(
+    paths: Any, canonical: dict[str, Path], confidence_cap: str, metrics_dir: Path,
+) -> None:
     con = common.open_duckdb(paths)
     try:
         daily = con.execute(
@@ -944,6 +698,14 @@ def _run_t09(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
         except ValueError:
             continue
 
+    change_log_available = bool(change_dates)
+    independent_series_available = _table_nonempty(canonical.get("channel_daily_reference"))
+    cause_missing: list[str] = []
+    if not change_log_available:
+        cause_missing.append("журнал изменений")
+    if not independent_series_available:
+        cause_missing.append("независимый ряд канала")
+
     anomaly_rows: list[dict[str, Any]] = []
     channels_evaluated = 0
     for channel, series in sorted(by_channel.items()):
@@ -959,13 +721,9 @@ def _run_t09(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
             is_drop = ratio is not None and ratio <= _T09_DROP_RATIO
             if not (is_spike or is_drop):
                 continue
-            explained = any(
-                abs((visit_date - cd).days) <= _T09_CHANGE_LOG_CORRELATION_DAYS
-                for cd in change_dates
-            )
             anomaly_rows.append({
                 "check_id": "T09",
-                "finding": "channel_anomaly",
+                "finding": "channel_anomaly_context",
                 "channel": channel,
                 "date": visit_date.isoformat(),
                 "visit_count": cnt,
@@ -974,17 +732,27 @@ def _run_t09(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
                 "anomaly_type": "spike" if is_spike else "drop",
                 "spike_ratio_threshold": _T09_SPIKE_RATIO,
                 "drop_ratio_threshold": _T09_DROP_RATIO,
-                "explained_by_client_change_log": explained,
+                "causal_claim": False,
                 "confidence": _cap("MED", confidence_cap),
             })
 
     rows: list[dict[str, Any]] = [{
         "check_id": "T09",
         "finding": "summary",
+        "status": "unavailable_for_cause" if not (
+            change_log_available and independent_series_available
+        ) else "context_only",
+        "reason": (
+            "нет источника для вывода о причине: " + "; ".join(cause_missing)
+            if cause_missing else None
+        ),
         "channels_evaluated": channels_evaluated,
         "anomalies_detected": len(anomaly_rows),
         "min_days_for_baseline": _T09_MIN_DAYS_FOR_BASELINE,
         "min_baseline_visits": _T09_MIN_BASELINE_VISITS,
+        "change_log_available": change_log_available,
+        "independent_series_available": independent_series_available,
+        "causal_claim": False,
         "confidence": _cap("MED", confidence_cap),
     }]
     rows.extend(anomaly_rows)
@@ -994,58 +762,7 @@ def _run_t09(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
 
 # ── T10 — реферальный спам, боты или технические домены ────────────────────
 def _run_t10(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
-    con = common.open_duckdb(paths)
-    try:
-        raw_rows = con.execute(
-            "SELECT client_id, entry_page, form_open, form_submit, call_click, "
-            "messenger_click FROM visits WHERE source_final = 'referral'"
-        ).fetchall()
-    finally:
-        con.close()
-
-    by_client: dict[str, dict[str, Any]] = {}
-    for client_id, entry_page, form_open, form_submit, call_click, messenger_click in raw_rows:
-        info = by_client.setdefault(client_id, {
-            "visit_count": 0, "engaged": False, "entry_pages": set(),
-        })
-        info["visit_count"] += 1
-        info["entry_pages"].add(entry_page)
-        if form_open or form_submit or call_click or messenger_click:
-            info["engaged"] = True
-
-    total_referral_visits = len(raw_rows)
-    distinct_client_ids = len(by_client)
-    spam_candidates = {
-        cid: info for cid, info in by_client.items()
-        if info["visit_count"] >= _T10_MIN_VISITS_FOR_SPAM_CANDIDATE and not info["engaged"]
-    }
-    spam_visits = sum(info["visit_count"] for info in spam_candidates.values())
-    spam_visit_share = (spam_visits / total_referral_visits) if total_referral_visits else None
-
-    rows: list[dict[str, Any]] = [{
-        "check_id": "T10",
-        "finding": "summary",
-        "total_referral_visits": total_referral_visits,
-        "distinct_referral_client_ids": distinct_client_ids,
-        "spam_candidate_client_ids": len(spam_candidates),
-        "spam_candidate_visits": spam_visits,
-        "spam_visit_share": round(spam_visit_share, 4) if spam_visit_share is not None else None,
-        "min_visits_for_spam_candidate": _T10_MIN_VISITS_FOR_SPAM_CANDIDATE,
-        "confidence": _cap("MED", confidence_cap),
-    }]
-
-    for cid, info in sorted(spam_candidates.items(), key=lambda kv: -kv[1]["visit_count"]):
-        rows.append({
-            "check_id": "T10",
-            "finding": "spam_candidate",
-            "client_id": cid,
-            "visit_count": info["visit_count"],
-            "distinct_entry_pages": len(info["entry_pages"]),
-            "zero_engagement": True,
-            "confidence": _cap("MED", confidence_cap),
-        })
-
-    common.write_metric_artifact(metrics_dir, "t10", rows, confidence_cap=confidence_cap)
+    _write_contract_unavailable(metrics_dir, "T10", "referer_domains и referral_geo")
 
 
 # ── Диспетчер блока ──────────────────────────────────────────────────────────
@@ -1054,10 +771,17 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
     canonical = common.load_canonical(paths)
     config = orchestrator_mod.load_client_config(paths)
     caps = _confidence_caps(paths)
+    registry_unavailable = _registry_unavailable_reasons(paths)
     metrics_dir = Path(paths.metrics)
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
     artifacts: list[str] = []
+
+    for check_id in ("T03", "T04", "T08", "T10"):
+        reason = registry_unavailable.get(check_id)
+        if reason is not None:
+            _write_unavailable(metrics_dir, check_id, reason)
+            artifacts.append(check_id.lower())
 
     if "T01" in runnable_ids and "visits" in canonical:
         _run_t01(paths, defaults, caps.get("T01", "HIGH"), metrics_dir)
@@ -1067,11 +791,14 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         _run_t02(paths, defaults, caps.get("T02", "HIGH"), metrics_dir)
         artifacts.append("t02")
 
-    if "T03" in runnable_ids and "visits" in canonical:
+    if "T03" in runnable_ids and "T03" not in registry_unavailable and "visits" in canonical:
         _run_t03(paths, defaults, caps.get("T03", "HIGH"), metrics_dir)
         artifacts.append("t03")
 
-    if "T04" in runnable_ids and "visits" in canonical and "costs" in canonical:
+    if (
+        "T04" in runnable_ids and "T04" not in registry_unavailable
+        and "visits" in canonical and "costs" in canonical
+    ):
         _run_t04(paths, config, canonical, caps.get("T04", "HIGH"), metrics_dir)
         artifacts.append("t04")
 
@@ -1087,15 +814,15 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         _run_t07(paths, defaults, caps.get("T07", "HIGH"), metrics_dir)
         artifacts.append("t07")
 
-    if "T08" in runnable_ids and "visits" in canonical:
+    if "T08" in runnable_ids and "T08" not in registry_unavailable and "visits" in canonical:
         _run_t08(paths, defaults, canonical, caps.get("T08", "HIGH"), metrics_dir)
         artifacts.append("t08")
 
     if "T09" in runnable_ids and "visits" in canonical:
-        _run_t09(paths, caps.get("T09", "HIGH"), metrics_dir)
+        _run_t09(paths, canonical, caps.get("T09", "HIGH"), metrics_dir)
         artifacts.append("t09")
 
-    if "T10" in runnable_ids and "visits" in canonical:
+    if "T10" in runnable_ids and "T10" not in registry_unavailable and "visits" in canonical:
         _run_t10(paths, caps.get("T10", "HIGH"), metrics_dir)
         artifacts.append("t10")
 

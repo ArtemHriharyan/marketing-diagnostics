@@ -16,7 +16,11 @@ REPO_ROOT = Path(__file__).parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.pipeline.degradation import evaluate_check, table_source_modes  # noqa: E402
+from src.pipeline.degradation import (  # noqa: E402
+    build_degradation_report,
+    evaluate_check,
+    table_source_modes,
+)
 
 
 def _modes(config=None):
@@ -52,6 +56,70 @@ def test_available_source_is_runnable():
     result = evaluate_check(check, available={"visits"}, source_modes=_modes())
     assert result["runnable"] is True
     assert result["reason_if_not_runnable"] is None
+
+
+def test_manifest_goals_makes_d02_d03_runnable():
+    """goals из manifest extract закрывает requires D02/D03 штатно."""
+    methodology = {
+        "checks": [
+            {"id": check_id, "requires": ["visits", "goals"], "type_default": "A"}
+            for check_id in ("D02", "D03")
+        ]
+    }
+    manifest = {
+        "sources": {
+            "metrika_reports": {"canonical_tables": ["visits", "goals"]},
+        }
+    }
+
+    report = build_degradation_report(methodology, manifest=manifest)
+    assert report["runnable_check_ids"] == ["D02", "D03"]
+
+
+def test_campaign_status_is_api_requirement_for_d08():
+    """D08 штатно skipped, пока extract не объявил campaign_status."""
+    methodology = {"checks": [{"id": "D08", "requires": ["costs", "campaign_status"], "type_default": "A"}]}
+    missing = build_degradation_report(
+        methodology, manifest={"sources": {"direct": {"canonical_tables": ["costs"]}}}
+    )
+    assert missing["runnable_check_ids"] == []
+    assert missing["skipped"][0]["missing"] == ["campaign_status"]
+
+    available = build_degradation_report(
+        methodology,
+        manifest={"sources": {"direct": {"canonical_tables": ["costs", "campaign_status"]}}},
+    )
+    assert available["runnable_check_ids"] == ["D08"]
+    assert available["checks"][0]["source_modes"] == {"costs": "api", "campaign_status": "api"}
+
+
+# ── requires в degradation_report ────────────────────────────────────────────
+
+def test_report_serializes_registry_requires_for_c14_c20_c24():
+    """requires реестра есть в checks и skipped без изменения прежних полей."""
+    methodology = {
+        "checks": [
+            {"id": "C14", "block": 3, "name": "trust", "requires": ["site_crawl", "manual_form_tests"], "type_default": "B"},
+            {"id": "C20", "block": 3, "name": "overlay", "requires": ["webvisor_findings"], "type_default": "B"},
+            {"id": "C24", "block": 3, "name": "availability", "requires": ["visits", "site_crawl"], "type_default": "A+B"},
+        ]
+    }
+
+    report = build_degradation_report(methodology, available={"visits"})
+
+    expected = {
+        "C14": ["site_crawl", "manual_form_tests"],
+        "C20": ["webvisor_findings"],
+        "C24": ["visits", "site_crawl"],
+    }
+    assert {item["id"]: item["requires"] for item in report["skipped"]} == expected
+    assert {item["check_id"]: item["requires"] for item in report["checks"]} == expected
+    assert {item["id"]: item["missing"] for item in report["skipped"]} == {
+        "C14": ["site_crawl", "manual_form_tests"],
+        "C20": ["webvisor_findings"],
+        "C24": ["site_crawl"],
+    }
+    assert all(item["reason"] for item in report["skipped"])
 
 
 # ── 2. type downgrade ────────────────────────────────────────────────────────

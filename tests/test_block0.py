@@ -92,6 +92,26 @@ def _write_costs_d(paths: _Paths, rows: list[dict]) -> None:
     _write_dated_parquet(paths.canonical / "costs.parquet", rows)
 
 
+def _write_campaign_status(paths: _Paths, rows: list[dict]) -> None:
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(paths.canonical / "campaign_status.parquet")
+
+
+def _campaign_status(campaign_id: str, state: str | None, **overrides) -> dict:
+    row = {
+        "campaign_id": campaign_id,
+        "state": state,
+        "status": "ACCEPTED",
+        "status_payment": "ELIGIBLE",
+        "status_clarification": None,
+        "observed_at": "2026-06-30T12:00:00+00:00",
+        "source": "direct.campaigns.get",
+        "requested_states": '["ON", "OFF", "SUSPENDED", "ENDED", "CONVERTED", "ARCHIVED"]',
+    }
+    row.update(overrides)
+    return row
+
+
 def _write_visits_d(paths: _Paths, rows: list[dict]) -> None:
     _write_dated_parquet(paths.canonical / "visits.parquet", rows)
 
@@ -172,7 +192,7 @@ def test_d02_flags_weak_type_goal_named_like_submission(tmp_path):
     ])
     _write_config(paths)
 
-    artifacts = block0.run(paths, DEFAULTS, set())
+    artifacts = block0.run(paths, DEFAULTS, {"D02"})
     assert "d02" in artifacts
     rows = _read_metric(paths, "d02")
     assert rows[0]["suspect_click_not_submit"] is True
@@ -187,7 +207,7 @@ def test_d02_strong_type_goal_not_flagged(tmp_path):
     ])
     _write_config(paths)
 
-    block0.run(paths, DEFAULTS, set())
+    block0.run(paths, DEFAULTS, {"D02"})
     rows = _read_metric(paths, "d02")
     assert rows[0]["suspect_click_not_submit"] is False
     assert rows[0]["is_weak_type"] is False
@@ -207,7 +227,7 @@ def test_d03_detects_goal_group_overlap(tmp_path):
         "call_click_goal_ids": [1, 2],  # 1 попал в обе группы — смешение
     })
 
-    artifacts = block0.run(paths, DEFAULTS, set())
+    artifacts = block0.run(paths, DEFAULTS, {"D03"})
     assert "d03" in artifacts
     rows = _read_metric(paths, "d03")
     overlap_rows = [r for r in rows if r["finding"] == "goal_group_overlap"]
@@ -229,7 +249,7 @@ def test_d03_no_overlap_when_groups_disjoint(tmp_path):
         "call_click_goal_ids": [2],
     })
 
-    block0.run(paths, DEFAULTS, set())
+    block0.run(paths, DEFAULTS, {"D03"})
     rows = _read_metric(paths, "d03")
     overlap_rows = [r for r in rows if r["finding"] == "goal_group_overlap"]
     assert overlap_rows == []
@@ -245,7 +265,7 @@ def test_d02_d03_unavailable_when_goals_missing(tmp_path):
     _write_visits(paths, [_base_visit()])
     # goals.parquet не создаём вовсе.
 
-    artifacts = block0.run(paths, DEFAULTS, set())
+    artifacts = block0.run(paths, DEFAULTS, {"D02", "D03"})
     assert "d02" in artifacts and "d03" in artifacts
 
     for name in ("d02", "d03"):
@@ -260,27 +280,24 @@ def test_d02_d03_unavailable_when_goals_empty(tmp_path):
     _write_visits(paths, [_base_visit()])
     _write_goals(paths, [])  # пустой goals.parquet (0 строк)
 
-    block0.run(paths, DEFAULTS, set())
+    block0.run(paths, DEFAULTS, {"D02", "D03"})
     for name in ("d02", "d03"):
         rows = _read_metric(paths, name)
         assert rows[0]["status"] == "unavailable"
         assert rows[0]["reason"] == "goals metadata недоступна"
 
 
-def test_d02_d03_run_even_when_not_in_runnable_ids_but_goals_present(tmp_path):
-    """Известный разрыв extract-манифеста (4I-goals-canonical) не должен молча
-    блокировать D02/D03, если goals.parquet физически присутствует и непуст."""
+def test_d02_d03_not_run_when_not_in_runnable_ids_even_with_goals(tmp_path):
+    """Непустой старый parquet не заменяет решение degradation."""
     paths = _Paths(tmp_path)
     _write_visits(paths, [_base_visit()])
     _write_goals(paths, [{"goal_id": "1", "name": "Заявка", "type": "url"}])
     _write_config(paths)
 
-    # Пустой runnable_ids — как в реальном прогоне сегодня (D02/D03 никогда не
-    # попадают в runnable_check_ids из-за пробела в CANONICAL_TABLES extract).
     artifacts = block0.run(paths, DEFAULTS, set())
-    rows = _read_metric(paths, "d02")
-    assert "status" not in rows[0]
-    assert rows[0]["goal_id"] == "1"
+    assert "d02" not in artifacts and "d03" not in artifacts
+    assert not (paths.metrics / "d02.json").exists()
+    assert not (paths.metrics / "d03.json").exists()
 
 
 # ── D04 — покрытие трекингом по устройствам ─────────────────────────────────
@@ -402,19 +419,30 @@ def test_d06_no_mismatch_when_answer_matches_and_single_basis(tmp_path):
 
 # ── D07 — расходы неполные или задвоены ─────────────────────────────────────
 
-def test_d07_flags_missing_declared_cost_and_double_counted_budget(tmp_path):
+def _d07_cost_rows(*, include_yandex_business: bool = False, agency_source: str | None = None) -> list[dict]:
+    rows = [
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
+         "campaign_name": "c1", "cost_raw": 1000.0, "cost_normalized": 1000.0,
+         "cost_status": "net", "clicks": 1, "impressions": 1},
+    ]
+    if include_yandex_business:
+        rows.append(
+            {"date": date(2026, 1, 15), "source_tag": "yandex_business", "campaign_id": None,
+             "campaign_name": None, "cost_raw": 500.0, "cost_normalized": 500.0,
+             "cost_status": "net", "clicks": 1, "impressions": 1}
+        )
+    if agency_source:
+        rows.append(
+            {"date": date(2026, 1, 31), "source_tag": agency_source, "campaign_id": None,
+             "campaign_name": None, "cost_raw": 200.0, "cost_normalized": 200.0,
+             "cost_status": "net", "clicks": None, "impressions": None}
+        )
+    return rows
+
+
+def test_d07_uses_canonical_hidden_costs_field(tmp_path):
     paths = _Paths(tmp_path)
-    _write_costs_d(paths, [
-        {"date": d, "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
-         "cost_raw": 1000.0, "cost_normalized": 1000.0, "cost_status": "net",
-         "clicks": 1, "impressions": 1}
-        for d in (date(2026, 1, 1), date(2026, 1, 15))
-    ] + [
-        {"date": d, "source_tag": "yandex_business", "campaign_id": None, "campaign_name": None,
-         "cost_raw": 500.0, "cost_normalized": 500.0, "cost_status": "net",
-         "clicks": 1, "impressions": 1}
-        for d in (date(2026, 1, 1), date(2026, 1, 15))
-    ])
+    _write_costs_d(paths, _d07_cost_rows(include_yandex_business=True))
     _write_client_answers(paths, {
         "finance": {
             "hidden_costs_rub_month": [
@@ -428,28 +456,18 @@ def test_d07_flags_missing_declared_cost_and_double_counted_budget(tmp_path):
     rows = _read_metric(paths, "d07")
     declared = next(r for r in rows if r["finding"] == "declared_cost_check")
     assert declared["missing_in_data"] is True
+    assert declared["declared_cost_field"] == "hidden_costs_rub_month"
     dup = next(r for r in rows if r["finding"] == "possible_double_counted_budget")
     assert dup["both_present"] is True
 
 
-def test_d07_no_finding_when_declared_cost_present_and_no_double_count(tmp_path):
+def test_d07_uses_legacy_costs_outside_cabinet_alias(tmp_path):
     paths = _Paths(tmp_path)
-    # Календарный месяц целиком (31 день января): факт совпадает с заявленным Q02.
-    rows_in = [
-        {"date": date(2026, 1, d), "source_tag": "agency_fee", "campaign_id": None,
-         "campaign_name": None, "cost_raw": 100.0, "cost_normalized": 100.0,
-         "cost_status": "net", "clicks": None, "impressions": None}
-        for d in range(1, 32)
-    ] + [
-        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
-         "campaign_name": "c1", "cost_raw": 500.0, "cost_normalized": 500.0,
-         "cost_status": "net", "clicks": 1, "impressions": 1},
-    ]
-    _write_costs_d(paths, rows_in)
+    _write_costs_d(paths, _d07_cost_rows(agency_source="agency_fee"))
     _write_client_answers(paths, {
         "finance": {
-            "hidden_costs_rub_month": [
-                {"name": "Фикс подрядчика", "rub_month": 3100.0, "source_tag": "agency_fee"},
+            "costs_outside_cabinet": [
+                {"name": "Фикс подрядчика", "rub_month": 200.0, "source_tag": "agency_fee"},
             ]
         }
     })
@@ -459,62 +477,201 @@ def test_d07_no_finding_when_declared_cost_present_and_no_double_count(tmp_path)
     declared = next(r for r in rows if r["finding"] == "declared_cost_check")
     assert declared["missing_in_data"] is False
     assert declared["amount_mismatch"] is False
-    dup = next(r for r in rows if r["finding"] == "possible_double_counted_budget")
-    assert dup["both_present"] is False
+    assert declared["declared_cost_field"] == "costs_outside_cabinet"
 
 
-# ── D08 — архивные/остановленные кампании исключены из истории ─────────────
+def test_d07_accepts_equal_canonical_and_legacy_values_once(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, _d07_cost_rows(agency_source="agency_fee"))
+    declared = [{"name": "Фикс подрядчика", "rub_month": 200.0, "source_tag": "agency_fee"}]
+    _write_client_answers(paths, {
+        "finance": {
+            "hidden_costs_rub_month": declared,
+            "costs_outside_cabinet": list(declared),
+        }
+    })
 
-def test_d08_no_stopped_campaigns_detected_flag(tmp_path):
+    block0.run(paths, DEFAULTS, {"D07"})
+    rows = _read_metric(paths, "d07")
+    assert len([r for r in rows if r["finding"] == "declared_cost_check"]) == 1
+    assert not any(r["finding"] == "conflicting_declared_cost_inputs" for r in rows)
+
+
+def test_d07_reports_conflicting_canonical_and_legacy_values(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, _d07_cost_rows(agency_source="canonical_fee"))
+    _write_client_answers(paths, {
+        "finance": {
+            "hidden_costs_rub_month": [
+                {"name": "Канонический фикс", "rub_month": 200.0, "source_tag": "canonical_fee"},
+            ],
+            "costs_outside_cabinet": [
+                {"name": "Старый фикс", "rub_month": 300.0, "source_tag": "legacy_fee"},
+            ],
+        }
+    })
+
+    block0.run(paths, DEFAULTS, {"D07"})
+    rows = _read_metric(paths, "d07")
+    declared = next(r for r in rows if r["finding"] == "declared_cost_check")
+    conflict = next(r for r in rows if r["finding"] == "conflicting_declared_cost_inputs")
+    assert declared["source_tag"] == "canonical_fee"
+    assert conflict["using_field"] == "hidden_costs_rub_month"
+
+
+def test_d07_reports_malformed_declared_cost_input(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, _d07_cost_rows())
+    _write_client_answers(paths, {
+        "finance": {"hidden_costs_rub_month": {"rub_month": 200.0}}
+    })
+
+    block0.run(paths, DEFAULTS, {"D07"})
+    rows = _read_metric(paths, "d07")
+    malformed = next(r for r in rows if r["finding"] == "malformed_declared_cost_input")
+    assert malformed["field"] == "hidden_costs_rub_month"
+    assert not any(r["finding"] == "declared_cost_check" for r in rows)
+
+
+def test_d07_records_no_declared_cost_as_absent_not_zero(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, _d07_cost_rows())
+    _write_client_answers(paths, {"finance": {}})
+
+    block0.run(paths, DEFAULTS, {"D07"})
+    rows = _read_metric(paths, "d07")
+    assert [r["finding"] for r in rows] == ["possible_double_counted_budget"]
+
+
+# ── D08 — API-статус кампании + historical costs ───────────────────────────
+
+def test_d08_active_campaign_with_spend_is_not_problem(tmp_path):
     paths = _Paths(tmp_path)
     _write_costs_d(paths, [
-        {"date": d, "source_tag": "direct", "campaign_id": cid, "campaign_name": f"camp-{cid}",
+        {"date": d, "source_tag": "direct", "campaign_id": "1", "campaign_name": "camp-1",
          "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
          "clicks": 1, "impressions": 1}
-        for d in (date(2026, 1, 1), date(2026, 1, 31)) for cid in ("1", "2")
+        for d in (date(2026, 1, 1), date(2026, 1, 31))
     ])
+    _write_campaign_status(paths, [_campaign_status("1", "ON")])
 
     artifacts = block0.run(paths, DEFAULTS, {"D08"})
     assert "d08" in artifacts
     rows = _read_metric(paths, "d08")
+    evidence = next(r for r in rows if r["finding"] == "campaign_status_evidence")
     summary = next(r for r in rows if r["finding"] == "summary")
-    assert summary["total_campaigns"] == 2
-    assert summary["stopped_campaign_count"] == 0
-    assert summary["no_stopped_campaigns_detected"] is True
+    assert evidence["state"] == "ON"
+    assert evidence["has_problem"] is False
+    assert summary["coverage_complete"] is True
+    assert summary["status"] == "pass"
 
 
-def test_d08_detects_campaign_stopped_before_window_end(tmp_path):
+def test_d08_archived_and_suspended_with_historical_spend_are_problems(tmp_path):
     paths = _Paths(tmp_path)
     rows_in = [
-        {"date": d, "source_tag": "direct", "campaign_id": "1", "campaign_name": "still-running",
-         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
-         "clicks": 1, "impressions": 1}
-        for d in (date(2026, 1, 1), date(2026, 1, 31))
-    ] + [
-        {"date": d, "source_tag": "direct", "campaign_id": "2", "campaign_name": "stopped-early",
+        {"date": d, "source_tag": "direct", "campaign_id": "1", "campaign_name": "archived",
          "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
          "clicks": 1, "impressions": 1}
         for d in (date(2026, 1, 1), date(2026, 1, 5))
+    ] + [
+        {"date": d, "source_tag": "direct", "campaign_id": "2", "campaign_name": "suspended",
+         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
+         "clicks": 1, "impressions": 1}
+        for d in (date(2026, 1, 1), date(2026, 1, 31))
     ]
     _write_costs_d(paths, rows_in)
+    _write_campaign_status(paths, [
+        _campaign_status("1", "ARCHIVED"), _campaign_status("2", "SUSPENDED"),
+    ])
 
     block0.run(paths, DEFAULTS, {"D08"})
     rows = _read_metric(paths, "d08")
-    stopped_row = next(r for r in rows if r.get("campaign_id") == "2")
-    assert stopped_row["stopped_before_window_end"] is True
+    evidence = [r for r in rows if r["finding"] == "campaign_status_evidence"]
     summary = next(r for r in rows if r["finding"] == "summary")
-    assert summary["stopped_campaign_count"] == 1
-    assert summary["no_stopped_campaigns_detected"] is False
+    assert all(r["has_problem"] is True for r in evidence)
+    assert {r["state"] for r in evidence} == {"ARCHIVED", "SUSPENDED"}
+    assert summary["confirmed_non_active_with_spend_count"] == 2
+    assert summary["status"] == "problem"
+
+
+def test_d08_zero_spend_non_active_campaign_is_not_problem(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, [
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1", "campaign_name": "zero",
+         "cost_raw": 0.0, "cost_normalized": 0.0, "cost_status": "net", "clicks": 0, "impressions": 0},
+        {"date": date(2026, 1, 31), "source_tag": "direct", "campaign_id": "2", "campaign_name": "active",
+         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1},
+    ])
+    _write_campaign_status(paths, [
+        _campaign_status("1", "ARCHIVED"), _campaign_status("2", "ON"),
+    ])
+
+    block0.run(paths, DEFAULTS, {"D08"})
+    evidence = next(r for r in _read_metric(paths, "d08") if r.get("campaign_id") == "1")
+    assert evidence["has_historical_spend"] is False
+    assert evidence["has_problem"] is False
+
+
+def test_d08_not_returned_status_is_coverage_gap_not_finding(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, [{
+        "date": date(2026, 1, 31), "source_tag": "direct", "campaign_id": "1", "campaign_name": "missing",
+        "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1,
+    }])
+    _write_campaign_status(paths, [_campaign_status("2", "ARCHIVED")])
+
+    block0.run(paths, DEFAULTS, {"D08"})
+    rows = _read_metric(paths, "d08")
+    evidence = next(r for r in rows if r["finding"] == "campaign_status_evidence")
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert evidence["coverage_gap"] is True
+    assert evidence["coverage_gap_reason"] == "status_not_returned"
+    assert evidence["has_problem"] is False
+    assert summary["status"] == "unverifiable"
+
+
+def test_d08_partial_coverage_keeps_confirmed_archived_finding_and_caps_confidence(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, [
+        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1", "campaign_name": "archived",
+         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1},
+        {"date": date(2026, 1, 31), "source_tag": "direct", "campaign_id": "2", "campaign_name": "missing",
+         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1},
+    ])
+    _write_campaign_status(paths, [_campaign_status("1", "ARCHIVED")])
+
+    block0.run(paths, DEFAULTS, {"D08"})
+    rows = _read_metric(paths, "d08")
+    archived = next(r for r in rows if r.get("campaign_id") == "1")
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert archived["has_problem"] is True
+    assert archived["confidence"] == "MED"
+    assert summary["coverage_complete"] is False
+    assert summary["coverage_gap_count"] == 1
+
+
+def test_d08_missing_campaign_status_writes_unavailable(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_costs_d(paths, [{
+        "date": date(2026, 1, 31), "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
+        "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1,
+    }])
+
+    artifacts = block0.run(paths, DEFAULTS, {"D08"})
+    assert artifacts == ["d08"]
+    assert _read_metric(paths, "d08") == [{
+        "check_id": "D08", "status": "unavailable", "reason": "нет источника: статусы кампаний Директа",
+    }]
 
 
 def test_d08_confidence_capped_by_degradation_report(tmp_path):
     paths = _Paths(tmp_path)
     _write_costs_d(paths, [
         {"date": d, "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
-         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
-         "clicks": 1, "impressions": 1}
+         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1}
         for d in (date(2026, 1, 1), date(2026, 1, 31))
     ])
+    _write_campaign_status(paths, [_campaign_status("1", "ARCHIVED")])
     paths.metrics.mkdir(parents=True, exist_ok=True)
     report = {"checks": [{"check_id": "D08", "confidence_cap": "LOW"}]}
     (paths.metrics / "degradation_report.json").write_text(json.dumps(report), encoding="utf-8")
@@ -527,47 +684,299 @@ def test_d08_confidence_capped_by_degradation_report(tmp_path):
 
 # ── D09 — периоды/часовые пояса/даты не приведены к единому правилу ────────
 
-def test_d09_flags_incomplete_month_and_period_mismatch(tmp_path):
+def _d09_metrika_contract(
+    date_from: str = "2026-06-01", date_to: str = "2026-06-30", *,
+    offset: int = 180, boundary_semantics: str = "inclusive",
+) -> dict:
+    return {
+        "requested_window": {
+            "date_from": date_from, "date_to": date_to,
+            "boundary_semantics": boundary_semantics,
+        },
+        "fields": {
+            "ym:s:dateTime": {
+                "event": "visit", "data_type": "datetime",
+                "timezone": {
+                    "status": "known", "time_zone_name": "Europe/Moscow",
+                    "time_zone_offset": offset,
+                },
+            },
+            "ym:s:goalsDateTime": {
+                "event": "goal_achievement", "data_type": "array_datetime",
+                "timezone_contract": "UTC+03:00",
+            },
+        },
+    }
+
+
+def _d09_direct_contract(
+    date_from: str = "2026-06-01", date_to: str = "2026-06-30", *,
+    boundary_semantics: str = "inclusive", zero_day_policy: str = "known",
+) -> dict:
+    return {
+        "requested_window": {
+            "date_from": date_from, "date_to": date_to,
+            "boundary_semantics": boundary_semantics,
+        },
+        "zero_day_policy": zero_day_policy,
+        "fields": {
+            "Date": {
+                "event": "direct_statistics_day", "data_type": "date",
+                "timezone_contract": "Europe/Moscow", "evidence": "direct_reports_contract",
+            },
+        },
+    }
+
+
+def _d09_partial(date_from: str, date_to: str) -> dict:
+    return {
+        "first_month": {
+            "month": date_from[:7],
+            "status": "declared_partial" if date_from[-2:] != "01" else "declared_complete",
+        },
+        "last_month": {
+            "month": date_to[:7],
+            "status": "declared_partial" if date_to[-2:] != "30" else "declared_complete",
+        },
+        "basis": "requested_window_only",
+    }
+
+
+def _write_d09_manifest(
+    paths: _Paths,
+    *,
+    metrika: dict | None = None,
+    direct: dict | None = None,
+    goal_status: dict | None = None,
+) -> None:
+    metrika = metrika or _d09_metrika_contract()
+    raw_sources = {"metrika_logs": metrika}
+    canonical_fields = {
+        "visits": {
+            "dt": {
+                "raw_source": "metrika_logs", "raw_field": "ym:s:dateTime",
+                "raw_field_contract": metrika["fields"]["ym:s:dateTime"],
+                "timezone_conversion": "none", "local_time_basis": "counter_local_time",
+            },
+            "date": {
+                "derived_from": "visits.dt",
+                "operation": "calendar_date_without_timezone_conversion",
+            },
+        },
+        "goal_achievements": {
+            "goal_datetime": {
+                "raw_source": "metrika_logs", "raw_field": "ym:s:goalsDateTime",
+                "raw_field_contract": metrika["fields"]["ym:s:goalsDateTime"],
+                "timezone_conversion": "none",
+            },
+        },
+    }
+    partial_months = {
+        "metrika_logs": _d09_partial(
+            metrika["requested_window"]["date_from"], metrika["requested_window"]["date_to"],
+        ),
+    }
+    if direct is not None:
+        raw_sources["direct"] = direct
+        canonical_fields["costs"] = {
+            "date": {
+                "raw_source": "direct", "raw_field": "Date",
+                "raw_field_contract": direct["fields"]["Date"],
+                "timezone_conversion": "none",
+            },
+        }
+        partial_months["direct"] = _d09_partial(
+            direct["requested_window"]["date_from"], direct["requested_window"]["date_to"],
+        )
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    (paths.canonical / "manifest.json").write_text(json.dumps({
+        "temporal_provenance": {
+            "raw_sources": raw_sources,
+            "canonical_fields": canonical_fields,
+            "partial_months": partial_months,
+        },
+        "flags": {"goal_achievements": goal_status or {
+            "status": "available", "mismatched_visits": 0, "malformed_goal_datetime": 0,
+        }},
+    }), encoding="utf-8")
+
+
+def _d09_summary(paths: _Paths) -> dict:
+    return next(row for row in _read_metric(paths, "d09") if row["finding"] == "summary")
+
+
+def test_d09_legacy_manifest_is_unverifiable(tmp_path):
     paths = _Paths(tmp_path)
     _write_visits_d(paths, [
-        _base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1"),
-        _base_visit(date=date(2026, 2, 10), client_id="c2", visit_id="v2"),
+        _base_visit(date=date(2026, 6, 1), client_id="c1", visit_id="v1"),
     ])
-    _write_costs_d(paths, [
-        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
-         "campaign_name": "c1", "cost_raw": 10.0, "cost_normalized": 10.0,
-         "cost_status": "net", "clicks": 1, "impressions": 1},
-    ])
-
-    artifacts = block0.run(paths, DEFAULTS, {"D09"})
-    assert "d09" in artifacts
-    rows = _read_metric(paths, "d09")
-    incomplete = next(r for r in rows if r["finding"] == "incomplete_last_month")
-    assert incomplete["is_incomplete"] is True
-    assert incomplete["last_month"] == "2026-02"
-    mismatch = next(r for r in rows if r["finding"] == "visits_costs_period_mismatch")
-    assert mismatch["mismatch"] is True
+    assert "d09" in block0.run(paths, DEFAULTS, {"D09"})
+    summary = _d09_summary(paths)
+    assert summary["status"] == "unverifiable"
+    assert summary["has_problem"] is False
+    assert summary["reason"] == "canonical_temporal_manifest_missing"
 
 
-def test_d09_no_finding_when_month_complete_and_periods_aligned(tmp_path):
+def test_d09_unknown_boundaries_are_unverifiable_not_problem(tmp_path):
     paths = _Paths(tmp_path)
     _write_visits_d(paths, [
-        _base_visit(date=d, client_id=f"c{d.day}", visit_id=f"v{d.day}")
-        for d in (date(2026, 1, 1), date(2026, 1, 31))
+        _base_visit(date=date(2026, 6, 10), client_id="c1", visit_id="v1"),
     ])
-    _write_costs_d(paths, [
-        {"date": d, "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
-         "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net",
-         "clicks": 1, "impressions": 1}
-        for d in (date(2026, 1, 1), date(2026, 1, 31))
-    ])
+    _write_d09_manifest(paths, metrika=_d09_metrika_contract(boundary_semantics="unknown"))
+    block0.run(paths, DEFAULTS, {"D09"})
+    boundary = next(r for r in _read_metric(paths, "d09") if r["finding"] == "visits_boundary_semantics")
+    assert boundary["status"] == "unverifiable"
+    assert boundary["reason"] == "visits_boundary_semantics_unknown"
+    assert _d09_summary(paths)["status"] == "unverifiable"
+
+
+def test_d09_unknown_direct_boundary_and_zero_day_are_separate_unverifiable_subchecks(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [_base_visit(date=date(2026, 6, 10), client_id="c1", visit_id="v1")])
+    _write_costs_d(paths, [{
+        "date": date(2026, 6, 10), "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
+        "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1,
+    }])
+    _write_d09_manifest(paths, direct=_d09_direct_contract(
+        boundary_semantics="unknown", zero_day_policy="unknown",
+    ))
 
     block0.run(paths, DEFAULTS, {"D09"})
-    rows = _read_metric(paths, "d09")
-    incomplete = next(r for r in rows if r["finding"] == "incomplete_last_month")
-    assert incomplete["is_incomplete"] is False
-    mismatch = next(r for r in rows if r["finding"] == "visits_costs_period_mismatch")
-    assert mismatch["mismatch"] is False
+    rows = {row["finding"]: row for row in _read_metric(paths, "d09")}
+    assert rows["costs_boundary_semantics"]["status"] == "unverifiable"
+    assert rows["costs_zero_day_policy"]["status"] == "unverifiable"
+    assert _d09_summary(paths)["has_problem"] is False
+
+
+def test_d09_passes_for_same_requested_windows_and_compatible_timezones(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [_base_visit(date=date(2026, 6, 10), client_id="c1", visit_id="v1")])
+    _write_costs_d(paths, [{
+        "date": date(2026, 6, 10), "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
+        "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1,
+    }])
+    _write_d09_manifest(paths, direct=_d09_direct_contract())
+
+    block0.run(paths, DEFAULTS, {"D09"})
+    assert _d09_summary(paths)["status"] == "pass"
+
+
+def test_d09_event_date_mapping_conflict_is_problem(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [_base_visit(date=date(2026, 6, 10), client_id="c1", visit_id="v1")])
+    _write_d09_manifest(paths)
+    manifest_path = paths.canonical / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["temporal_provenance"]["canonical_fields"]["visits"]["date"]["operation"] = "utc_date"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    block0.run(paths, DEFAULTS, {"D09"})
+    visits = next(r for r in _read_metric(paths, "d09") if r["finding"] == "visits_contract")
+    assert visits["status"] == "problem"
+    assert visits["reason"] == "visits_event_date_mapping_conflict"
+
+
+def test_d09_requested_window_difference_is_proven_problem(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [_base_visit(date=date(2026, 6, 10), client_id="c1", visit_id="v1")])
+    _write_costs_d(paths, [{
+        "date": date(2026, 6, 10), "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
+        "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1,
+    }])
+    _write_d09_manifest(paths, direct=_d09_direct_contract(date_from="2026-06-02"))
+
+    block0.run(paths, DEFAULTS, {"D09"})
+    row = next(r for r in _read_metric(paths, "d09") if r["finding"] == "visits_costs_requested_window")
+    assert row["status"] == "problem" and row["has_problem"] is True
+    assert _d09_summary(paths)["status"] == "problem"
+
+
+def test_d09_incompatible_known_timezones_are_problem(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [_base_visit(date=date(2026, 6, 10), client_id="c1", visit_id="v1")])
+    _write_costs_d(paths, [{
+        "date": date(2026, 6, 10), "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
+        "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1,
+    }])
+    _write_d09_manifest(paths, metrika=_d09_metrika_contract(offset=600), direct=_d09_direct_contract())
+
+    block0.run(paths, DEFAULTS, {"D09"})
+    row = next(r for r in _read_metric(paths, "d09") if r["finding"] == "costs_contract")
+    assert row["status"] == "problem"
+    assert row["reason"] == "visits_costs_timezone_incompatible"
+
+
+def test_d09_direct_absence_is_not_problem(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [_base_visit(date=date(2026, 6, 10), client_id="c1", visit_id="v1")])
+    _write_d09_manifest(paths)
+
+    block0.run(paths, DEFAULTS, {"D09"})
+    costs = next(r for r in _read_metric(paths, "d09") if r["finding"] == "costs_contract")
+    assert costs["status"] == "not_applicable" and costs["has_problem"] is False
+    assert _d09_summary(paths)["status"] == "pass"
+
+
+def test_d09_declared_partial_and_missing_cost_day_are_not_findings(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [
+        _base_visit(date=date(2026, 6, 3), client_id="c1", visit_id="v1"),
+        _base_visit(date=date(2026, 6, 28), client_id="c2", visit_id="v2"),
+    ])
+    _write_costs_d(paths, [{
+        "date": date(2026, 6, 10), "source_tag": "direct", "campaign_id": "1", "campaign_name": "c1",
+        "cost_raw": 10.0, "cost_normalized": 10.0, "cost_status": "net", "clicks": 1, "impressions": 1,
+    }])
+    metrika = _d09_metrika_contract(date_from="2026-06-03", date_to="2026-06-28")
+    direct = _d09_direct_contract(date_from="2026-06-03", date_to="2026-06-28")
+    _write_d09_manifest(paths, metrika=metrika, direct=direct)
+
+    block0.run(paths, DEFAULTS, {"D09"})
+    partial = next(r for r in _read_metric(paths, "d09") if r["finding"] == "direct_partial_months")
+    assert partial["declared_first_month"]["status"] == "declared_partial"
+    assert partial["has_problem"] is False
+    assert _d09_summary(paths)["status"] == "pass"
+
+
+def test_d09_canonical_date_outside_requested_window_is_problem(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [_base_visit(date=date(2026, 7, 1), client_id="c1", visit_id="v1")])
+    _write_d09_manifest(paths)
+
+    block0.run(paths, DEFAULTS, {"D09"})
+    observed = next(r for r in _read_metric(paths, "d09") if r["finding"] == "visits_observed_range")
+    assert observed["status"] == "problem"
+    assert observed["reason"] == "canonical_dates_outside_requested_window"
+
+
+def test_d09_degraded_goal_achievements_are_unverifiable(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [_base_visit(date=date(2026, 6, 10), client_id="c1", visit_id="v1")])
+    _write_d09_manifest(paths, goal_status={
+        "status": "degraded", "mismatched_visits": 1, "malformed_goal_datetime": 0,
+    })
+
+    block0.run(paths, DEFAULTS, {"D09"})
+    goals = next(r for r in _read_metric(paths, "d09") if r["finding"] == "goal_achievements_contract")
+    assert goals["status"] == "unverifiable"
+    assert goals["reason"] == "goal_achievements_mismatched_visits"
+    assert _d09_summary(paths)["status"] == "unverifiable"
+
+
+def test_d09_confidence_is_capped_and_output_is_deterministic(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits_d(paths, [_base_visit(date=date(2026, 6, 10), client_id="c1", visit_id="v1")])
+    _write_d09_manifest(paths)
+    paths.metrics.mkdir(parents=True, exist_ok=True)
+    (paths.metrics / "degradation_report.json").write_text(
+        json.dumps({"checks": [{"check_id": "D09", "confidence_cap": "LOW"}]}), encoding="utf-8",
+    )
+
+    block0.run(paths, DEFAULTS, {"D09"})
+    first = _read_metric(paths, "d09")
+    block0.run(paths, DEFAULTS, {"D09"})
+    assert _read_metric(paths, "d09") == first
+    assert all(row["confidence"] == "LOW" for row in first)
 
 
 # ── D10 — выгрузка неполная (пагинация/лимиты/фильтры/семплирование) ───────
@@ -650,11 +1059,94 @@ def test_d11_no_high_frequency_and_test_marker_detected(tmp_path):
 
 # ── D12 — таблицы соединяются на неверном уровне детализации ───────────────
 
-def test_d12_detects_duplicate_costs_key(tmp_path):
+def _join_record(**overrides) -> dict:
+    record = {
+        "join_id": "test_join",
+        "tables": {"left": "left_table", "right": "right_table", "output": "output_table"},
+        "keys": ["business_key"],
+        "expected_cardinality": "1:1",
+        "status": "PASS",
+        "pre": {"rows": 1, "distinct_keys": 1, "checksums": {"cost_rub": 10.0},
+                "non_null_counts": {"cost_rub": 1}},
+        "right": {"rows": 1, "distinct_keys": 1, "checksums": {}, "non_null_counts": {}},
+        "post": {"rows": 1, "distinct_keys": 1, "checksums": {"cost_rub": 10.0},
+                 "non_null_counts": {"cost_rub": 1}},
+        "matched": 1,
+        "unmatched": {"left": 0, "right": 0},
+        "unmatched_policy": {"left": "allowed", "right": "forbidden"},
+        "preserved_controls": ["cost_rub"],
+    }
+    record.update(overrides)
+    return record
+
+
+def _write_join_integrity(paths: _Paths, records: list[dict]) -> None:
+    paths.canonical.mkdir(parents=True, exist_ok=True)
+    (paths.canonical / "manifest.json").write_text(
+        json.dumps({"join_integrity": records}), encoding="utf-8",
+    )
+
+
+def _run_d12(paths: _Paths, records: list[dict]) -> list[dict]:
+    _write_visits_d(paths, [_base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1")])
+    _write_join_integrity(paths, records)
+    assert "d12" in block0.run(paths, DEFAULTS, {"D12"})
+    return _read_metric(paths, "d12")
+
+
+def test_d12_accepts_correct_one_to_one_join(tmp_path):
     paths = _Paths(tmp_path)
-    _write_visits_d(paths, [
-        _base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1"),
-    ])
+    rows = _run_d12(paths, [_join_record()])
+    assert rows == [{"check_id": "D12", "join_id": "test_join", "status": "pass",
+                     "violations": [], "has_problem": False, "confidence": "HIGH"}]
+
+
+def test_d12_detects_fan_out(tmp_path):
+    paths = _Paths(tmp_path)
+    record = _join_record(post={"rows": 2, "distinct_keys": 2, "checksums": {"cost_rub": 20.0},
+                                "non_null_counts": {"cost_rub": 2}})
+    row = _run_d12(paths, [record])[0]
+    assert row["status"] == "problem"
+    assert "fan_out_rows" in row["violations"]
+
+
+def test_d12_detects_preserved_checksum_mismatch(tmp_path):
+    paths = _Paths(tmp_path)
+    record = _join_record(post={"rows": 1, "distinct_keys": 1, "checksums": {"cost_rub": 9.0},
+                                "non_null_counts": {"cost_rub": 1}})
+    row = _run_d12(paths, [record])[0]
+    assert row["status"] == "problem"
+    assert "checksum_mismatch_cost_rub" in row["violations"]
+
+
+def test_d12_detects_required_unmatched(tmp_path):
+    paths = _Paths(tmp_path)
+    record = _join_record(right={"rows": 2, "distinct_keys": 2, "checksums": {}, "non_null_counts": {}},
+                          matched=1, unmatched={"left": 0, "right": 1})
+    row = _run_d12(paths, [record])[0]
+    assert row["status"] == "problem"
+    assert "required_match_unmatched_right" in row["violations"]
+
+
+def test_d12_marks_missing_controls_unverifiable(tmp_path):
+    paths = _Paths(tmp_path)
+    record = _join_record(post={"rows": 1, "distinct_keys": 1, "checksums": {},
+                                "non_null_counts": {"cost_rub": 1}})
+    row = _run_d12(paths, [record])[0]
+    assert row["status"] == "unverifiable"
+    assert "post_checksum_cost_rub_absent" in row["missing_controls"]
+
+
+def test_d12_not_applicable_is_not_problem(tmp_path):
+    paths = _Paths(tmp_path)
+    record = _join_record(status="NOT_APPLICABLE", reason="source_absent")
+    row = _run_d12(paths, [record])[0]
+    assert row["status"] == "not_applicable"
+    assert row["has_problem"] is False
+
+
+def test_d12_does_not_treat_costs_segmentation_as_fan_out(tmp_path):
+    paths = _Paths(tmp_path)
     _write_costs_d(paths, [
         {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
          "campaign_name": "c1", "cost_raw": 10.0, "cost_normalized": 10.0,
@@ -663,50 +1155,20 @@ def test_d12_detects_duplicate_costs_key(tmp_path):
          "campaign_name": "c1", "cost_raw": 10.0, "cost_normalized": 10.0,
          "cost_status": "net", "clicks": 1, "impressions": 1},
     ])
-
-    artifacts = block0.run(paths, DEFAULTS, {"D12"})
-    assert "d12" in artifacts
-    rows = _read_metric(paths, "d12")
-    costs_row = next(r for r in rows if r["table"] == "costs")
-    assert costs_row["has_duplicate_keys"] is True
-    assert costs_row["duplicate_key_count"] == 1
-    visits_row = next(r for r in rows if r["table"] == "visits")
-    assert visits_row["has_duplicate_keys"] is False
-
-
-def test_d12_no_duplicates_when_keys_unique(tmp_path):
-    paths = _Paths(tmp_path)
-    _write_visits_d(paths, [
-        _base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1"),
-        _base_visit(date=date(2026, 1, 2), client_id="c2", visit_id="v2"),
-    ])
-    _write_costs_d(paths, [
-        {"date": date(2026, 1, 1), "source_tag": "direct", "campaign_id": "1",
-         "campaign_name": "c1", "cost_raw": 10.0, "cost_normalized": 10.0,
-         "cost_status": "net", "clicks": 1, "impressions": 1},
-        {"date": date(2026, 1, 2), "source_tag": "direct", "campaign_id": "1",
-         "campaign_name": "c1", "cost_raw": 10.0, "cost_normalized": 10.0,
-         "cost_status": "net", "clicks": 1, "impressions": 1},
-    ])
-
-    block0.run(paths, DEFAULTS, {"D12"})
-    rows = _read_metric(paths, "d12")
-    assert all(r["has_duplicate_keys"] is False for r in rows)
+    row = _run_d12(paths, [_join_record()])[0]
+    assert row["status"] == "pass"
+    assert row["has_problem"] is False
 
 
 def test_d12_confidence_capped_by_degradation_report(tmp_path):
     paths = _Paths(tmp_path)
-    _write_visits_d(paths, [
-        _base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1"),
-    ])
+    _write_visits_d(paths, [_base_visit(date=date(2026, 1, 1), client_id="c1", visit_id="v1")])
+    _write_join_integrity(paths, [_join_record()])
     paths.metrics.mkdir(parents=True, exist_ok=True)
     report = {"checks": [{"check_id": "D12", "confidence_cap": "MED"}]}
     (paths.metrics / "degradation_report.json").write_text(json.dumps(report), encoding="utf-8")
-
     block0.run(paths, DEFAULTS, {"D12"})
-    rows = _read_metric(paths, "d12")
-    # visits-строка сама по себе была бы HIGH (точный подсчёт дублей) — не выше потолка.
-    assert all(r["confidence"] == "MED" for r in rows)
+    assert _read_metric(paths, "d12")[0]["confidence"] == "MED"
 
 
 # ── confidence_cap — compute капает вниз, никогда не поднимает ─────────────

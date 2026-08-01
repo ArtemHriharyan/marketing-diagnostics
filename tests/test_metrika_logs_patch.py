@@ -102,8 +102,14 @@ def _evaluate_route(get_session, bad=frozenset()):
     return (lambda m, u: m == "GET" and u.endswith("/logrequests/evaluate"), responder)
 
 
-def _full_routes(box, *, bad=frozenset(), request_id=900, part_text=None):
+def _full_routes(
+    box, *, bad=frozenset(), request_id=900, part_text=None,
+    counter_metadata=None,
+):
     part_text = part_text or "ym:s:visitID\nv1\n"
+    counter_metadata = counter_metadata or {
+        "counter": {"time_zone_name": "Asia/Yekaterinburg", "time_zone_offset": 300},
+    }
 
     def poll_responder(n):
         status = "created" if n == 0 else "processed"
@@ -112,6 +118,8 @@ def _full_routes(box, *, bad=frozenset(), request_id=900, part_text=None):
             "request_id": request_id, "status": status, "parts": parts}})
 
     return [
+        (lambda m, u: m == "GET" and u.endswith("/counter/12345"),
+         FakeResponse(json_data=counter_metadata)),
         _evaluate_route(lambda: box["session"], bad=bad),
         (lambda m, u: m == "POST" and u.endswith("/logrequests"),
          FakeResponse(json_data={"log_request": {"request_id": request_id, "status": "created"}})),
@@ -274,6 +282,54 @@ def test_goal_array_fields_round_trip_unmodified(paths):
     goal_dts = cells["ym:s:goalsDateTime"].split(",")
     goal_sns = cells["ym:s:goalsSerialNumber"].split(",")
     assert len(goal_ids) == len(goal_dts) == len(goal_sns) == 3
+
+
+def test_temporal_provenance_uses_exact_counter_timezone_metadata(paths):
+    """Timezone визита берётся буквально из GET /counter, без нормализации."""
+    box = {}
+    session = FakeSession(_full_routes(
+        box,
+        counter_metadata={"counter": {"time_zone_name": "Asia/Vladivostok", "time_zone_offset": 600}},
+    ))
+    box["session"] = session
+
+    metrika_logs.extract(CONFIG_METRIKA, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    provenance = manifest_mod.load_manifest(paths.raw)["sources"]["metrika_logs"]["temporal_provenance"]
+    assert provenance["requested_window"] == {
+        "date_from": "2026-06-01",
+        "date_to": "2026-06-30",
+        "boundary_semantics": "unknown",
+    }
+    assert provenance["fields"]["ym:s:dateTime"]["timezone"] == {
+        "status": "known",
+        "time_zone_name": "Asia/Vladivostok",
+        "time_zone_offset": 600,
+        "evidence": "metrika_management_counter",
+    }
+    assert provenance["fields"]["ym:s:dateTime"]["event"] == "visit"
+    assert provenance["fields"]["ym:s:goalsDateTime"] == {
+        "event": "goal_achievement",
+        "data_type": "array_datetime",
+        "timezone_contract": "UTC+03:00",
+    }
+
+
+def test_temporal_provenance_marks_missing_counter_timezone_unknown(paths):
+    """Отсутствие metadata не заменяется timezone по умолчанию."""
+    box = {}
+    session = FakeSession(_full_routes(box, counter_metadata={"counter": {}}))
+    box["session"] = session
+
+    metrika_logs.extract(CONFIG_METRIKA, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    timezone = manifest_mod.load_manifest(paths.raw)["sources"]["metrika_logs"]["temporal_provenance"]["fields"]["ym:s:dateTime"]["timezone"]
+    assert timezone == {
+        "status": "unknown",
+        "reason": "counter_time_zone_metadata_missing",
+        "evidence": "metrika_management_counter",
+    }
+    assert "Moscow" not in str(timezone)
 
 
 # ── Backfill новых полей 2A-patch поверх уже пропатченного visits-v2 ───────

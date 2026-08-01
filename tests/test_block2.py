@@ -20,9 +20,11 @@ if str(REPO_ROOT) not in sys.path:
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 import yaml
 
 from src.compute import block2  # noqa: E402
+from src.pipeline import degradation  # noqa: E402
 
 
 class _Paths:
@@ -212,7 +214,7 @@ def test_t02_unavailable_when_resolved_column_missing(tmp_path):
 
 # ── T03 — self-referral / разрыв сессии ─────────────────────────────────────
 
-def test_t03_counts_resolved_session_breaks(tmp_path):
+def test_t03_is_unavailable_without_referer_domains_contract(tmp_path):
     paths = _Paths(tmp_path)
     _write_config(paths)
     visits = [
@@ -227,16 +229,13 @@ def test_t03_counts_resolved_session_breaks(tmp_path):
 
     block2.run(paths, DEFAULTS, {"T03"})
     rows = _read_metric(paths, "t03")
-    summary = next(r for r in rows if r["finding"] == "session_break_summary")
-    assert summary["session_break_visits"] == 2
-    assert summary["session_break_resolved"] == 1
-    assert summary["session_break_unresolved"] == 1
-    assert summary["domain_level_detection_available"] is False
+    assert rows[0]["status"] == "unavailable"
+    assert "referer_domains" in rows[0]["reason"]
 
 
 # ── T04 — каналы сравниваются по разным моделям атрибуции ──────────────────
 
-def test_t04_flags_diverging_attribution_models(tmp_path):
+def test_t04_is_unavailable_without_goal_attribution_models(tmp_path):
     paths = _Paths(tmp_path)
     _write_config(paths, macro_goals=[{"id": 999, "name": "lead"}])
     visits = (
@@ -259,10 +258,8 @@ def test_t04_flags_diverging_attribution_models(tmp_path):
 
     block2.run(paths, DEFAULTS, {"T04"})
     rows = _read_metric(paths, "t04")
-    recon = next(r for r in rows if r["finding"] == "conversion_model_reconciliation")
-    assert recon["metrika_ad_conversions"] == 5
-    assert recon["direct_conversions"] == 20
-    assert recon["attribution_models_diverge"] is True
+    assert rows[0]["status"] == "unavailable"
+    assert "goal_attribution_models" in rows[0]["reason"]
 
 
 # ── T05 — брендовый и небрендовый спрос смешаны ─────────────────────────────
@@ -350,7 +347,7 @@ def test_t07_repeat_visits_same_cookie_counted_as_returning(tmp_path):
 
 # ── T08 — зависимость от одного канала или кампании ─────────────────────────
 
-def test_t08_flags_channel_concentration_risk(tmp_path):
+def test_t08_is_unavailable_without_visit_campaign_map(tmp_path):
     paths = _Paths(tmp_path)
     _write_config(paths)
     visits = (
@@ -362,9 +359,8 @@ def test_t08_flags_channel_concentration_risk(tmp_path):
 
     block2.run(paths, DEFAULTS, {"T08"})
     rows = _read_metric(paths, "t08")
-    summary = next(r for r in rows if r["finding"] == "channel_concentration_summary")
-    assert summary["dominant_channel"] == "ad"
-    assert summary["channel_concentration_risk"] is True
+    assert rows[0]["status"] == "unavailable"
+    assert "visit_campaign_map" in rows[0]["reason"]
 
 
 # ── T09 — аномалия канала ───────────────────────────────────────────────────
@@ -384,7 +380,11 @@ def test_t09_flags_anomalous_source_spike(tmp_path):
 
     block2.run(paths, DEFAULTS, {"T09"})
     rows = _read_metric(paths, "t09")
-    anomalies = [r for r in rows if r.get("finding") == "channel_anomaly"]
+    summary = next(r for r in rows if r["finding"] == "summary")
+    anomalies = [r for r in rows if r.get("finding") == "channel_anomaly_context"]
+    assert summary["status"] == "unavailable_for_cause"
+    assert summary["causal_claim"] is False
+    assert "независимый ряд канала" in summary["reason"]
     assert len(anomalies) == 1
     assert anomalies[0]["channel"] == "referral"
     assert anomalies[0]["anomaly_type"] == "spike"
@@ -405,13 +405,16 @@ def test_t09_no_anomaly_for_stable_source(tmp_path):
 
     block2.run(paths, DEFAULTS, {"T09"})
     rows = _read_metric(paths, "t09")
-    anomalies = [r for r in rows if r.get("finding") == "channel_anomaly"]
+    summary = next(r for r in rows if r["finding"] == "summary")
+    anomalies = [r for r in rows if r.get("finding") == "channel_anomaly_context"]
+    assert summary["status"] == "unavailable_for_cause"
+    assert "журнал изменений" in summary["reason"]
     assert anomalies == []
 
 
 # ── T10 — реферальный спам, боты или технические домены ─────────────────────
 
-def test_t10_flags_spam_referral_recurring_zero_engagement(tmp_path):
+def test_t10_is_unavailable_without_referer_and_geo_contract(tmp_path):
     paths = _Paths(tmp_path)
     _write_config(paths)
     visits = [
@@ -425,13 +428,8 @@ def test_t10_flags_spam_referral_recurring_zero_engagement(tmp_path):
 
     block2.run(paths, DEFAULTS, {"T10"})
     rows = _read_metric(paths, "t10")
-    summary = next(r for r in rows if r["finding"] == "summary")
-    assert summary["spam_candidate_client_ids"] == 1
-    assert summary["spam_candidate_visits"] == 6
-
-    candidate = next(r for r in rows if r.get("finding") == "spam_candidate")
-    assert candidate["client_id"] == "bot-1"
-    assert candidate["zero_engagement"] is True
+    assert rows[0]["status"] == "unavailable"
+    assert "referer_domains" in rows[0]["reason"]
 
 
 def test_t10_does_not_flag_normal_referral(tmp_path):
@@ -447,6 +445,50 @@ def test_t10_does_not_flag_normal_referral(tmp_path):
 
     block2.run(paths, DEFAULTS, {"T10"})
     rows = _read_metric(paths, "t10")
-    summary = next(r for r in rows if r["finding"] == "summary")
-    assert summary["spam_candidate_client_ids"] == 0
-    assert not any(r.get("finding") == "spam_candidate" for r in rows)
+    assert rows[0]["status"] == "unavailable"
+
+
+@pytest.mark.parametrize(
+    ("check_id", "missing_requirement"),
+    [
+        ("T03", "referer_domains"),
+        ("T04", "goal_attribution_models"),
+        ("T08", "visit_campaign_map"),
+        ("T10", "referer_domains"),
+    ],
+)
+def test_contract_gaps_are_skipped_by_registry(check_id, missing_requirement):
+    methodology = yaml.safe_load((REPO_ROOT / "config" / "methodology.yaml").read_text(
+        encoding="utf-8"
+    ))
+    report = degradation.build_degradation_report(
+        methodology,
+        available={"visits", "costs", "direct_campaigns", "client_answers", "site_crawl"},
+    )
+    detail = next(row for row in report["checks"] if row["check_id"] == check_id)
+    assert detail["runnable"] is False
+    assert missing_requirement in detail["reason_if_not_runnable"]
+
+
+@pytest.mark.parametrize("check_id", ("T03", "T04", "T08", "T10"))
+def test_registry_unavailable_overwrites_contract_metric(tmp_path, check_id):
+    paths = _Paths(tmp_path)
+    _write_config(paths)
+    paths.metrics.mkdir(parents=True, exist_ok=True)
+    (paths.metrics / "degradation_report.json").write_text(json.dumps({
+        "checks": [{
+            "check_id": check_id,
+            "runnable": False,
+            "reason_if_not_runnable": "нет источника: обязательный контракт",
+        }],
+    }), encoding="utf-8")
+
+    written = block2.run(paths, DEFAULTS, set())
+
+    assert check_id.lower() in written
+    rows = _read_metric(paths, check_id.lower())
+    assert rows == [{
+        "check_id": check_id,
+        "status": "unavailable",
+        "reason": "нет источника: обязательный контракт",
+    }]

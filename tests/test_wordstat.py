@@ -212,6 +212,35 @@ def test_extract_handles_empty_top_requests(paths):
     assert list(core["phrase"]) == ["маска без данных"]
 
 
+def test_extract_limits_dynamics_to_wordstat_hourly_quota(paths, monkeypatch):
+    _write_stopwords(paths, STOPWORDS_YAML)
+    monkeypatch.setattr(wordstat, "MAX_STATISTICS_CALLS_PER_HOUR", 2)
+    session = FakeSession(_routes(TOP_REQUESTS_RESPONSE, DYNAMICS_RESPONSE))
+
+    result = wordstat.extract(CONFIG, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    dynamics_calls = [c for c in session.calls if "/v2/wordstat/dynamics" in c[1]]
+    entry = manifest_mod.load_manifest(paths.raw)["sources"]["wordstat"]
+    assert result["target_queries"] == 1
+    assert len(dynamics_calls) == 1
+    assert entry["wordstat_calls_made"] == 2
+    assert entry["wordstat_queries_omitted_by_hourly_quota"] == 3
+
+
+def test_post_spaces_requests_at_wordstat_rps_limit(monkeypatch):
+    timestamps = iter([0.0, 0.0, 0.0, 0.1])
+    monkeypatch.setattr(wordstat.time, "monotonic", lambda: next(timestamps))
+    session = FakeSession([(_contains("/v2/wordstat/topRequests"), FakeResponse(json_data={}))])
+    calls_made = {"count": 0}
+    slept = []
+
+    wordstat._post(session, {}, wordstat.TOP_REQUESTS_PATH, {}, slept.append, calls_made)
+    wordstat._post(session, {}, wordstat.TOP_REQUESTS_PATH, {}, slept.append, calls_made)
+
+    assert slept == [wordstat.MIN_STATISTICS_CALL_INTERVAL_SEC]
+    assert calls_made["count"] == 2
+
+
 # ── 2. Фильтр стоп-слов: подстрока + отсутствие ложных срабатываний ────────
 def test_merge_candidates_stopword_substring_and_no_false_positive():
     entries = [

@@ -129,6 +129,12 @@ TOP_REQUESTS_NUM_PHRASES = 2000
 
 PERIOD_WEEKLY = "PERIOD_WEEKLY"
 
+# Лимиты Yandex Cloud Search API для функциональности Wordstat. Лимит в час
+# применяется ко всем вызовам GetTop и GetDynamics одного облака.
+MAX_STATISTICS_CALLS_PER_HOUR = 100
+MAX_STATISTICS_CALLS_PER_SECOND = 10
+MIN_STATISTICS_CALL_INTERVAL_SEC = 1 / MAX_STATISTICS_CALLS_PER_SECOND
+
 WEEKLY_FIELDS = ["phrase", "normalized_phrase", "date", "count", "share", "purpose"]
 CORE_FIELDS = [
     "phrase", "normalized_phrase", "seed_mask", "purpose", "scope", "top_requests_count",
@@ -233,6 +239,11 @@ def extract(
         raise C.SourceUnavailable(SOURCE, "topRequests не вернул ни одной фразы ни по одной маске")
 
     # ── Шаг 4: dynamics — один вызов на фразу, полный диапазон, weekly ──────
+    # GetTop уже израсходовал часть часовой квоты. Не начинаем dynamics,
+    # которые заведомо превысят лимит и оставят сырой слой неполным.
+    target_queries, omitted_by_quota = _fit_queries_into_hourly_quota(
+        target_queries, calls_made["count"],
+    )
     weekly_rows: list[dict[str, Any]] = []
     core_rows: list[dict[str, Any]] = []
     for norm_phrase, entry in target_queries.items():
@@ -266,11 +277,11 @@ def extract(
         paths, regions, devices, folder_id, date_from, date_to,
         rows=len(weekly_rows), core_rows=len(core_rows),
         calls_made=calls_made["count"], stopwords_empty=stopwords_empty,
-        dynamics_date_to=C.fmt(dynamics_date_to),
+        dynamics_date_to=C.fmt(dynamics_date_to), omitted_by_quota=omitted_by_quota,
     )
     log(
         f"{SOURCE}: готово — {len(target_queries)} фраз, {len(weekly_rows)} недельных точек, "
-        f"вызовов API: {calls_made['count']}"
+        f"вызовов API: {calls_made['count']}, пропущено по часовой квоте: {omitted_by_quota}"
     )
 
     return {
@@ -438,6 +449,20 @@ def _post(session, headers, path, body, sleeper, calls_made) -> dict[str, Any]:
 
     Отдельного цикла для квоты, в отличие от WS-1 (v1 API, 503), больше нет —
     см. докстринг модуля."""
+    if calls_made["count"] >= MAX_STATISTICS_CALLS_PER_HOUR:
+        raise C.SourceUnavailable(
+            SOURCE,
+            f"исчерпана квота Wordstat: {MAX_STATISTICS_CALLS_PER_HOUR} запросов статистики в час",
+        )
+
+    previous_call = calls_made.get("last_call_monotonic")
+    now = time.monotonic()
+    if previous_call is not None:
+        delay = MIN_STATISTICS_CALL_INTERVAL_SEC - (now - previous_call)
+        if delay > 0:
+            sleeper(delay)
+    calls_made["last_call_monotonic"] = time.monotonic()
+
     url = API_BASE_URL + path
     resp = C.http_request(
         session, "POST", url,
@@ -446,6 +471,15 @@ def _post(session, headers, path, body, sleeper, calls_made) -> dict[str, Any]:
     C.ensure_ok(resp, SOURCE, path)
     calls_made["count"] += 1
     return resp.json() or {}
+
+
+def _fit_queries_into_hourly_quota(
+    target_queries: dict[str, dict[str, Any]], calls_already_made: int,
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Оставить детерминированный префикс фраз в доступной часовой квоте."""
+    available_dynamics_calls = max(0, MAX_STATISTICS_CALLS_PER_HOUR - calls_already_made)
+    selected = dict(list(target_queries.items())[:available_dynamics_calls])
+    return selected, len(target_queries) - len(selected)
 
 
 # ── Выравнивание периода dynamics под требования API ─────────────────────────
@@ -514,7 +548,7 @@ def _dump_json(path: Path, obj: Any) -> None:
 def _record_manifest(
     paths, regions, devices, folder_id, date_from, date_to, *,
     rows: int, core_rows: int, calls_made: int, stopwords_empty: bool,
-    dynamics_date_to: str,
+    dynamics_date_to: str, omitted_by_quota: int,
 ) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
@@ -535,5 +569,6 @@ def _record_manifest(
             # date_to окна не всегда воскресенье (см. _align_to_sunday) —
             # фиксируем фактическую дату, отправленную в dynamics.toDate.
             "wordstat_dynamics_date_to": dynamics_date_to,
+            "wordstat_queries_omitted_by_hourly_quota": omitted_by_quota,
         },
     )

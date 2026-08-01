@@ -12,6 +12,7 @@
 
 | Задача | Статус  | Недостающий критерий / комментарий |
 |--------|---------|-------------------------------------|
+| **CHECKPOINT-post-fixes** | BLOCKED (analyze billing) | 2026-07-31: полный pytest и локальный smoke-run детерминированных стадий завершены; extract не завершился в ограниченное время и использовал ранее сохранённый raw. Внешний analyze дошёл до вызова провайдера, но был отклонён по биллингу; черновики не созданы, report корректно остановлен пустым approval-гейтом. Клиентские идентификаторы и значения из журнала удалены. |
 | **1A** | DONE    | — |
 | **1B** | DONE    | — |
 | **1C** | DONE    | — |
@@ -91,6 +92,9 @@
 | **FIX-vat-source-tag-mapping** | DONE | 2026-07-30. Закрывает несовпадение имён между Q01 (`finance.vat_basis_by_source[].source` в `client_answers.yaml`) и `source_tag` в `costs.parquet`/direct-таблицах, подтверждённое `AUDIT-block0-client-answers-wiring-and-source-tag-mismatch`: `_vat_lookup()` (`build_canonical.py`) сравнивало строки точно после `.strip()`, без `.lower()`/транслитерации — из трёх реальных пар совпадала только `"direct"→"direct"`, `"seo"→"seo_fee"` и `"Яндекс Бизнес"→"yandex_business"` уходили в `vat_basis_unknown`, хотя ответ на Q01 фактически был дан. Добавлен явный словарь `_VAT_SOURCE_TAG_ALIASES` (ровно три пары, не общая нормализация регистра/транслитерации — она могла бы неверно сработать на будущих `source_tag`, которых сейчас нет в данных) — применяется в `_vat_lookup()` к `src` до записи в `out`, ДО сравнения с `source_tag` строк расходов. `src/compute/block1.py` не тронут (не в `allowed_files`) — `_direct_vat_multiplier`/`_open_duckdb_with_direct_vat` переиспользуют тот же `_vat_lookup`, поэтому фикс подхватился автоматически для `direct_queries`/`direct_campaigns`/`direct_geo`/`direct_placements` без правки block1.py (`"direct"→"direct"` — identity, поведение существующих тестов `test_block1_direct_vat_normalization.py` не изменилось, все 4 теста прошли без правок). Тесты (`tests/test_build_canonical.py`): 3 unit-теста на `_vat_lookup()` (seo-алиас, Яндекс Бизнес-алиас, неизвестный source остаётся как есть) + 3 сквозных через `build()` (seo→seo_fee применяет НДС, Яндекс Бизнес→yandex_business применяет НДС, source_tag вне трёх пар остаётся `vat_basis_unknown`, как раньше). `pytest tests/test_build_canonical.py -k vat tests/test_block1_direct_vat_normalization.py` (через `.venv`, где установлен `scipy`) — **18 passed**, 0 failed. Blocker: нет. |
 
 | **FIX-vat-basis-path** | DONE | 2026-07-30. `run_transform()` deterministically loads `inputs/client_answers.yaml` and passes Q01 to `build()`, so `costs.parquet` no longer reads VAT basis only from config. Direct `build()` calls retain the legacy config fallback; supplied empty/null Q01 remains unknown. Added gross/net/unknown, YAML handoff, and D06 (`answer_not_applied=false`) tests. |
+| **FIX-d02-d03-goals-manifest-contract** | DONE | 2026-08-01. `metrika_reports` объявляет `goals` в `canonical_tables`, поэтому raw manifest штатно делает D02/D03 runnable через degradation; block0 больше не обходит `runnable_ids`, а при runnable и пустом/отсутствующем goals пишет explicit unavailable-result. Целевые тесты пройдены. |
+| **FIX-d12-join-integrity-contract** | DONE | 2026-08-01. D12 валидирует агрегированные pre/post JOIN-контроли из canonical manifest и не считает сегментацию `costs` фан-аутом без доказательства JOIN. |
+| **FIX-d08-campaign-status-contract** | DONE | 2026-08-01. D08 использует `campaign_status` с provenance из `campaigns.get States=ALL`; non-active State + исторический расход — единственный finding, а unknown/not-returned — coverage gap. `last_positive_over_14_days` сохранён только как evidence. Тесты: 217 passed. |
 ---
 
 ## Детали по задачам
@@ -1143,7 +1147,7 @@ tests/test_smoke.py` — **154 passed**, 0 failed.
 
 ---
 
-**5H** DONE — 2026-07-29. Бизнес-логика C13–C25 в `src/compute/block3.py`
+**5H** DONE — 2026-08-01. Бизнес-логика C13–C25 в `src/compute/block3.py`; контрактный патч C14/C20/C24: C14=`site_crawl + manual_form_tests` (Webvisor только enrichment, confidence≤MED/cap), C20=`webvisor_findings` только G2 (confidence≤MED/cap, без CWV/device-CR), C24=`visits + site_crawl`, но без URL-level availability пишет стандартный `unavailable` как UNVERIFIABLE без client facts/confidence. Локальный recompute подтвердил корректную деградацию недоступных источников; dispatch удаляет stale CSV/JSON только текущих skipped checks, а degradation serializes `requires` в `checks` и `skipped`.
 (та же вторая половина блока 3 — каталог v2 §8), диспетчер `run()` расширен;
 C01–C12 не переписаны.
 
@@ -3390,4 +3394,11 @@ Blocker: нет для завершённой части (Части 1-2 чер�
 согласию аналитика в ходе задачи, не самовольное расширение скоупа).
 
 **MIGRATE-analyze-openai** DONE — 2026-07-30. Слой analyze переведён с Anthropic на OpenAI Responses API: `openai`, `client.responses.create`, `OPENAI_API_KEY` только из project environment, `gpt-5.6-terra` по умолчанию; strict JSON Schema, rejected-артефакты и ручной report gate сохранены. Целевые тесты проходят без реального API.
-**PROXYAPI-analyze** DONE — 2026-07-31. Клиент OpenAI в analyze использует ProxyAPI; ключ читается только из OPENAI_API_KEY, выбор модели и Responses API не менялись.
+**FIX-analyze-proxyapi-integration** DONE — 2026-07-31. Analyze читает только `PROXYAPI_API_KEY`; `ANALYZE_LLM_BASE_URL` имеет ProxyAPI default, fallback на OpenAI отсутствует; модель и Responses API не менялись.
+**FIX-d07-q02-field-contract** DONE — 2026-08-01. D07 поддерживает canonical Q02 и legacy-алиас, фиксирует конфликты и malformed ввод без подмены нулём.
+**FIX-s06-gsc-direction** DONE — 2026-08-01. S06 считает сезонность только по помесячным GSC total_shows и avg_show_position; Wordstat подтверждает её лишь при совпадении направления спроса и показов без ухудшения позиции. Вебмастер для динамики пишет явный `unavailable`; добавлены positive/negative/direction-conflict/missing-W сценарии.
+**FIX-seo-queries-month-key** DONE — 2026-08-01. Natural key `seo_queries` включает `month`, поэтому месяцы одного query×page не схлопываются до page-level агрегатов S09/S24; S05 остаётся явным `unavailable`, пока в canonical нет кластера запросов.
+**FIX-s04-device-manual-degradation** DONE — 2026-08-01. S04 считает CTR только по известным device-срезам и исключает `unknown`; без известного device пишет единственный `manual_required` с MED без CTR-прокси и проблемных строк.
+**FIX-s09-s24-gsc-page-degradation** DONE — 2026-08-01. S09 не создаёт overlap-кандидаты при пустой GSC page-dimension; S24 не итоги и кандидаты без непустого GSC page за два месяца; оба пишут единственный `manual_required` с MED.
+**FIX-t03-t10-contract-degradation** DONE — 2026-08-01. T03/T04/T08/T10 остановлены реестром без обязательных входов; T09 хранит только контекст аномалии и без любого из журнала изменений/независимого ряда имеет `unavailable_for_cause`.
+**FIX-t03-t10-downstream-gap** DONE — 2026-08-01. Analyze исключает unavailable/unavailable_for_cause и channel_anomaly_context из кандидатов и validation; report не публикует сохранённые запрещённые finding и явно показывает limitation T09 без причинного вывода.

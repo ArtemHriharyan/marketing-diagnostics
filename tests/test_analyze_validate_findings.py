@@ -130,6 +130,24 @@ def test_empty_metrics_pack_is_rejected():
 
 # ── 5. Числа в assumptions ───────────────────────────────────────────────
 
+def test_non_finding_statuses_are_rejected_before_approval():
+    for status in ("unavailable", "unavailable_for_cause"):
+        finding = _finding(check_id="T09", status=status)
+        errors = validate_findings.validate_finding_evidence(
+            finding, metrics={"t09": [{"check_id": "T09", "status": status}]}
+        )
+        assert any("не может стать finding" in error for error in errors)
+
+
+def test_channel_anomaly_context_is_rejected_as_finding():
+    finding = _finding(check_id="T09")
+    errors = validate_findings.validate_finding_evidence(
+        finding,
+        metrics={"t09": [{"check_id": "T09", "finding": "channel_anomaly_context"}]},
+    )
+    assert any("диагностический контекст" in error for error in errors)
+
+
 def test_unconfirmed_number_in_assumptions_is_rejected():
     finding = _finding(assumptions=["Средний чек взят как 999999 ₽"])
     errors = validate_findings.validate_finding_evidence(

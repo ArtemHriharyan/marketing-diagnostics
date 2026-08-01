@@ -164,35 +164,57 @@ def test_call_llm_sends_expected_request_and_parses_response():
     assert '"metrics"' in kwargs["input"][0]["content"]
 
 
-def test_call_llm_fails_clearly_without_openai_api_key(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+def test_call_llm_fails_clearly_without_proxyapi_api_key(monkeypatch):
+    monkeypatch.delenv(draft_findings.PROXYAPI_API_KEY_ENV_VAR, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-used")
 
     import pytest
 
-    with pytest.raises(RuntimeError, match="OPENAI_API_KEY"):
+    with pytest.raises(RuntimeError, match="PROXYAPI_API_KEY"):
         draft_findings._call_llm("системный промт", {"metrics": {}})
 
 
-def test_call_llm_creates_client_with_proxyapi_base_url(monkeypatch):
+def test_call_llm_creates_client_with_proxyapi_key_and_default_base_url(monkeypatch):
     captured: dict[str, object] = {}
 
     class _MockOpenAI:
-        def __init__(self, *, base_url, timeout, max_retries, **_private):
+        def __init__(self, *, api_key, base_url, timeout, max_retries, **_private):
             captured.update(
+                api_key=api_key,
                 base_url=base_url,
                 timeout=timeout,
                 max_retries=max_retries,
             )
             self.responses = _MockResponses([])
 
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv(draft_findings.PROXYAPI_API_KEY_ENV_VAR, "test-proxyapi-key")
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_MockOpenAI))
 
     assert draft_findings._call_llm("системный промт", {"metrics": {}}) == {"findings": []}
     assert captured == {
-        "base_url": draft_findings.PROXYAPI_OPENAI_BASE_URL,
+        "api_key": "test-proxyapi-key",
+        "base_url": draft_findings.DEFAULT_LLM_BASE_URL,
         "timeout": draft_findings.LLM_TIMEOUT_SECONDS,
         "max_retries": draft_findings.LLM_MAX_RETRIES,
+    }
+
+
+def test_call_llm_uses_base_url_override(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _MockOpenAI:
+        def __init__(self, *, api_key, base_url, **_private):
+            captured.update(api_key=api_key, base_url=base_url)
+            self.responses = _MockResponses([])
+
+    monkeypatch.setenv(draft_findings.PROXYAPI_API_KEY_ENV_VAR, "test-proxyapi-key")
+    monkeypatch.setenv(draft_findings.LLM_BASE_URL_ENV_VAR, "https://proxy.example/v1")
+    monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=_MockOpenAI))
+
+    assert draft_findings._call_llm("системный промт", {"metrics": {}}) == {"findings": []}
+    assert captured == {
+        "api_key": "test-proxyapi-key",
+        "base_url": "https://proxy.example/v1",
     }
 
 
@@ -241,6 +263,25 @@ def test_draft_numbers_multiple_findings_in_same_block_sequentially(tmp_path):
     names = draft_findings.draft(paths, CONFIG, METHODOLOGY, client=_MockClient(payload))
 
     assert names == [draft_findings.INPUT_PACK_ARTIFACT_NAME, "F-A-01.yaml", "F-A-02.yaml"]
+
+
+def test_draft_sends_metric_projection_to_llm(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_degradation(paths, [{"check_id": "A04", "runnable": True, "confidence_cap": "MED"}])
+    _write_metrics(paths, "a04", [_evidence_metrics_row("A04", "MED")])
+    a19_rows = [
+        {"campaign": "high", "cpc_anomalously_high": True, "cost": 5000.0},
+        {"campaign": "normal", "cpc_anomalously_high": False, "cost": 1000.0},
+    ]
+    _write_metrics(paths, "a19", a19_rows)
+    capture: list[dict] = []
+
+    draft_findings.draft(paths, CONFIG, METHODOLOGY, client=_MockClient([], capture))
+
+    sent_pack = json.loads(capture[0]["input"][0]["content"].partition("\n\n")[2])
+    assert sent_pack["metrics"]["a19"]["summary"]["total_rows"] == 2
+    assert sent_pack["metrics"]["a19"]["candidates"] == [a19_rows[0]]
+    assert "normal" not in json.dumps(sent_pack["metrics"]["a19"])
 
 
 # ── 4. Невалидные находки отбрасываются в rejected/ без повторного вызова

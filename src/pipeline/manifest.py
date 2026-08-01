@@ -71,9 +71,16 @@ def update_source(
         "script_version": script_version,
         "canonical_tables": canonical_tables,
     }
+    previous_entry = manifest["sources"].get(source) or {}
     for key, value in (extra or {}).items():
         if key not in entry:
             entry[key] = value
+    # Temporal provenance описывает контракт уже выгруженных строк, а не момент
+    # записи manifest. Не теряем его при служебном обновлении той же записи
+    # (например, при добавлении lookback-статистики), если новый extract его не
+    # передал явно.
+    if "temporal_provenance" not in entry and "temporal_provenance" in previous_entry:
+        entry["temporal_provenance"] = previous_entry["temporal_provenance"]
     manifest["sources"][source] = entry
     manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
 

@@ -234,6 +234,36 @@ def test_dispatch_blocks_passes_runnable_ids_and_collects_artifacts(tmp_path):
     assert result["block_status"] == {"fake_checks_runnable": "ok"}
 
 
+def test_dispatch_blocks_removes_only_stale_artifacts_of_skipped_checks(tmp_path):
+    paths = _Paths(tmp_path)
+    paths.metrics.mkdir(parents=True)
+    for check_id, stale_text in {
+        "c14": "stale manual form result",
+        "c20": "stale C09 reference",
+        "c24": "stale client answers reference",
+        "a01": "runnable artifact",
+    }.items():
+        for suffix in (".json", ".csv"):
+            (paths.metrics / f"{check_id}{suffix}").write_text(
+                stale_text, encoding="utf-8"
+            )
+    degradation_report = {
+        "runnable_check_ids": ["A01"],
+        "skipped": [{"id": "C14"}, {"id": "C20"}, {"id": "C24"}],
+        "counts": {"total": 4, "runnable": 1, "skipped": 3},
+    }
+
+    common.dispatch_blocks(
+        paths, {}, degradation_report, modules=[_FakeBlockChecksRunnable()]
+    )
+
+    for check_id in ("c14", "c20", "c24"):
+        assert not (paths.metrics / f"{check_id}.json").exists()
+        assert not (paths.metrics / f"{check_id}.csv").exists()
+    assert (paths.metrics / "a01.json").read_text(encoding="utf-8") == "runnable artifact"
+    assert (paths.metrics / "a01.csv").read_text(encoding="utf-8") == "runnable artifact"
+
+
 def test_dispatch_blocks_not_implemented_block_does_not_stop_others(tmp_path):
     paths = _Paths(tmp_path)
     degradation_report = {"runnable_check_ids": [], "skipped": [], "counts": {}}

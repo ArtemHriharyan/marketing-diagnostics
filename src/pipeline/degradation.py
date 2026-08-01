@@ -17,6 +17,7 @@
     {
       "check_id": "...",
       "runnable": bool,
+      "requires": ["...", ...],
       "type_effective": "A"|"B"|"Q"|"A+B"|"A+Q",  # после downgrade-правил
       "source_modes": {"<requires-таблица>": "api"|"manual", ...},
       "confidence_cap": "HIGH" | "MED",     # MED, если хоть одно requires manual
@@ -53,6 +54,7 @@ _SOURCE_LABELS: dict[str, str] = {
     "manual_form_tests": "ручное тестирование форм (inputs/manual_form_tests.yaml)",
     "webvisor_findings": "наблюдения из Вебвизора (inputs/webvisor_findings.yaml)",
     "campaign_strategies": "стратегии кампаний Директа (Директ не подключён)",
+    "campaign_status": "статусы кампаний Директа (Директ не подключён)",
     "degradation_report": "отчёт о деградации",
 }
 
@@ -69,7 +71,7 @@ def _label(table: str) -> str:
 #   * ``seo_queries``      — режим берётся из config.sources (webmaster/gsc):
 #                            manual, если ХОТЯ БЫ один из них заявлен mode=manual.
 _API_TABLES: frozenset[str] = frozenset(
-    {"visits", "costs", "direct_queries", "campaign_strategies",
+    {"visits", "costs", "direct_queries", "campaign_strategies", "campaign_status",
      "wordstat", "crux", "degradation_report"}
 )
 _MANUAL_TABLES: frozenset[str] = frozenset(
@@ -171,7 +173,7 @@ def evaluate_check(
 ) -> dict[str, Any]:
     """Обогатить одну проверку по контракту карты деградации.
 
-    Возвращает ``{check_id, runnable, type_effective, source_modes,
+    Возвращает ``{check_id, runnable, requires, type_effective, source_modes,
     confidence_cap, reason_if_not_runnable}``.
 
     ``source_modes`` — режим каждого требования (requires). ``confidence_cap`` =
@@ -210,6 +212,7 @@ def evaluate_check(
     return {
         "check_id": check.get("id"),
         "runnable": runnable,
+        "requires": required,
         "type_effective": type_effective,
         "source_modes": modes,
         "confidence_cap": confidence_cap,
@@ -250,7 +253,7 @@ def split_checks(
     Возвращает кортеж (runnable, skipped):
         runnable — список записей проверок как есть;
         skipped  — список словарей вида
-            {"id", "block", "name", "missing": [...], "reason": "...",
+             {"id", "block", "name", "requires": [...], "missing": [...], "reason": "...",
              "degrades_to": <id|None>}
     Порядок сохраняется, что делает раздел «Что не удалось проверить»
     детерминированным.
@@ -272,6 +275,7 @@ def split_checks(
                 "id": check.get("id"),
                 "block": check.get("block"),
                 "name": check.get("name"),
+                "requires": required,
                 "missing": missing,
                 "reason": reason,
                 "degrades_to": check.get("degrades_to"),

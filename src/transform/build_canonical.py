@@ -88,6 +88,93 @@ from ..pipeline import manifest as manifest_mod
 
 CANONICAL_MANIFEST_NAME = "manifest.json"
 
+_JOIN_STATUS_PASS = "PASS"
+_JOIN_STATUS_NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+def _join_frame_controls(
+    df: pd.DataFrame, keys: list[str], control_columns: tuple[str, ...],
+) -> dict[str, Any]:
+    """Агрегаты DataFrame для manifest D12, без значений ключей/PII."""
+    available = [column for column in control_columns if column in df.columns]
+    checksums: dict[str, float] = {}
+    non_null_counts: dict[str, int] = {}
+    for column in available:
+        values = pd.to_numeric(df[column], errors="coerce")
+        checksums[column] = float(values.sum(skipna=True))
+        non_null_counts[column] = int(values.notna().sum())
+    return {
+        "rows": int(len(df)),
+        "distinct_keys": int(len(df.drop_duplicates(subset=keys))),
+        "checksums": checksums,
+        "non_null_counts": non_null_counts,
+    }
+
+
+def _join_key_set(df: pd.DataFrame, keys: list[str]) -> set[tuple[Any, ...]]:
+    """Множество ключей только для подсчёта matched/unmatched, без сериализации."""
+    return {
+        tuple(None if pd.isna(value) else value for value in row)
+        for row in df[keys].itertuples(index=False, name=None)
+    }
+
+
+def _join_integrity_record(
+    *,
+    join_id: str,
+    left_table: str,
+    right_table: str,
+    output_table: str,
+    keys: list[str],
+    expected_cardinality: str,
+    left_df: pd.DataFrame,
+    right_df: pd.DataFrame,
+    output_df: pd.DataFrame,
+    control_columns: tuple[str, ...],
+    unmatched_policy: dict[str, str],
+) -> dict[str, Any]:
+    """Нормализованный PASS-record фактически выполненного LEFT JOIN."""
+    left_keys = _join_key_set(left_df, keys)
+    right_keys = _join_key_set(right_df, keys)
+    return {
+        "join_id": join_id,
+        "tables": {"left": left_table, "right": right_table, "output": output_table},
+        "keys": list(keys),
+        "expected_cardinality": expected_cardinality,
+        "status": _JOIN_STATUS_PASS,
+        "pre": _join_frame_controls(left_df, keys, control_columns),
+        "right": _join_frame_controls(right_df, keys, ()),
+        "post": _join_frame_controls(output_df, keys, control_columns),
+        "matched": int(len(left_keys & right_keys)),
+        "unmatched": {
+            "left": int(len(left_keys - right_keys)),
+            "right": int(len(right_keys - left_keys)),
+        },
+        "unmatched_policy": dict(unmatched_policy),
+        "preserved_controls": list(control_columns),
+    }
+
+
+def _join_not_applicable_record(
+    *,
+    join_id: str,
+    left_table: str,
+    right_table: str,
+    output_table: str,
+    keys: list[str],
+    expected_cardinality: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Явный record для предусмотренного, но не выполненного JOIN."""
+    return {
+        "join_id": join_id,
+        "tables": {"left": left_table, "right": right_table, "output": output_table},
+        "keys": list(keys),
+        "expected_cardinality": expected_cardinality,
+        "status": _JOIN_STATUS_NOT_APPLICABLE,
+        "reason": reason,
+    }
+
 
 # ── Маппинг источника трафика (см. докстринг модуля) ───────────────────────
 _TRAFFIC_SOURCE_MAP: dict[str, str] = {
@@ -745,6 +832,119 @@ def _read_metrika_logs_rows(raw_dir: Path) -> list[dict[str, str]]:
     return rows
 
 
+_GOAL_ACHIEVEMENT_FIELDS = (
+    "ym:s:goalsID",
+    "ym:s:goalsDateTime",
+    "ym:s:goalsSerialNumber",
+)
+
+
+def _split_goal_array(raw: str | None) -> list[str]:
+    """Разделить массив Logs API, сохраняя пустые элементы внутри массива."""
+    text = (raw or "").strip()
+    if not text:
+        return []
+    return [part.strip() for part in re.split(r"[,;|]", text)]
+
+
+def _read_metrika_goal_backfill_rows(raw_dir: Path) -> list[dict[str, str]]:
+    """Прочитать только строки backfill, которые действительно несут массивы целей."""
+    rows: list[dict[str, str]] = []
+    backfill_dir = Path(raw_dir) / BACKFILL_SUBDIR
+    if not backfill_dir.exists():
+        return rows
+    for path in sorted(backfill_dir.glob("visits_backfill_*.csv.gz")):
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
+            for row in csv.DictReader(fh, delimiter="\t"):
+                if any(field in row for field in _GOAL_ACHIEVEMENT_FIELDS):
+                    rows.append(row)
+    return rows
+
+
+def _latest_goal_rows(rows: Iterable[dict[str, str]]) -> dict[str, dict[str, str]]:
+    """Оставить последнюю по dateTime строку на visit_id, как в visits.parquet."""
+    selected: dict[str, tuple[str, int, dict[str, str]]] = {}
+    for index, row in enumerate(rows):
+        visit_id = (row.get("ym:s:visitID") or "").strip()
+        if not visit_id:
+            continue
+        # В backfill нет dateTime: порядок файла остаётся детерминированным и
+        # перезаписывает базовую строку того же visit_id ниже.
+        marker = (row.get("ym:s:dateTime") or "").strip()
+        previous = selected.get(visit_id)
+        if previous is None or (marker, index) >= (previous[0], previous[1]):
+            selected[visit_id] = (marker, index, row)
+    return {visit_id: selected[visit_id][2] for visit_id in sorted(selected)}
+
+
+def build_goal_achievements(metrika_logs_dir: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Развернуть только строго параллельные goalsID/goalsDateTime/goalsSerialNumber.
+
+    Несовпадение длин не исправляется эвристикой и не проходит через ``zip``:
+    достижение такого визита не попадает в parquet, а объём потери фиксируется
+    в canonical manifest. Некорректный datetime пропускается поэлементно с
+    отдельным счётчиком и сохранением исходного achievement_index остальных.
+    """
+    base_rows = _read_metrika_logs_rows(metrika_logs_dir)
+    base_with_fields = [
+        row for row in base_rows
+        if any(field in row for field in _GOAL_ACHIEVEMENT_FIELDS)
+    ]
+    backfill_rows = _read_metrika_goal_backfill_rows(metrika_logs_dir)
+    if not base_with_fields and not backfill_rows:
+        return pd.DataFrame(), {
+            "status": "unavailable",
+            "reason": "goal_achievement_fields_missing",
+            "source_visits": 0,
+            "emitted_rows": 0,
+            "mismatched_visits": 0,
+            "mismatched_values": 0,
+            "malformed_goal_datetime": 0,
+        }
+
+    by_visit = _latest_goal_rows(base_with_fields)
+    # Backfill содержит именно поля патча и имеет приоритет над старой базовой
+    # строкой того же визита; иначе goalsDateTime снова потеряется.
+    by_visit.update(_latest_goal_rows(backfill_rows))
+
+    records: list[dict[str, Any]] = []
+    mismatched_visits = 0
+    mismatched_values = 0
+    malformed_goal_datetime = 0
+    for visit_id in sorted(by_visit):
+        row = by_visit[visit_id]
+        goal_ids = _split_goal_array(row.get("ym:s:goalsID"))
+        goal_datetimes = _split_goal_array(row.get("ym:s:goalsDateTime"))
+        serial_numbers = _split_goal_array(row.get("ym:s:goalsSerialNumber"))
+        lengths = (len(goal_ids), len(goal_datetimes), len(serial_numbers))
+        if len(set(lengths)) != 1:
+            mismatched_visits += 1
+            mismatched_values += max(lengths)
+            continue
+        for achievement_index in range(lengths[0]):
+            goal_datetime = pd.to_datetime(goal_datetimes[achievement_index], errors="coerce")
+            if pd.isna(goal_datetime):
+                malformed_goal_datetime += 1
+                continue
+            records.append({
+                "visit_id": visit_id,
+                "goal_id": goal_ids[achievement_index] or None,
+                "goal_datetime": pd.Timestamp(goal_datetime).to_pydatetime(),
+                "serial_number": serial_numbers[achievement_index] or None,
+                "achievement_index": achievement_index,
+            })
+
+    status = "available" if not (mismatched_visits or malformed_goal_datetime) else "degraded"
+    return pd.DataFrame(records), {
+        "status": status,
+        "source_visits": len(by_visit),
+        "emitted_rows": len(records),
+        "mismatched_visits": mismatched_visits,
+        "mismatched_values": mismatched_values,
+        "malformed_goal_datetime": malformed_goal_datetime,
+    }
+
+
 def _read_metrika_lookback_rows(raw_dir: Path) -> list[dict[str, str]]:
     """Визиты lookback-окна (см. LOOKBACK_SUBDIR, src.extract.metrika_logs).
 
@@ -835,6 +1035,7 @@ def _read_metrika_backfill(
 
 def _join_backfill(
     df: pd.DataFrame, metrika_dir: Path, region_field: str,
+    join_integrity: list[dict[str, Any]] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Left join базовых визитов с backfill по visit_id (число строк не растёт).
 
@@ -854,6 +1055,16 @@ def _join_backfill(
         backfill_dir.glob("visits_backfill_*.csv.gz")
     )
     if no_backfill_files:
+        if join_integrity is not None:
+            join_integrity.append(_join_not_applicable_record(
+                join_id="visits_backfill",
+                left_table="visits_base",
+                right_table="visits_backfill",
+                output_table="visits",
+                keys=["visit_id"],
+                expected_cardinality="1:1",
+                reason="backfill_files_absent",
+            ))
         df = df.copy()
         stats = {
             "backfill_rows": 0,
@@ -891,6 +1102,23 @@ def _join_backfill(
         raise AssertionError(
             f"backfill join изменил число строк: {n_before} -> {len(merged)}"
         )
+    if join_integrity is not None:
+        join_integrity.append(_join_integrity_record(
+            join_id="visits_backfill",
+            left_table="visits_base",
+            right_table="visits_backfill",
+            output_table="visits",
+            keys=["visit_id"],
+            expected_cardinality="1:1",
+            left_df=df_base,
+            right_df=bf_df,
+            output_df=merged,
+            control_columns=(
+                "form_open_count", "form_submit_count", "call_click_count",
+                "messenger_click_count",
+            ),
+            unmatched_policy={"left": "allowed", "right": "allowed"},
+        ))
     return merged, stats
 
 
@@ -966,6 +1194,7 @@ def _empty_backfill_stats() -> dict[str, Any]:
 def build_visits(
     raw_dir: Path, config: dict[str, Any], defaults: dict[str, Any],
     manifest_metrika_entry: dict[str, Any] | None = None,
+    join_integrity: list[dict[str, Any]] | None = None,
 ) -> tuple[pd.DataFrame, bool, dict[str, Any]]:
     """data/raw/metrika_logs/ -> (визиты, utm_uncertain, статистика backfill).
 
@@ -1000,6 +1229,16 @@ def build_visits(
     parsed = [r for r in (_parse_visit_row(row, goals_cfg, region_field) for row in raw_rows)
               if r is not None]
     if not parsed:
+        if join_integrity is not None:
+            join_integrity.append(_join_not_applicable_record(
+                join_id="visits_backfill",
+                left_table="visits_base",
+                right_table="visits_backfill",
+                output_table="visits",
+                keys=["visit_id"],
+                expected_cardinality="1:1",
+                reason="base_visits_absent",
+            ))
         return pd.DataFrame(), False, _empty_backfill_stats()
 
     df = pd.DataFrame(parsed)
@@ -1012,7 +1251,7 @@ def build_visits(
     df["source_final"] = source_final
     df["is_ad"] = df["source_final"] == "ad"
 
-    df, backfill_stats = _join_backfill(df, raw_dir, region_field)
+    df, backfill_stats = _join_backfill(df, raw_dir, region_field, join_integrity)
     df["is_lookback_only"] = False
 
     lookback_raw_rows = _read_metrika_lookback_rows(raw_dir)
@@ -1170,6 +1409,7 @@ def _parse_date_field(raw: Any) -> date | None:
 def build_direct_queries(
     direct_dir: Path, manifest_direct_entry: dict[str, Any] | None,
     macro_goals: list[dict[str, Any]] | None = None,
+    join_integrity: list[dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """SEARCH_QUERY_PERFORMANCE_REPORT -> direct_queries.
 
@@ -1215,7 +1455,12 @@ def build_direct_queries(
         goal_ids = [str(g["id"]) for g in macro_goals]
         key_cols = ["date", "campaign_id", "campaign_name", "ad_group_id",
                     "query", "match_type", "device"]
-        df = _join_goal_convs(df, queries_dir / "goals", goal_ids, key_cols)
+        df = _join_goal_convs(
+            df, queries_dir / "goals", goal_ids, key_cols,
+            join_id_prefix="direct_queries_goal_conversions",
+            left_table="direct_queries",
+            join_integrity=join_integrity,
+        )
 
     return df
 
@@ -1223,6 +1468,7 @@ def build_direct_queries(
 def build_direct_campaigns(
     direct_dir: Path, manifest_direct_entry: dict[str, Any] | None,
     macro_goals: list[dict[str, Any]] | None = None,
+    join_integrity: list[dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """CAMPAIGN_PERFORMANCE_REPORT -> direct_campaigns.
 
@@ -1257,7 +1503,12 @@ def build_direct_campaigns(
     if macro_goals:
         goal_ids = [str(g["id"]) for g in macro_goals]
         key_cols = ["date", "campaign_id", "campaign_name", "device"]
-        df = _join_goal_convs(df, campaign_dir / "goals", goal_ids, key_cols)
+        df = _join_goal_convs(
+            df, campaign_dir / "goals", goal_ids, key_cols,
+            join_id_prefix="direct_campaigns_goal_conversions",
+            left_table="direct_campaigns",
+            join_integrity=join_integrity,
+        )
 
     return df
 
@@ -1265,6 +1516,7 @@ def build_direct_campaigns(
 def build_direct_geo(
     direct_dir: Path, manifest_direct_entry: dict[str, Any] | None,
     macro_goals: list[dict[str, Any]] | None = None,
+    join_integrity: list[dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """GEO_PERFORMANCE_REPORT -> direct_geo.
 
@@ -1309,7 +1561,12 @@ def build_direct_geo(
         goal_ids = [str(g["id"]) for g in macro_goals]
         key_cols = ["date", "campaign_id", "campaign_name",
                     "location_of_presence_id", "location_of_presence_name", "device"]
-        df = _join_goal_convs(df, geo_dir / "goals", goal_ids, key_cols)
+        df = _join_goal_convs(
+            df, geo_dir / "goals", goal_ids, key_cols,
+            join_id_prefix="direct_geo_goal_conversions",
+            left_table="direct_geo",
+            join_integrity=join_integrity,
+        )
 
     return df
 
@@ -1382,6 +1639,10 @@ def _join_goal_convs(
     goals_base_dir: Path,
     goal_ids: list[str],
     key_cols: list[str],
+    *,
+    join_id_prefix: str,
+    left_table: str,
+    join_integrity: list[dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
     """LEFT JOIN goal-отчётов на base_df по key_cols.
 
@@ -1402,17 +1663,38 @@ def _join_goal_convs(
     cost_before = float(base_df["cost_rub"].sum()) if "cost_rub" in base_df.columns else 0.0
     result = base_df.copy()
 
-    for goal_id in goal_ids:
+    for goal_index, goal_id in enumerate(goal_ids, start=1):
+        join_id = f"{join_id_prefix}_{goal_index}"
         col = f"goal_conv_{goal_id}"
         goal_dir = goals_base_dir / f"goal_{goal_id}"
         goal_df = _build_goal_frame(goal_dir, conv_col_name=col)
 
         if goal_df.empty:
+            if join_integrity is not None:
+                join_integrity.append(_join_not_applicable_record(
+                    join_id=join_id,
+                    left_table=left_table,
+                    right_table=f"{left_table}_goal_report",
+                    output_table=left_table,
+                    keys=key_subset,
+                    expected_cardinality="1:1",
+                    reason="goal_report_absent_or_empty",
+                ))
             result[col] = 0
             continue
 
         merge_key = [c for c in key_subset if c in goal_df.columns]
         if not merge_key:
+            if join_integrity is not None:
+                join_integrity.append(_join_not_applicable_record(
+                    join_id=join_id,
+                    left_table=left_table,
+                    right_table=f"{left_table}_goal_report",
+                    output_table=left_table,
+                    keys=key_subset,
+                    expected_cardinality="1:1",
+                    reason="goal_report_join_keys_absent",
+                ))
             result[col] = 0
             continue
 
@@ -1420,11 +1702,26 @@ def _join_goal_convs(
         if goal_df.duplicated(subset=merge_key).any():
             goal_df = goal_df.groupby(merge_key, dropna=False)[col].sum().reset_index()
 
+        before_merge = result
         result = result.merge(
             goal_df[merge_key + [col]],
             on=merge_key, how="left",
         )
         result[col] = result[col].fillna(0).astype("Int64")
+        if join_integrity is not None:
+            join_integrity.append(_join_integrity_record(
+                join_id=join_id,
+                left_table=left_table,
+                right_table=f"{left_table}_goal_report",
+                output_table=left_table,
+                keys=merge_key,
+                expected_cardinality="1:1",
+                left_df=before_merge,
+                right_df=goal_df,
+                output_df=result,
+                control_columns=("cost_rub", "clicks", "impressions", "conversions_all"),
+                unmatched_policy={"left": "allowed", "right": "forbidden"},
+            ))
 
     # Инвариант: сумма cost_rub не должна измениться.
     if "cost_rub" in result.columns:
@@ -1479,6 +1776,49 @@ def build_campaign_strategies(direct_dir: Path) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows)
+
+
+def build_campaign_status(
+    direct_dir: Path, manifest_direct_entry: dict[str, Any] | None,
+) -> pd.DataFrame:
+    """campaigns.get -> campaign_status без клиентских названий кампаний.
+
+    Snapshot статуса относится к моменту извлечения, а не к периоду расходов.
+    Provenance приходит из raw manifest, который пишет extract; при его
+    отсутствии поля остаются null, чтобы compute признал статус непроверенным.
+    """
+    path = direct_dir / "campaign_strategies.json"
+    if not path.exists():
+        return pd.DataFrame()
+    with path.open("r", encoding="utf-8") as fh:
+        campaigns = json.load(fh) or []
+
+    entry = manifest_direct_entry or {}
+    provenance = entry.get("campaign_status_provenance") or {}
+    requested_states = provenance.get("requested_states")
+    requested_states_json = (
+        json.dumps(requested_states, ensure_ascii=False, sort_keys=True)
+        if isinstance(requested_states, list) else None
+    )
+    observed_at = entry.get("fetched_at") or entry.get("extracted_at")
+    source = provenance.get("source")
+
+    rows: list[dict[str, Any]] = []
+    for campaign in campaigns:
+        campaign_id = _to_optional_str(campaign.get("Id"))
+        if campaign_id is None:
+            continue
+        rows.append({
+            "campaign_id": campaign_id,
+            "state": _to_optional_str(campaign.get("State")),
+            "status": _to_optional_str(campaign.get("Status")),
+            "status_payment": _to_optional_str(campaign.get("StatusPayment")),
+            "status_clarification": _to_optional_str(campaign.get("StatusClarification")),
+            "observed_at": _to_optional_str(observed_at),
+            "source": _to_optional_str(source),
+            "requested_states": requested_states_json,
+        })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 def build_ad_texts(direct_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1732,7 +2072,9 @@ def _wordstat_purpose_to_string(value: Any) -> str | None:
     return ",".join(sorted(items)) if items else None
 
 
-def build_wordstat(wordstat_dir: Path) -> pd.DataFrame:
+def build_wordstat(
+    wordstat_dir: Path, join_integrity: list[dict[str, Any]] | None = None,
+) -> pd.DataFrame:
     """data/raw/wordstat/{wordstat_weekly,wordstat_core_queries}.parquet -> wordstat.
 
     LEFT JOIN недельного временного ряда спроса (wordstat_weekly — WEEKLY_FIELDS,
@@ -1754,9 +2096,29 @@ def build_wordstat(wordstat_dir: Path) -> pd.DataFrame:
     """
     weekly_path = wordstat_dir / "wordstat_weekly.parquet"
     if not weekly_path.exists():
+        if join_integrity is not None:
+            join_integrity.append(_join_not_applicable_record(
+                join_id="wordstat_core_metadata",
+                left_table="wordstat_weekly",
+                right_table="wordstat_core_queries",
+                output_table="wordstat",
+                keys=["normalized_phrase"],
+                expected_cardinality="N:1",
+                reason="weekly_rows_absent",
+            ))
         return pd.DataFrame()
     weekly = pd.read_parquet(weekly_path)
     if weekly.empty:
+        if join_integrity is not None:
+            join_integrity.append(_join_not_applicable_record(
+                join_id="wordstat_core_metadata",
+                left_table="wordstat_weekly",
+                right_table="wordstat_core_queries",
+                output_table="wordstat",
+                keys=["normalized_phrase"],
+                expected_cardinality="N:1",
+                reason="weekly_rows_empty",
+            ))
         return pd.DataFrame()
 
     weekly = weekly.copy()
@@ -1774,7 +2136,31 @@ def build_wordstat(wordstat_dir: Path) -> pd.DataFrame:
         core_cols = core[["normalized_phrase", "seed_mask", "scope", "top_requests_count"]]
         core_cols = core_cols.drop_duplicates(subset="normalized_phrase", keep="first")
         merged = weekly.merge(core_cols, on="normalized_phrase", how="left")
+        if join_integrity is not None:
+            join_integrity.append(_join_integrity_record(
+                join_id="wordstat_core_metadata",
+                left_table="wordstat_weekly",
+                right_table="wordstat_core_queries",
+                output_table="wordstat",
+                keys=["normalized_phrase"],
+                expected_cardinality="N:1",
+                left_df=weekly,
+                right_df=core_cols,
+                output_df=merged,
+                control_columns=("count", "share"),
+                unmatched_policy={"left": "allowed", "right": "allowed"},
+            ))
     else:
+        if join_integrity is not None:
+            join_integrity.append(_join_not_applicable_record(
+                join_id="wordstat_core_metadata",
+                left_table="wordstat_weekly",
+                right_table="wordstat_core_queries",
+                output_table="wordstat",
+                keys=["normalized_phrase"],
+                expected_cardinality="N:1",
+                reason="core_metadata_absent_or_empty",
+            ))
         merged = weekly
         merged["seed_mask"] = None
         merged["scope"] = None
@@ -1872,6 +2258,11 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "campaign_id": "string", "campaign_name": "string", "strategy_type": "string",
         "optimize_for": "string",
     },
+    "campaign_status": {
+        "campaign_id": "string", "state": "string", "status": "string",
+        "status_payment": "string", "status_clarification": "string",
+        "observed_at": "string", "source": "string", "requested_states": "string",
+    },
     "seo_queries": {
         "query": "string", "page": "string", "source": "string", "month": "string",
         "device": "string",          # "unknown", если источник не даёт device-разрез
@@ -1907,6 +2298,10 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "goal_id": "string", "name": "string", "type": "string",
         "url_pattern": "string", "conditions_raw": "string",
         "created_at": "timestamp", "updated_at": "timestamp",
+    },
+    "goal_achievements": {
+        "visit_id": "string", "goal_id": "string", "goal_datetime": "timestamp",
+        "serial_number": "string", "achievement_index": "int",
     },
     "wordstat": {
         "phrase": "string", "normalized_phrase": "string",
@@ -1959,12 +2354,130 @@ def write_canonical_table(df: pd.DataFrame, table_name: str, out_path: Path) -> 
     pq.write_table(table, out_path)
 
 
-def _write_canonical_manifest(canonical_dir: Path, tables: list[str], flags: dict[str, Any]) -> None:
+def _unknown_temporal_provenance(reason: str) -> dict[str, str]:
+    return {"status": "unknown", "reason": reason}
+
+
+def _source_temporal_provenance(sources: dict[str, Any]) -> dict[str, Any]:
+    """Перенести raw temporal_provenance без изменения значений."""
+    result: dict[str, Any] = {}
+    for source_name in sorted(sources):
+        provenance = (sources.get(source_name) or {}).get("temporal_provenance")
+        result[source_name] = (
+            provenance
+            if isinstance(provenance, dict)
+            else _unknown_temporal_provenance("raw_temporal_provenance_missing")
+        )
+    return result
+
+
+def _raw_temporal_field(
+    raw_sources: dict[str, Any], source_name: str, field_name: str,
+) -> dict[str, Any]:
+    provenance = raw_sources.get(source_name)
+    if not isinstance(provenance, dict) or provenance.get("status") == "unknown":
+        return _unknown_temporal_provenance("raw_temporal_provenance_missing")
+    field = (provenance.get("fields") or {}).get(field_name)
+    if not isinstance(field, dict):
+        return _unknown_temporal_provenance("raw_temporal_field_missing")
+    return field
+
+
+def _declared_partial_months(provenance: dict[str, Any]) -> dict[str, Any]:
+    """Определить неполные месяцы только по requested_window, не по строкам."""
+    requested_window = provenance.get("requested_window") if isinstance(provenance, dict) else None
+    if not isinstance(requested_window, dict):
+        return _unknown_temporal_provenance("raw_temporal_provenance_missing")
+    try:
+        date_from = date.fromisoformat(str(requested_window["date_from"]))
+        date_to = date.fromisoformat(str(requested_window["date_to"]))
+    except (KeyError, TypeError, ValueError):
+        return _unknown_temporal_provenance("requested_window_missing")
+
+    def _month_record(value: date, *, is_first: bool) -> dict[str, str]:
+        is_partial = value.day != 1 if is_first else value.day != calendar.monthrange(value.year, value.month)[1]
+        return {
+            "month": value.strftime("%Y-%m"),
+            "status": "declared_partial" if is_partial else "declared_complete",
+        }
+
+    return {
+        "first_month": _month_record(date_from, is_first=True),
+        "last_month": _month_record(date_to, is_first=False),
+        "basis": "requested_window_only",
+    }
+
+
+def build_temporal_provenance(sources: dict[str, Any]) -> dict[str, Any]:
+    """Собрать D09-контракт canonical без преобразования raw-семантики."""
+    raw_sources = _source_temporal_provenance(sources)
+    canonical_fields: dict[str, Any] = {}
+    partial_months: dict[str, Any] = {}
+
+    if "metrika_logs" in sources:
+        canonical_fields["visits"] = {
+            "dt": {
+                "raw_source": "metrika_logs",
+                "raw_field": "ym:s:dateTime",
+                "raw_field_contract": _raw_temporal_field(
+                    raw_sources, "metrika_logs", "ym:s:dateTime"
+                ),
+                "timezone_conversion": "none",
+                "local_time_basis": "counter_local_time",
+            },
+            "date": {
+                "derived_from": "visits.dt",
+                "operation": "calendar_date_without_timezone_conversion",
+            },
+        }
+        canonical_fields["goal_achievements"] = {
+            "goal_datetime": {
+                "raw_source": "metrika_logs",
+                "raw_field": "ym:s:goalsDateTime",
+                "raw_field_contract": _raw_temporal_field(
+                    raw_sources, "metrika_logs", "ym:s:goalsDateTime"
+                ),
+                "timezone_conversion": "none",
+            },
+        }
+        partial_months["metrika_logs"] = _declared_partial_months(
+            raw_sources["metrika_logs"]
+        )
+
+    if "direct" in sources:
+        canonical_fields["costs"] = {
+            "date": {
+                "raw_source": "direct",
+                "raw_field": "Date",
+                "raw_field_contract": _raw_temporal_field(raw_sources, "direct", "Date"),
+                "timezone_conversion": "none",
+            },
+        }
+        partial_months["direct"] = _declared_partial_months(raw_sources["direct"])
+
+    return {
+        "raw_sources": raw_sources,
+        "canonical_fields": canonical_fields,
+        "partial_months": partial_months,
+    }
+
+
+def _write_canonical_manifest(
+    canonical_dir: Path,
+    tables: list[str],
+    flags: dict[str, Any],
+    join_integrity: list[dict[str, Any]],
+    temporal_provenance: dict[str, Any] | None = None,
+) -> None:
     from datetime import timezone
 
     payload = {
         "tables": sorted(tables),
         "flags": flags,
+        "join_integrity": sorted(join_integrity, key=lambda record: record["join_id"]),
+        "temporal_provenance": temporal_provenance or {
+            "raw_sources": {}, "canonical_fields": {}, "partial_months": {},
+        },
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     with (canonical_dir / CANONICAL_MANIFEST_NAME).open("w", encoding="utf-8") as fh:
@@ -1991,13 +2504,15 @@ def build(
 
     raw_manifest = manifest_mod.load_manifest(raw_dir)
     sources = raw_manifest.get("sources") or {}
+    temporal_provenance = build_temporal_provenance(sources)
 
     built: list[str] = []
     flags: dict[str, Any] = {}
+    join_integrity: list[dict[str, Any]] = []
 
     if "metrika_logs" in sources:
         visits_df, utm_uncertain, backfill_stats = build_visits(
-            raw_dir / "metrika_logs", config, defaults, sources.get("metrika_logs")
+            raw_dir / "metrika_logs", config, defaults, sources.get("metrika_logs"), join_integrity,
         )
         if not visits_df.empty:
             # lookback-визиты (is_lookback_only=True) нужны build_visits только
@@ -2019,6 +2534,28 @@ def build(
             # флага робота, is_robot_available) — фиксируется для аналитика,
             # а не «молча».
             flags["metrika_backfill"] = backfill_stats
+
+        goal_achievements_df, goal_achievements_stats = build_goal_achievements(
+            raw_dir / "metrika_logs"
+        )
+        flags["goal_achievements"] = goal_achievements_stats
+        if not goal_achievements_df.empty:
+            write_canonical_table(
+                goal_achievements_df,
+                "goal_achievements",
+                canonical_dir / "goal_achievements.parquet",
+            )
+            built.append("goal_achievements")
+    else:
+        join_integrity.append(_join_not_applicable_record(
+            join_id="visits_backfill",
+            left_table="visits_base",
+            right_table="visits_backfill",
+            output_table="visits",
+            keys=["visit_id"],
+            expected_cardinality="1:1",
+            reason="metrika_logs_source_absent",
+        ))
 
     if "metrika_reports" in sources:
         goals_df = build_goals(raw_dir / "metrika_reports")
@@ -2052,19 +2589,58 @@ def build(
         macro_goals = direct_cfg.get("macro_goals") or []
         goal_ids = [str(g["id"]) for g in macro_goals] if macro_goals else []
 
-        dq_df = build_direct_queries(direct_dir, direct_entry, macro_goals=macro_goals)
+        query_records_before = len(join_integrity)
+        dq_df = build_direct_queries(
+            direct_dir, direct_entry, macro_goals=macro_goals, join_integrity=join_integrity,
+        )
+        if len(join_integrity) == query_records_before:
+            join_integrity.append(_join_not_applicable_record(
+                join_id="direct_queries_goal_conversions",
+                left_table="direct_queries",
+                right_table="direct_queries_goal_report",
+                output_table="direct_queries",
+                keys=["date", "campaign_id", "campaign_name", "ad_group_id", "query", "match_type", "device"],
+                expected_cardinality="1:1",
+                reason="macro_goals_or_base_rows_absent",
+            ))
         if not dq_df.empty:
             _write_direct_table(dq_df, "direct_queries",
                                 canonical_dir / "direct_queries.parquet", goal_ids)
             built.append("direct_queries")
 
-        dc_df = build_direct_campaigns(direct_dir, direct_entry, macro_goals=macro_goals)
+        campaign_records_before = len(join_integrity)
+        dc_df = build_direct_campaigns(
+            direct_dir, direct_entry, macro_goals=macro_goals, join_integrity=join_integrity,
+        )
+        if len(join_integrity) == campaign_records_before:
+            join_integrity.append(_join_not_applicable_record(
+                join_id="direct_campaigns_goal_conversions",
+                left_table="direct_campaigns",
+                right_table="direct_campaigns_goal_report",
+                output_table="direct_campaigns",
+                keys=["date", "campaign_id", "campaign_name", "device"],
+                expected_cardinality="1:1",
+                reason="macro_goals_or_base_rows_absent",
+            ))
         if not dc_df.empty:
             _write_direct_table(dc_df, "direct_campaigns",
                                 canonical_dir / "direct_campaigns.parquet", goal_ids)
             built.append("direct_campaigns")
 
-        dg_df = build_direct_geo(direct_dir, direct_entry, macro_goals=macro_goals)
+        geo_records_before = len(join_integrity)
+        dg_df = build_direct_geo(
+            direct_dir, direct_entry, macro_goals=macro_goals, join_integrity=join_integrity,
+        )
+        if len(join_integrity) == geo_records_before:
+            join_integrity.append(_join_not_applicable_record(
+                join_id="direct_geo_goal_conversions",
+                left_table="direct_geo",
+                right_table="direct_geo_goal_report",
+                output_table="direct_geo",
+                keys=["date", "campaign_id", "campaign_name", "location_of_presence_id", "location_of_presence_name", "device"],
+                expected_cardinality="1:1",
+                reason="macro_goals_or_base_rows_absent",
+            ))
         if not dg_df.empty:
             _write_direct_table(dg_df, "direct_geo",
                                 canonical_dir / "direct_geo.parquet", goal_ids)
@@ -2084,6 +2660,13 @@ def build(
             )
             built.append("campaign_strategies")
 
+        status_df = build_campaign_status(direct_dir, direct_entry)
+        if not status_df.empty:
+            write_canonical_table(
+                status_df, "campaign_status", canonical_dir / "campaign_status.parquet"
+            )
+            built.append("campaign_status")
+
         ad_texts_active, ad_texts_archived = build_ad_texts(direct_dir)
         if not ad_texts_active.empty:
             write_canonical_table(
@@ -2100,6 +2683,24 @@ def build(
                 "active_count": len(ad_texts_active),
                 "archived_count": len(ad_texts_archived),
             }
+    else:
+        for join_id, left_table, keys in (
+            ("direct_queries_goal_conversions", "direct_queries",
+             ["date", "campaign_id", "campaign_name", "ad_group_id", "query", "match_type", "device"]),
+            ("direct_campaigns_goal_conversions", "direct_campaigns",
+             ["date", "campaign_id", "campaign_name", "device"]),
+            ("direct_geo_goal_conversions", "direct_geo",
+             ["date", "campaign_id", "campaign_name", "location_of_presence_id", "location_of_presence_name", "device"]),
+        ):
+            join_integrity.append(_join_not_applicable_record(
+                join_id=join_id,
+                left_table=left_table,
+                right_table=f"{left_table}_goal_report",
+                output_table=left_table,
+                keys=keys,
+                expected_cardinality="1:1",
+                reason="direct_source_absent",
+            ))
 
     seo_frames: list[pd.DataFrame] = []
     if "gsc" in sources:
@@ -2111,14 +2712,15 @@ def build(
     seo_frames = [f for f in seo_frames if not f.empty]
     if seo_frames:
         seo_df = pd.concat(seo_frames, ignore_index=True)
-        # Дедуп по натуральному ключу (query, page, source, device): одна запись
-        # на пару (запрос, страница) в конкретном device-разрезе внутри каждого
-        # источника. device включён в ключ (задача 4G-seo-queries-device) —
+        # Дедуп по натуральному ключу (query, page, source, device, month): одна
+        # запись на пару (запрос, страница) в конкретном device-разрезе и месяце
+        # внутри каждого источника. device включён в ключ (задача
+        # 4G-seo-queries-device) —
         # иначе строки с разными device для одного (query, page, source) схлопнутся
         # в одну и разбивка по устройствам молча потеряется. Webmaster+GSC с
         # одинаковым (query, page) — разные строки (разный source), не конфликт.
         seo_df = seo_df.drop_duplicates(
-            subset=["query", "page", "source", "device"], keep="first"
+            subset=["query", "page", "source", "device", "month"], keep="first"
         ).reset_index(drop=True)
         min_shows = int(
             ((defaults or {}).get("transform") or {}).get("seo_queries_min_total_shows", 10)
@@ -2129,10 +2731,20 @@ def build(
             built.append("seo_queries")
 
     if "wordstat" in sources:
-        ws_df = build_wordstat(raw_dir / "wordstat")
+        ws_df = build_wordstat(raw_dir / "wordstat", join_integrity)
         if not ws_df.empty:
             write_canonical_table(ws_df, "wordstat", canonical_dir / "wordstat.parquet")
             built.append("wordstat")
+    else:
+        join_integrity.append(_join_not_applicable_record(
+            join_id="wordstat_core_metadata",
+            left_table="wordstat_weekly",
+            right_table="wordstat_core_queries",
+            output_table="wordstat",
+            keys=["normalized_phrase"],
+            expected_cardinality="N:1",
+            reason="wordstat_source_absent",
+        ))
 
     if "crm" in sources:
         crm_df = build_crm(raw_dir / "crm")
@@ -2151,5 +2763,7 @@ def build(
             write_canonical_table(slg_df, "site_link_graph", canonical_dir / "site_link_graph.parquet")
             built.append("site_link_graph")
 
-    _write_canonical_manifest(canonical_dir, built, flags)
+    _write_canonical_manifest(
+        canonical_dir, built, flags, join_integrity, temporal_provenance,
+    )
     return built

@@ -184,6 +184,43 @@ def test_skipped_section_empty_says_all_runnable(tmp_path):
 
 # ── 4. Форматирование ₽ / % / п.п. ──────────────────────────────────────
 
+def test_report_hides_non_publishable_approved_findings(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_finding(paths, "F-visible.yaml", check_id="A04")
+    _write_finding(paths, "F-unavailable.yaml", check_id="T03", status="unavailable")
+    _write_finding(
+        paths, "F-cause-unavailable.yaml", check_id="T09", status="unavailable_for_cause"
+    )
+    _write_finding(
+        paths,
+        "F-context.yaml",
+        check_id="T09",
+        finding="channel_anomaly_context",
+        causal_claim=False,
+    )
+
+    findings = build_report.load_approved_findings(paths.findings_approved)
+
+    assert [finding["check_id"] for finding in findings] == ["A04"]
+
+
+def test_report_shows_t09_cause_limitation_without_registry_skip(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_degradation(paths, skipped=[])
+    _write_metrics_summary(paths)
+    paths.metrics.mkdir(parents=True, exist_ok=True)
+    (paths.metrics / "t09.json").write_text(
+        json.dumps({"summary": {"status": "unavailable_for_cause"}}),
+        encoding="utf-8",
+    )
+
+    out_path = build_report.build(paths, CONFIG, DEFAULTS)
+    text = Path(out_path).read_text(encoding="utf-8")
+
+    assert "**T09** (блок 2): аномалия наблюдается, причина не установлена" in text
+    assert "Все проверки реестра выполнены при текущих источниках." not in text
+
+
 def test_format_rub_rounds_and_formats_thousands():
     assert build_report.format_rub(12345.6, currency_round=0) == "12 346 ₽"
 

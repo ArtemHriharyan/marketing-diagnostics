@@ -39,7 +39,7 @@
                             находки как findings/draft/F-<блок>-<nn>.yaml
                             (не больше schemas.MAX_FINDINGS_PER_RUN).
 
-    Модель и ключ API берутся из project env (только OPENAI_API_KEY),
+    Модель, ключ API и base URL берутся из project env,
     а НЕ из clients/<name>/.env — секреты клиента (принцип 6 CLAUDE.md)
     относятся к источникам данных, а не к самому пайплайну.
 
@@ -68,11 +68,31 @@ from . import validate_findings as validate_findings_mod
 # не несёт бизнес-чисел (см. src/compute/common.py: build_metrics_summary)
 # и в input pack не нужен.
 _METRICS_EXCLUDE_STEMS = frozenset({"degradation_report", "metrics_summary"})
+_NON_FINDING_STATUSES = frozenset({"unavailable", "unavailable_for_cause"})
+_DIAGNOSTIC_CONTEXT_MARKERS = frozenset({"channel_anomaly_context"})
+_LLM_METRIC_PROJECTIONS = {
+    "a19": {"candidate_flag": "cpc_anomalously_high", "include_baseline": False},
+    "a20": {"candidate_flag": "anomalously_low_ctr", "include_baseline": False},
+    "c21": {"candidate_flag": "segment_underperforms_baseline", "include_baseline": True},
+}
 
 INPUT_PACK_ARTIFACT_NAME = "_analyze_input_pack.json"
 
 
 # ── Сбор входного пакета ────────────────────────────────────────────────────
+def _is_non_finding_metric(payload: Any) -> bool:
+    """True, если артефакт — ограничение или диагностический контекст, не finding."""
+    if isinstance(payload, dict):
+        if payload.get("status") in _NON_FINDING_STATUSES:
+            return True
+        if payload.get("finding") in _DIAGNOSTIC_CONTEXT_MARKERS:
+            return True
+        return any(_is_non_finding_metric(value) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_is_non_finding_metric(value) for value in payload)
+    return False
+
+
 def _load_metrics(paths: Any) -> dict[str, Any]:
     """Прочитать все data/metrics/*.json (кроме служебных) как {имя: содержимое}.
 
@@ -87,10 +107,51 @@ def _load_metrics(paths: Any) -> dict[str, Any]:
         if p.stem in _METRICS_EXCLUDE_STEMS:
             continue
         try:
-            result[p.stem] = json.loads(p.read_text(encoding="utf-8"))
+            payload = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
+        if _is_non_finding_metric(payload):
+            continue
+        result[p.stem] = payload
     return result
+
+
+def _project_llm_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Сократить только крупные табличные артефакты для входа LLM.
+
+    Полные metrics остаются артефактами compute и не меняются. Проекция
+    применяется только к a19/a20/c21; остальные проверки передаются как есть.
+    """
+    projected = dict(metrics)
+    for artifact, spec in _LLM_METRIC_PROJECTIONS.items():
+        payload = metrics.get(artifact)
+        if not isinstance(payload, list):
+            continue
+
+        candidate_flag = spec["candidate_flag"]
+        candidates = [
+            row for row in payload
+            if isinstance(row, dict) and row.get(candidate_flag) is True
+        ]
+        context = [
+            row for row in payload
+            if spec["include_baseline"]
+            and isinstance(row, dict)
+            and row.get("is_baseline") is True
+        ]
+        summary = {
+            "total_rows": len(payload),
+            "candidate_rows": len(candidates),
+            "context_rows": len(context),
+            "candidate_flag": candidate_flag,
+        }
+        artifact_projection: dict[str, Any] = {"summary": summary}
+        if candidates:
+            artifact_projection["candidates"] = candidates
+            if spec["include_baseline"]:
+                artifact_projection["context"] = context
+        projected[artifact] = artifact_projection
+    return projected
 
 
 def _load_inputs(paths: Any) -> dict[str, Any]:
@@ -152,6 +213,7 @@ def build_input_pack(
     """
     defaults = defaults or {}
     degradation_report = _load_degradation_report(paths)
+    metrics = _load_metrics(paths)
 
     return {
         "client_context": _client_context(config),
@@ -161,7 +223,7 @@ def build_input_pack(
             if c.get("id")
         },
         "known_check_ids": sorted(schemas.known_check_ids(methodology)),
-        "metrics": _load_metrics(paths),
+        "metrics": _project_llm_metrics(metrics),
         "inputs": _load_inputs(paths),
         "degradation": {
             "runnable_check_ids": degradation_report.get("runnable_check_ids") or [],
@@ -257,11 +319,13 @@ def build_system_prompt(defaults: dict[str, Any] | None = None) -> str:
 
 
 # ── Вызов модели (задача 6B; единственное место в пайплайне — принцип 3) ────
-# Модель и ключ — из project env (только OPENAI_API_KEY), НЕ из
+# Модель, ключ и base URL — из project env, НЕ из
 # clients/<name>/.env — см. докстринг модуля.
 LLM_MODEL_ENV_VAR = "ANALYZE_LLM_MODEL"
 DEFAULT_LLM_MODEL = "gpt-5.6-terra"
-PROXYAPI_OPENAI_BASE_URL = "https://api.proxyapi.ru/openai/v1"
+LLM_BASE_URL_ENV_VAR = "ANALYZE_LLM_BASE_URL"
+DEFAULT_LLM_BASE_URL = "https://api.proxyapi.ru/openai/v1"
+PROXYAPI_API_KEY_ENV_VAR = "PROXYAPI_API_KEY"
 LLM_MAX_TOKENS = 8000          # предсказуемый бюджет одного структурированного вызова
 LLM_TIMEOUT_SECONDS = 180.0
 LLM_MAX_RETRIES = 2            # ретраи транспортного уровня SDK (сеть/429/5xx)
@@ -271,6 +335,10 @@ _FINDING_FIELD_NAMES = frozenset(f.name for f in dataclasses.fields(schemas.Find
 
 def _resolve_llm_model() -> str:
     return os.environ.get(LLM_MODEL_ENV_VAR) or DEFAULT_LLM_MODEL
+
+
+def _resolve_llm_base_url() -> str:
+    return os.environ.get(LLM_BASE_URL_ENV_VAR) or DEFAULT_LLM_BASE_URL
 
 
 def _finding_item_schema() -> dict[str, Any]:
@@ -339,17 +407,18 @@ def _call_llm(
     умолчанию создаётся openai.OpenAI() с ключом только из project env.
     """
     if client is None:
-        api_key = os.environ.get("OPENAI_API_KEY")
+        api_key = os.environ.get(PROXYAPI_API_KEY_ENV_VAR)
         if not api_key:
             raise RuntimeError(
-                "OPENAI_API_KEY не задан в project environment; analyze не читает clients/<name>/.env"
+                "PROXYAPI_API_KEY не задан в project environment; "
+                "analyze не читает clients/<name>/.env"
             )
 
         from openai import OpenAI
 
         client = OpenAI(
             api_key=api_key,
-            base_url=PROXYAPI_OPENAI_BASE_URL,
+            base_url=_resolve_llm_base_url(),
             timeout=LLM_TIMEOUT_SECONDS,
             max_retries=LLM_MAX_RETRIES,
         )
@@ -457,6 +526,7 @@ def draft(
     defaults = orchestrator_mod.load_defaults()
 
     pack = build_input_pack(paths, config, methodology, defaults)
+    full_metrics = _load_metrics(paths)
     system_prompt = build_system_prompt(defaults)
 
     out_path = Path(paths.findings_draft) / INPUT_PACK_ARTIFACT_NAME
@@ -489,7 +559,7 @@ def draft(
         errors = schemas.validate_finding(finding, known_ids=known_ids, confidence_cap=cap)
         errors += validate_findings_mod.validate_finding_evidence(
             finding,
-            metrics=pack["metrics"],
+            metrics=full_metrics,
             inputs=pack["inputs"],
             degradation_report=degradation_report,
         )

@@ -95,7 +95,7 @@ from . import _common as C
 
 SCRIPT_VERSION = "0.4.0"
 SOURCE = "direct"
-CANONICAL_TABLES = ["costs", "direct_queries"]
+CANONICAL_TABLES = ["costs", "direct_queries", "campaign_status"]
 
 # Базис расхода: НЕТТО без НДС, Cost в микрорублях (деление — в transform).
 COST_BASIS = "net_no_vat"
@@ -109,6 +109,11 @@ ADEXTENSIONS_URL = "https://api.direct.yandex.com/json/v5/adextensions"
 KEYWORDS_URL = "https://api.direct.yandex.com/json/v5/keywords"
 BIDMODIFIERS_URL = "https://api.direct.yandex.com/json/v5/bidmodifiers"
 FEEDS_URL = "https://api.direct.yandex.com/json/v5/feeds"
+
+TARGETING_RAW_ARTIFACT = "direct/campaign_targeting.json"
+ADGROUPS_TARGETING_FIELDS = ["Id", "Name", "CampaignId", "RegionIds", "NegativeKeywords"]
+BID_MODIFIERS_TARGETING_FIELDS = ["Id", "CampaignId", "AdGroupId", "Type"]
+BID_MODIFIER_TARGETING_TYPES = ["DEMOGRAPHICS", "DESKTOP", "MOBILE", "REGIONAL"]
 
 # Число повторов при статусе «отчёт готовится» (201/202 + Retry-In).
 REPORT_MAX_POLLS = 60
@@ -639,13 +644,20 @@ def _run_window_extract(
     campaign_ids = [c["Id"] for c in campaigns if c.get("Id") is not None]
 
     # 6. Настройки таргетинга (гео/устройства/расписание/корректировки).
+    targeting_progress = _new_targeting_progress(campaign_ids)
     try:
-        targeting = _fetch_targeting(session, headers, campaign_ids)
+        targeting = _fetch_targeting(session, headers, campaign_ids, targeting_progress)
         with (out_dir / "campaign_targeting.json").open("w", encoding="utf-8") as fh:
             json.dump(targeting, fh, ensure_ascii=False, indent=2)
+        targeting_provenance = _build_targeting_provenance(
+            targeting_progress, raw_artifact_saved=True,
+        )
     except C.AuthError:
         raise
     except C.SourceUnavailable as exc:
+        targeting_provenance = _build_targeting_provenance(
+            targeting_progress, raw_artifact_saved=False,
+        )
         notes.append(f"настройки таргетинга недоступны: {exc}")
 
     # 7. Тексты объявлений + расширения.
@@ -772,6 +784,7 @@ def _run_window_extract(
         report_status=report_status,
         geo_report_available=geo_report_available,
         window_infos=window_infos,
+        targeting_provenance=targeting_provenance,
     )
     log(
         f"{SOURCE}: готово — расходы {campaign_rows} строк, запросы {query_rows} строк, "
@@ -1065,6 +1078,7 @@ def _retry_in(response: Any) -> float:
 # ── JSON API v5 (campaigns / adgroups / ads / keywords / bidmodifiers / feeds)
 def _get_all(
     session, headers, url, params: dict[str, Any], *, result_key: str, context: str,
+    progress: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Постраничный get JSON-API v5: тянем страницы по LimitedBy до исчерпания."""
     items: list[dict[str, Any]] = []
@@ -1074,17 +1088,38 @@ def _get_all(
         page_params = dict(params)
         page_params.setdefault("SelectionCriteria", {})
         page_params["Page"] = {"Limit": page_limit, "Offset": offset}
-        resp = C.http_request(
-            session, "POST", url,
-            source=SOURCE, headers=headers, json={"method": "get", "params": page_params},
-            timeout=60,
-        )
-        C.ensure_ok(resp, SOURCE, context)
-        _raise_for_api_error(resp, context)  # ошибка приходит как 200+error
-        result = resp.json().get("result") or {}
-        items.extend(result.get(result_key) or [])
+        try:
+            resp = C.http_request(
+                session, "POST", url,
+                source=SOURCE, headers=headers, json={"method": "get", "params": page_params},
+                timeout=60,
+            )
+            C.ensure_ok(resp, SOURCE, context)
+            _raise_for_api_error(resp, context)  # ошибка приходит как 200+error
+            result = resp.json().get("result") or {}
+        except Exception:
+            if progress is not None:
+                progress["failed"] = True
+            raise
+        page_items = result.get(result_key) or []
+        items.extend(page_items)
+        if progress is not None:
+            progress["pages_fetched"] += 1
+            progress["rows"] = len(items)
+            progress["unique_id_values"].update(
+                item.get(progress["id_field"])
+                for item in page_items
+                if item.get(progress["id_field"]) is not None
+            )
+            progress["returned_campaign_values"].update(
+                item.get(progress["campaign_field"])
+                for item in page_items
+                if item.get(progress["campaign_field"]) is not None
+            )
         limited = result.get("LimitedBy")
         if limited is None:
+            if progress is not None:
+                progress["pages_complete"] = True
             break
         offset = limited
     return items
@@ -1190,31 +1225,132 @@ def _archived_retrievable(campaigns: list[dict[str, Any]]) -> bool:
     return any((c.get("State") or "").upper() == "ARCHIVED" for c in campaigns)
 
 
-def _fetch_targeting(session, headers, campaign_ids: list[int]) -> dict[str, Any]:
+def _new_targeting_progress(campaign_ids: list[int]) -> dict[str, dict[str, Any]]:
+    """Создать не содержащий строк ответа прогресс двух targeting-сервисов."""
+    requested_campaign_values = {
+        campaign_id for campaign_id in campaign_ids if campaign_id is not None
+    }
+    return {
+        "ad_groups": {
+            "service": "adgroups.get",
+            "requested_fields": list(ADGROUPS_TARGETING_FIELDS),
+            "requested_types": [],
+            "requested_campaign_values": requested_campaign_values,
+            "id_field": "Id",
+            "campaign_field": "CampaignId",
+            "attempted": False,
+            "pages_fetched": 0,
+            "pages_complete": False,
+            "rows": 0,
+            "unique_id_values": set(),
+            "returned_campaign_values": set(),
+            "failed": False,
+        },
+        "bid_modifiers": {
+            "service": "bidmodifiers.get",
+            "requested_fields": list(BID_MODIFIERS_TARGETING_FIELDS),
+            "requested_types": sorted(BID_MODIFIER_TARGETING_TYPES),
+            "requested_campaign_values": requested_campaign_values,
+            "id_field": "Id",
+            "campaign_field": "CampaignId",
+            "attempted": False,
+            "pages_fetched": 0,
+            "pages_complete": False,
+            "rows": 0,
+            "unique_id_values": set(),
+            "returned_campaign_values": set(),
+            "failed": False,
+        },
+    }
+
+
+def _build_targeting_provenance_entry(
+    progress: dict[str, Any], *, raw_artifact_saved: bool,
+) -> dict[str, Any]:
+    """Построить детерминированную запись manifest без ID и строк клиента."""
+    requested = progress["requested_campaign_values"]
+    returned = progress["returned_campaign_values"]
+    attempted = bool(progress["attempted"])
+    pages_complete = bool(progress["pages_complete"])
+    missing_count = None if not attempted else len(requested - returned)
+    coverage_known = bool(attempted and pages_complete and not progress["failed"] and (
+        not requested or requested.issubset(returned)
+    ))
+
+    if not attempted:
+        status = "not_requested"
+    elif progress["failed"]:
+        status = "partial" if progress["pages_fetched"] else "failed"
+    elif not pages_complete or not raw_artifact_saved:
+        status = "partial"
+    elif not coverage_known:
+        status = "unknown"
+    else:
+        status = "complete"
+
+    return {
+        "service": progress["service"],
+        "attempted": attempted,
+        "status": status,
+        "requested_fields": list(progress["requested_fields"]),
+        "requested_types": list(progress["requested_types"]),
+        "pages_complete": pages_complete,
+        "rows": int(progress["rows"]),
+        "unique_ids": {"count": len(progress["unique_id_values"])},
+        "requested_campaigns": {"count": len(requested)},
+        "returned_campaigns": {"count": len(returned)},
+        "missing_campaigns": {"count": missing_count},
+        "raw_artifact": TARGETING_RAW_ARTIFACT,
+        "snapshot": {"raw_artifact_saved": raw_artifact_saved},
+        "evidence": {
+            "pages_fetched": int(progress["pages_fetched"]),
+            "campaign_coverage": "known" if coverage_known else "unknown",
+        },
+    }
+
+
+def _build_targeting_provenance(
+    progress_by_service: dict[str, dict[str, Any]], *, raw_artifact_saved: bool,
+) -> dict[str, dict[str, Any]]:
+    return {
+        service: _build_targeting_provenance_entry(
+            progress, raw_artifact_saved=raw_artifact_saved,
+        )
+        for service, progress in progress_by_service.items()
+    }
+
+
+def _fetch_targeting(
+    session, headers, campaign_ids: list[int], progress_by_service: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
     """Гео (adgroups.RegionIds) + корректировки ставок/устройства/расписание
     (bidmodifiers.get) по кампании/группе (A12–A14, A16).
 
     adgroups.get требует непустой SelectionCriteria (error 4001) — фильтруем
     по CampaignIds, полученным из campaigns.get (шаг 5).
     """
+    ad_groups_progress = progress_by_service["ad_groups"]
+    ad_groups_progress["attempted"] = True
     ad_groups = _get_all(
         session, headers, ADGROUPS_URL,
         {
             "SelectionCriteria": {"CampaignIds": campaign_ids},
-            "FieldNames": ["Id", "Name", "CampaignId", "RegionIds", "NegativeKeywords"],
+            "FieldNames": ADGROUPS_TARGETING_FIELDS,
         },
-        result_key="AdGroups", context="adgroups.get",
+        result_key="AdGroups", context="adgroups.get", progress=ad_groups_progress,
     )
+    bid_modifiers_progress = progress_by_service["bid_modifiers"]
+    bid_modifiers_progress["attempted"] = True
     bid_modifiers = _get_all(
         session, headers, BIDMODIFIERS_URL,
         {
-            "FieldNames": ["Id", "CampaignId", "AdGroupId", "Type"],
+            "FieldNames": BID_MODIFIERS_TARGETING_FIELDS,
             "MobileAdjustmentFieldNames": ["BidModifier"],
             "DesktopAdjustmentFieldNames": ["BidModifier"],
             "DemographicsAdjustmentFieldNames": ["Age", "Gender", "BidModifier"],
             "RegionalAdjustmentFieldNames": ["RegionId", "BidModifier"],
         },
-        result_key="BidModifiers", context="bidmodifiers.get",
+        result_key="BidModifiers", context="bidmodifiers.get", progress=bid_modifiers_progress,
     )
     return {"ad_groups": ad_groups, "bid_modifiers": bid_modifiers}
 
@@ -1387,6 +1523,13 @@ def _fetch_feed(session, headers, notes: list[str]) -> list[dict[str, Any]]:
     return [_feed_row(f) for f in items]
 
 
+def _add_targeting_provenance(
+    extra: dict[str, Any], targeting_provenance: dict[str, dict[str, Any]] | None,
+) -> None:
+    """Добавить изолированную provenance-запись без изменения остальных extra-полей."""
+    extra["targeting_provenance"] = targeting_provenance or {}
+
+
 def _record_manifest(
     paths, source_key, date_from, date_to, rows, *,
     has_lost_is: bool, archived_retrievable: bool, feed_used: bool,
@@ -1402,6 +1545,7 @@ def _record_manifest(
     report_status: dict[str, str] | None = None,
     geo_report_available: bool = True,
     window_infos: dict[str, dict] | None = None,
+    targeting_provenance: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
@@ -1409,12 +1553,21 @@ def _record_manifest(
         statistics_field_scope = STATISTICS_FIELD_SCOPE_UNKNOWN
 
     extra: dict[str, Any] = {
+        "temporal_provenance": _temporal_provenance(date_from, date_to),
         # Базис расхода: НЕТТО без НДС, Cost в микрорублях (деление — в transform).
         "cost_basis": COST_BASIS,
         "cost_micros_per_rub": COST_MICROS_PER_RUB,
         # Приёмочные флаги (первый реальный прогон).
         "campaign_report_has_lost_impression_share": has_lost_is,
         "archived_campaigns_retrievable": archived_retrievable,
+        # D08: снимок текущих API-статусов кампаний. observed_at берётся из
+        # fetched_at самой записи manifest при transform, чтобы не дублировать
+        # время и не связывать статус с произвольной датой отчёта расходов.
+        "campaign_status_provenance": {
+            "source": "direct.campaigns.get",
+            "requested_states": list(CAMPAIGN_STATES_ALL),
+            "raw_path": "direct/campaign_strategies.json",
+        },
         "feed_used": feed_used,
         "geo_report_available": geo_report_available,
         # 2A-direct-strategy: Strategy — факт наличия + сырые образцы структуры
@@ -1455,6 +1608,7 @@ def _record_manifest(
         "query_period_logs": query_period_logs,
         "geo_period_logs": geo_period_logs,
     }
+    _add_targeting_provenance(extra, targeting_provenance)
     if goal_period_logs:
         extra["goal_period_logs"] = goal_period_logs
     if not macro_goals_configured:
@@ -1485,3 +1639,27 @@ def _record_manifest(
         canonical_tables=CANONICAL_TABLES,
         extra=extra,
     )
+
+
+def _temporal_provenance(date_from, date_to) -> dict[str, Any]:
+    """Детерминированный temporal-контракт Direct Reports для raw manifest.
+
+    TimeZone из campaigns.get относится к расписанию кампании и намеренно не
+    участвует в этом контракте статистического отчёта.
+    """
+    return {
+        "requested_window": {
+            "date_from": C.fmt(date_from),
+            "date_to": C.fmt(date_to),
+            "boundary_semantics": "unknown",
+        },
+        "zero_day_policy": "unknown",
+        "fields": {
+            "Date": {
+                "event": "direct_statistics_day",
+                "data_type": "date",
+                "timezone_contract": "Europe/Moscow",
+                "evidence": "direct_reports_contract",
+            },
+        },
+    }

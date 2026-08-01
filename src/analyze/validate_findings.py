@@ -51,6 +51,21 @@ _REL_TOL = 1e-3
 # HIGH/MED/LOW — то же множество, что использует degradation.min_confidence
 # для сравнения уровней; client-HIGH сюда не входит (см. validate_finding_evidence).
 _CONFIDENCE_LEVELS = frozenset({"HIGH", "MED", "LOW"})
+_NON_FINDING_STATUSES = frozenset({"unavailable", "unavailable_for_cause"})
+_DIAGNOSTIC_CONTEXT_MARKERS = frozenset({"channel_anomaly_context"})
+
+
+def _is_non_finding_metric(payload: Any) -> bool:
+    """True для статуса ограничения или контекста, который нельзя превратить в finding."""
+    if isinstance(payload, dict):
+        if payload.get("status") in _NON_FINDING_STATUSES:
+            return True
+        if payload.get("finding") in _DIAGNOSTIC_CONTEXT_MARKERS:
+            return True
+        return any(_is_non_finding_metric(value) for value in payload.values())
+    if isinstance(payload, list):
+        return any(_is_non_finding_metric(value) for value in payload)
+    return False
 
 
 def _normalize_number(raw: str) -> float | None:
@@ -177,6 +192,16 @@ def validate_finding_evidence(
     degradation_report = degradation_report or {}
 
     source_rows = check_source_metrics(finding.check_id, metrics)
+    if finding.status in _NON_FINDING_STATUSES:
+        errors.append(
+            f"status={finding.status!r} — ограничение compute не может стать finding"
+        )
+    if _is_non_finding_metric(source_rows):
+        errors.append(
+            f"check_id={finding.check_id!r} содержит ограничение или диагностический контекст "
+            "и не может стать finding"
+        )
+        return errors
     if source_rows is None:
         errors.append(
             f"source_file для check_id={finding.check_id!r} не найден в data/metrics "

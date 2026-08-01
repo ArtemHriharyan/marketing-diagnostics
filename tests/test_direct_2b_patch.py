@@ -93,7 +93,7 @@ def _geo_tsv():
     )
 
 
-def _direct_routes(box, *, campaign_tsv=None):
+def _direct_routes(box, *, campaign_tsv=None, ad_groups=None, bid_modifiers=None):
     """HTTP-моки для тестов 2B-patch (упрощённый набор)."""
     campaign_tsv = campaign_tsv or _campaign_tsv()
 
@@ -120,8 +120,8 @@ def _direct_routes(box, *, campaign_tsv=None):
             {"Id": 1, "Name": "Поиск", "TextCampaign": {
                 "BiddingStrategy": {"Search": {"BiddingStrategyType": "HIGHEST_POSITION"}}}}
         ]}})),
-        (_contains("/adgroups"), FakeResponse(json_data={"result": {"AdGroups": []}})),
-        (_contains("/bidmodifiers"), FakeResponse(json_data={"result": {"BidModifiers": []}})),
+        (_contains("/adgroups"), FakeResponse(json_data={"result": {"AdGroups": ad_groups or []}})),
+        (_contains("/bidmodifiers"), FakeResponse(json_data={"result": {"BidModifiers": bid_modifiers or []}})),
         (_contains("/adextensions"), FakeResponse(json_data={"result": {"AdExtensions": []}})),
         (_contains("/ads"), FakeResponse(json_data={"result": {"Ads": []}})),
         (_contains("/keywords"), FakeResponse(json_data={"result": {"Keywords": []}})),
@@ -368,7 +368,11 @@ def test_join_key_not_unique_fails(tmp_path):
     goals_base_dir.mkdir()
 
     with pytest.raises(ValueError, match="не уникален"):
-        bc._join_goal_convs(base_df, goals_base_dir, ["999"], key_cols)
+        bc._join_goal_convs(
+            base_df, goals_base_dir, ["999"], key_cols,
+            join_id_prefix="direct_queries_goal_conversions",
+            left_table="direct_queries",
+        )
 
 
 # ── join_cost_preserved: сумма cost_normalized не меняется после джойна ─────
@@ -394,7 +398,11 @@ def test_join_cost_preserved(tmp_path):
         encoding="utf-8",
     )
 
-    result = bc._join_goal_convs(base_df, tmp_path / "goals", ["100"], key_cols)
+    result = bc._join_goal_convs(
+        base_df, tmp_path / "goals", ["100"], key_cols,
+        join_id_prefix="direct_queries_goal_conversions",
+        left_table="direct_queries",
+    )
     assert result["cost_normalized"].sum() == pytest.approx(8.0)  # 5.0 + 3.0
 
 
@@ -711,6 +719,118 @@ def test_targeting_requires_campaign_ids(tmp_path):
         assert criteria.get("CampaignIds"), (
             f"adgroups.get должен получать непустой CampaignIds: {criteria}"
         )
+
+
+def test_targeting_provenance_complete_and_saved_in_direct_manifest(tmp_path):
+    """Успешные targeting-сервисы фиксируются отдельно после записи raw artifact."""
+    paths = Paths(tmp_path / "data" / "raw")
+    (tmp_path / "data" / "raw").mkdir(parents=True, exist_ok=True)
+    box = {}
+    session = FakeSession(_direct_routes(
+        box,
+        ad_groups=[{"Id": 10, "CampaignId": 1, "RegionIds": [1]}],
+        bid_modifiers=[{"Id": 20, "CampaignId": 1, "Type": "MOBILE"}],
+    ))
+    box["session"] = session
+
+    direct.extract(CONFIG_DIRECT, ENV, paths, session=session, sleeper=NO_SLEEP)
+
+    targeting = manifest_mod.load_manifest(paths.raw)["sources"]["direct"]["targeting_provenance"]
+    ad_groups = targeting["ad_groups"]
+    bid_modifiers = targeting["bid_modifiers"]
+    assert ad_groups["service"] == "adgroups.get"
+    assert ad_groups["status"] == "complete"
+    assert ad_groups["requested_fields"] == direct.ADGROUPS_TARGETING_FIELDS
+    assert ad_groups["pages_complete"] is True
+    assert ad_groups["rows"] == 1
+    assert ad_groups["unique_ids"] == {"count": 1}
+    assert ad_groups["raw_artifact"] == "direct/campaign_targeting.json"
+    assert ad_groups["snapshot"] == {"raw_artifact_saved": True}
+    assert bid_modifiers["service"] == "bidmodifiers.get"
+    assert bid_modifiers["status"] == "complete"
+    assert bid_modifiers["requested_types"] == ["DEMOGRAPHICS", "DESKTOP", "MOBILE", "REGIONAL"]
+
+
+def test_targeting_provenance_records_complete_multiple_pages():
+    """complete требует последней страницы без LimitedBy, а не только первой."""
+    progress = direct._new_targeting_progress([1, 2])["ad_groups"]
+    progress["attempted"] = True
+
+    def paged(n):
+        if n == 0:
+            return FakeResponse(json_data={"result": {
+                "AdGroups": [{"Id": 10, "CampaignId": 1}], "LimitedBy": 1,
+            }})
+        return FakeResponse(json_data={"result": {
+            "AdGroups": [{"Id": 20, "CampaignId": 2}],
+        }})
+
+    session = FakeSession([(_contains("/adgroups"), paged)])
+    rows = direct._get_all(
+        session, {}, direct.ADGROUPS_URL,
+        {"SelectionCriteria": {"CampaignIds": [1, 2]}, "FieldNames": direct.ADGROUPS_TARGETING_FIELDS},
+        result_key="AdGroups", context="adgroups.get", progress=progress,
+    )
+    entry = direct._build_targeting_provenance_entry(progress, raw_artifact_saved=True)
+
+    assert len(rows) == 2
+    assert entry["status"] == "complete"
+    assert entry["pages_complete"] is True
+    assert entry["evidence"]["pages_fetched"] == 2
+
+
+def test_targeting_provenance_successful_empty_answer_can_be_complete():
+    """Нулевой ответ без запрошенных кампаний не превращается в failed."""
+    progress = direct._new_targeting_progress([])["ad_groups"]
+    progress["attempted"] = True
+    session = FakeSession([(_contains("/adgroups"), FakeResponse(json_data={"result": {"AdGroups": []}}))])
+    direct._get_all(
+        session, {}, direct.ADGROUPS_URL,
+        {"SelectionCriteria": {"CampaignIds": []}, "FieldNames": direct.ADGROUPS_TARGETING_FIELDS},
+        result_key="AdGroups", context="adgroups.get", progress=progress,
+    )
+
+    entry = direct._build_targeting_provenance_entry(progress, raw_artifact_saved=True)
+    assert entry["status"] == "complete"
+    assert entry["rows"] == 0
+    assert entry["missing_campaigns"] == {"count": 0}
+
+
+def test_targeting_provenance_marks_unknown_campaign_coverage():
+    """Пустой ответ на непустой CampaignIds не доказывает отсутствие групп."""
+    progress = direct._new_targeting_progress([1])["ad_groups"]
+    progress["attempted"] = True
+    progress["pages_fetched"] = 1
+    progress["pages_complete"] = True
+
+    entry = direct._build_targeting_provenance_entry(progress, raw_artifact_saved=True)
+    assert entry["status"] == "unknown"
+    assert entry["evidence"]["campaign_coverage"] == "unknown"
+    assert entry["missing_campaigns"] == {"count": 1}
+
+
+def test_targeting_provenance_marks_partial_and_failed_without_swallowing_errors():
+    """Чистый builder сохраняет distinction partial/failed; extract по-прежнему пробрасывает AuthError."""
+    partial = direct._new_targeting_progress([1])["bid_modifiers"]
+    partial.update({"attempted": True, "pages_fetched": 1, "rows": 1, "failed": True})
+    failed = direct._new_targeting_progress([1])["bid_modifiers"]
+    failed.update({"attempted": True, "failed": True})
+
+    assert direct._build_targeting_provenance_entry(
+        partial, raw_artifact_saved=False,
+    )["status"] == "partial"
+    assert direct._build_targeting_provenance_entry(
+        failed, raw_artifact_saved=False,
+    )["status"] == "failed"
+
+
+def test_targeting_provenance_modifier_types_are_sorted_and_limited_to_requested():
+    """В manifest попадают только реально запрошенные type-specific поля."""
+    entry = direct._build_targeting_provenance_entry(
+        direct._new_targeting_progress([])["bid_modifiers"], raw_artifact_saved=False,
+    )
+    assert entry["requested_types"] == sorted(entry["requested_types"])
+    assert entry["requested_types"] == ["DEMOGRAPHICS", "DESKTOP", "MOBILE", "REGIONAL"]
 
 
 def test_ad_texts_requires_campaign_ids(tmp_path):

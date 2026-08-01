@@ -134,6 +134,7 @@ PATCH_DATE = "2026-07-22"
 # ВНИМАНИЕ (квирк Logs API): создание запроса и evaluate — множественное число
 # /logrequests, а статус/скачивание/очистка — ЕДИНСТВЕННОЕ /logrequest/{id}.
 API_BASE = "https://api-metrika.yandex.net/management/v1/counter"
+COUNTER_TIMEZONE_EVIDENCE = "metrika_management_counter"
 
 # Базовый набор полей визита (до патча). Порядок фиксирован — на него опирается
 # transform. Все поля базы поддерживаются источником visits.
@@ -556,6 +557,9 @@ def _run_full(
         sleeper=sleeper, log=log,
     )
 
+    temporal_provenance = _temporal_provenance(
+        date_from, date_to, _fetch_counter_timezone(session, counter_id, headers),
+    )
     manifest = _record_manifest(paths, source_key, date_from, date_to, total_rows, extra={
         "schema_version": SCHEMA_VERSION,
         "fields": fields,
@@ -569,6 +573,7 @@ def _run_full(
         "region_field": region_field,
         "region_field_verified": region_verified,
         "region_field_error": region_error,
+        "temporal_provenance": temporal_provenance,
         **lookback_stats,
     })
     log(f"{SOURCE}: готово — {parts_written} частей, {total_rows} визитов; "
@@ -640,6 +645,9 @@ def _run_backfill(
     available = VISIT_FIELDS_BASE + accepted + [region_field]   # полный набор после склейки base+backfill
     # backfill_dir — путь относительно data/raw/ (для transform/verify_metrika).
     backfill_dir = (Path(src_dir).relative_to(Path(paths.raw)) / BACKFILL_SUBDIR).as_posix()
+    temporal_provenance = _temporal_provenance(
+        date_from, date_to, _fetch_counter_timezone(session, counter_id, headers),
+    )
     manifest = _record_manifest(paths, source_key, date_from, date_to, total_rows, extra={
         "schema_version": SCHEMA_VERSION,
         "fields": available,
@@ -656,6 +664,7 @@ def _run_backfill(
         "region_field": region_field,
         "region_field_verified": region_verified,
         "region_field_error": region_error,
+        "temporal_provenance": temporal_provenance,
         "note": ("новые поля патча довыгружены в подкаталог backfill/ "
                  "(visits_backfill_*), старые visits_* не изменялись (неизменность "
                  "слоя raw). Склейка по ym:s:visitID — в transform."),
@@ -956,6 +965,67 @@ def manifest_load(raw_root: Path) -> dict[str, Any]:
     from ..pipeline import manifest as manifest_mod
 
     return manifest_mod.load_manifest(Path(raw_root))
+
+
+def _fetch_counter_timezone(session, counter_id, headers) -> dict[str, Any]:
+    """Получить timezone счётчика без подстановки значения по умолчанию."""
+    try:
+        response = C.http_request(
+            session, "GET", f"{API_BASE}/{counter_id}",
+            source=SOURCE, headers=headers, timeout=30,
+        )
+        C.ensure_ok(response, SOURCE, "counter timezone")
+        counter = (response.json() or {}).get("counter") or {}
+    except C.SourceUnavailable:
+        return {
+            "status": "unknown",
+            "reason": "counter_metadata_unavailable",
+            "evidence": COUNTER_TIMEZONE_EVIDENCE,
+        }
+    except (TypeError, ValueError):
+        return {
+            "status": "unknown",
+            "reason": "counter_metadata_invalid",
+            "evidence": COUNTER_TIMEZONE_EVIDENCE,
+        }
+
+    name = counter.get("time_zone_name")
+    offset = counter.get("time_zone_offset")
+    if isinstance(name, str) and name and isinstance(offset, int) and not isinstance(offset, bool):
+        return {
+            "status": "known",
+            "time_zone_name": name,
+            "time_zone_offset": offset,
+            "evidence": COUNTER_TIMEZONE_EVIDENCE,
+        }
+    return {
+        "status": "unknown",
+        "reason": "counter_time_zone_metadata_missing",
+        "evidence": COUNTER_TIMEZONE_EVIDENCE,
+    }
+
+
+def _temporal_provenance(date_from, date_to, counter_timezone: dict[str, Any]) -> dict[str, Any]:
+    """Детерминированный temporal-контракт Logs API для raw manifest."""
+    return {
+        "requested_window": {
+            "date_from": C.fmt(date_from),
+            "date_to": C.fmt(date_to),
+            "boundary_semantics": "unknown",
+        },
+        "fields": {
+            "ym:s:dateTime": {
+                "event": "visit",
+                "data_type": "datetime",
+                "timezone": counter_timezone,
+            },
+            "ym:s:goalsDateTime": {
+                "event": "goal_achievement",
+                "data_type": "array_datetime",
+                "timezone_contract": "UTC+03:00",
+            },
+        },
+    }
 
 
 def _record_manifest(paths, source_key, date_from, date_to, rows, *, extra=None) -> dict[str, Any]:

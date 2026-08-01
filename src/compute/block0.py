@@ -33,24 +33,16 @@ manifest.json источника direct, который canonical-manifest не 
                data/metrics/degradation_report.json (confidence_cap на проверку).
     Пишет    — data/metrics/{d01..d12}.csv/.json. БЕЗ LLM.
 
-Разрыв D02/D03 vs runnable_ids (см. docs/implementation_status.md, запись
-4I-goals-canonical): src/extract/metrika_reports.py::CANONICAL_TABLES пока не
-объявляет "goals", поэтому data/raw/manifest.json никогда не перечисляет
-"goals" среди available_tables и degradation.build_degradation_report держит
-D02/D03 в состоянии runnable=False даже когда data/canonical/goals.parquet
-физически существует и непуст. Это ограничение extract-слоя (вне
-allowed_files этой задачи), не факт отсутствия данных — поэтому D02/D03
-НЕ гейтятся здесь через runnable_ids: доступность проверяется напрямую по
-канонической таблице goals. Если goals.parquet отсутствует или пуст, D02/D03
-получают явную запись со статусом "unavailable" и причиной "goals metadata
-недоступна" — не пропускаются молча.
+D02/D03 запускаются только по ``runnable_ids`` из degradation. Если проверка
+штатно runnable, но goals.parquet отсутствует или пуст, пишется явный результат
+со статусом "unavailable", а не молчаливый пропуск.
 """
 
 from __future__ import annotations
 
-import calendar
 import json
-from datetime import timedelta
+import math
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -85,10 +77,8 @@ _SUBMIT_NAME_KEYWORDS: tuple[str, ...] = (
     "отправ", "заявк", "заказ", "оформ", "submit", "send", "оплат", "бронир",
 )
 
-# D08: кампания считается «остановленной до конца периода», если последний день
-# с расходом отстоит от конца окна (последний день с расходом Директа в costs)
-# больше, чем на этот запас — защита от кампаний, которые просто не потратили
-# в самый последний день окна (не значит «остановлена»).
+# D08: последний положительный расход — только supporting evidence: он не
+# устанавливает API-статус кампании и не создаёт finding самостоятельно.
 _D08_STOPPED_CAMPAIGN_BUFFER_DAYS = 14
 
 # D10: сколько дат без визитов показывать построчно в артефакте — сам факт и
@@ -417,8 +407,77 @@ def _months_in_range(date_from: Any, date_to: Any) -> int:
     return (date_to.year - date_from.year) * 12 + (date_to.month - date_from.month) + 1
 
 
+def _parse_declared_costs(value: Any, field_name: str) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]]]:
+    """Проверить контракт Q02 и вернуть нормализованные записи либо ошибки.
+
+    Неизвестный формат не подменяется нулевым расходом: при любой ошибке поля
+    возвращается ``None``, а D07 записывает отдельную диагностическую строку.
+    """
+    if not isinstance(value, list):
+        return None, [{
+            "field": field_name,
+            "entry_index": None,
+            "reason": "ожидался список записей",
+        }]
+
+    entries: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    for index, entry in enumerate(value):
+        if not isinstance(entry, dict):
+            issues.append({
+                "field": field_name,
+                "entry_index": index,
+                "reason": "запись должна быть объектом",
+            })
+            continue
+
+        name = entry.get("name")
+        source_tag = entry.get("source_tag")
+        rub_month = entry.get("rub_month")
+        if not isinstance(name, str) or not name.strip():
+            issues.append({
+                "field": field_name,
+                "entry_index": index,
+                "reason": "name должен быть непустой строкой",
+            })
+        if not isinstance(source_tag, str) or not source_tag.strip():
+            issues.append({
+                "field": field_name,
+                "entry_index": index,
+                "reason": "source_tag должен быть непустой строкой",
+            })
+        if (
+            isinstance(rub_month, bool)
+            or not isinstance(rub_month, (int, float))
+            or not math.isfinite(float(rub_month))
+            or rub_month < 0
+        ):
+            issues.append({
+                "field": field_name,
+                "entry_index": index,
+                "reason": "rub_month должен быть конечным неотрицательным числом",
+            })
+
+        if not any(issue["entry_index"] == index for issue in issues):
+            entries.append({
+                "name": name.strip(),
+                "source_tag": source_tag.strip(),
+                "rub_month": float(rub_month),
+            })
+
+    return (None, issues) if issues else (entries, [])
+
+
+def _declared_costs_signature(entries: list[dict[str, Any]]) -> list[tuple[str, str, float]]:
+    """Сравнить два Q02-поля как набор статей, не зависящий от порядка YAML."""
+    return sorted(
+        (entry["name"], entry["source_tag"], entry["rub_month"])
+        for entry in entries
+    )
+
+
 def _run_d07(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
-    """Q02 (hidden_costs_rub_month) против costs.parquet + правило §4.8 каталога.
+    """Q02 против costs.parquet + правило §4.8 каталога.
 
     Два независимых сигнала: (1) заявленная клиентом статья расхода отсутствует
     или занижена в costs.parquet (сверка Q02 с фактом, тот же паттерн, что D06
@@ -429,7 +488,56 @@ def _run_d07(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     """
     inputs = common.load_inputs(paths)
     client_answers = inputs.get("client_answers") or {}
-    hidden_costs = (client_answers.get("finance") or {}).get("hidden_costs_rub_month") or []
+    finance = client_answers.get("finance") or {}
+    rows: list[dict[str, Any]] = []
+
+    if not isinstance(finance, dict):
+        canonical_costs = legacy_costs = None
+        input_issues = [{
+            "field": "finance",
+            "entry_index": None,
+            "reason": "ожидался объект с ответами Q02",
+        }]
+    else:
+        canonical_present = "hidden_costs_rub_month" in finance
+        legacy_present = "costs_outside_cabinet" in finance
+        canonical_costs, canonical_issues = (
+            _parse_declared_costs(finance["hidden_costs_rub_month"], "hidden_costs_rub_month")
+            if canonical_present else (None, [])
+        )
+        legacy_costs, legacy_issues = (
+            _parse_declared_costs(finance["costs_outside_cabinet"], "costs_outside_cabinet")
+            if legacy_present else (None, [])
+        )
+        input_issues = canonical_issues + legacy_issues
+
+    for issue in input_issues:
+        rows.append({
+            "check_id": "D07",
+            "finding": "malformed_declared_cost_input",
+            **issue,
+            "confidence": _cap("MED", confidence_cap),
+        })
+
+    declared_costs: list[dict[str, Any]] = []
+    declared_cost_field: str | None = None
+    if canonical_costs is not None:
+        declared_costs = canonical_costs
+        declared_cost_field = "hidden_costs_rub_month"
+        if legacy_costs is not None and _declared_costs_signature(canonical_costs) != _declared_costs_signature(legacy_costs):
+            rows.append({
+                "check_id": "D07",
+                "finding": "conflicting_declared_cost_inputs",
+                "canonical_field": "hidden_costs_rub_month",
+                "legacy_field": "costs_outside_cabinet",
+                "canonical_entry_count": len(canonical_costs),
+                "legacy_entry_count": len(legacy_costs),
+                "using_field": declared_cost_field,
+                "confidence": _cap("MED", confidence_cap),
+            })
+    elif legacy_costs is not None:
+        declared_costs = legacy_costs
+        declared_cost_field = "costs_outside_cabinet"
 
     con = common.open_duckdb(paths)
     try:
@@ -445,11 +553,10 @@ def _run_d07(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
         con.close()
 
     months = _months_in_range(date_min, date_max)
-    rows: list[dict[str, Any]] = []
 
-    for entry in hidden_costs:
-        source_tag = str(entry.get("source_tag") or "").strip()
-        rub_month = float(entry.get("rub_month") or 0)
+    for entry in declared_costs:
+        source_tag = entry["source_tag"]
+        rub_month = entry["rub_month"]
         actual_total = float(by_source.get(source_tag) or 0.0)
         expected_total = rub_month * months if months > 0 else None
         missing_in_data = actual_total <= 0.0
@@ -462,8 +569,9 @@ def _run_d07(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
         rows.append({
             "check_id": "D07",
             "finding": "declared_cost_check",
-            "name": entry.get("name"),
-            "source_tag": source_tag or None,
+            "declared_cost_field": declared_cost_field,
+            "name": entry["name"],
+            "source_tag": source_tag,
             "declared_rub_month": rub_month,
             "months_in_window": months,
             "expected_total_rub": round(expected_total, 2) if expected_total is not None else None,
@@ -489,15 +597,11 @@ def _run_d07(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
 
 # ── D08 — архивные/остановленные кампании исключены из истории ─────────────
 def _run_d08(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
-    """Сигнал из costs.parquet: есть ли среди кампаний Директа хоть одна,
+    """D08 по подтверждённому API-снимку campaign_status и historical costs.
 
-    переставшая тратить задолго до конца окна (доказательство того, что
-    остановленные кампании ПОПАЛИ в выгрузку, а не исключены по текущему
-    статусу). Compute не имеет доступа к campaigns.get/archived_campaigns_
-    retrievable (сырой manifest Директа, не canonical) — см. docstring модуля.
-    Отсутствие ни одной такой кампании при наличии >=2 кампаний — не
-    доказательство проблемы, но и не молчаливо пропускается: finding
-    no_stopped_campaigns_detected фиксирует ограничение проверки явно.
+    Только non-active ``State`` вместе с положительным историческим расходом
+    образует проблему. Отсутствующий/неизвестный статус — coverage gap, а
+    last-positive-date остаётся контекстом, а не доказательством остановки.
     """
     con = common.open_duckdb(paths)
     try:
@@ -512,54 +616,309 @@ def _run_d08(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
         period_end = con.execute(
             "SELECT MAX(date) FROM costs WHERE source_tag = 'direct'"
         ).fetchone()[0]
+        statuses = con.execute(
+            "SELECT campaign_id, state, status, status_payment, "
+            "status_clarification, observed_at, source, requested_states "
+            "FROM campaign_status WHERE campaign_id IS NOT NULL"
+        ).fetchall()
     finally:
         con.close()
 
+    status_by_campaign: dict[str, tuple[Any, ...]] = {}
+    duplicate_status_ids: set[str] = set()
+    for status_row in statuses:
+        campaign_id = str(status_row[0])
+        if campaign_id in status_by_campaign:
+            duplicate_status_ids.add(campaign_id)
+            continue
+        status_by_campaign[campaign_id] = status_row[1:]
+
     rows: list[dict[str, Any]] = []
-    stopped_count = 0
+    confirmed_count = 0
+    coverage_gap_count = 0
+    problem_count = 0
     for campaign_id, campaign_name, first_active, last_active, total_cost in campaigns:
-        stopped_before_end = (
+        status_row = status_by_campaign.get(str(campaign_id))
+        has_provenance = bool(
+            status_row
+            and status_row[0]
+            and status_row[4]
+            and status_row[5]
+            and status_row[6]
+            and str(campaign_id) not in duplicate_status_ids
+        )
+        state = str(status_row[0]).strip().upper() if has_provenance else None
+        coverage_gap = state in (None, "", "UNKNOWN")
+        if coverage_gap:
+            coverage_gap_count += 1
+        else:
+            confirmed_count += 1
+        has_historical_spend = last_active is not None
+        non_active = state is not None and state != "ON"
+        has_problem = bool(non_active and has_historical_spend)
+        if has_problem:
+            problem_count += 1
+        last_positive_over_14_days = (
             period_end is not None
             and last_active is not None
             and (period_end - last_active).days > _D08_STOPPED_CAMPAIGN_BUFFER_DAYS
         )
-        if stopped_before_end:
-            stopped_count += 1
+        row_confidence = _cap("MED" if coverage_gap_count else "HIGH", confidence_cap)
         rows.append({
             "check_id": "D08",
-            "finding": "campaign_activity",
+            "finding": "campaign_status_evidence",
             "campaign_id": campaign_id,
             "campaign_name": campaign_name,
+            "state": state,
+            "api_status": status_row[1] if status_row and has_provenance else None,
+            "status_payment": status_row[2] if status_row and has_provenance else None,
+            "status_clarification": status_row[3] if status_row and has_provenance else None,
+            "observed_at": status_row[4] if status_row and has_provenance else None,
+            "status_source": status_row[5] if status_row and has_provenance else None,
+            "requested_states": status_row[6] if status_row and has_provenance else None,
+            "coverage_gap": coverage_gap,
+            "coverage_gap_reason": (
+                "status_not_returned" if status_row is None else
+                "status_snapshot_invalid" if not has_provenance else
+                "state_unknown"
+            ) if coverage_gap else None,
             "first_active_date": first_active.isoformat() if first_active else None,
             "last_active_date": last_active.isoformat() if last_active else None,
             "total_cost_rub": round(float(total_cost or 0.0), 2),
-            "stopped_before_window_end": stopped_before_end,
-            "confidence": _cap("HIGH", confidence_cap),
+            "has_historical_spend": has_historical_spend,
+            "last_positive_over_14_days": last_positive_over_14_days,
+            "has_problem": has_problem,
+            "status": "unverifiable" if coverage_gap else ("problem" if has_problem else "pass"),
+            "confidence": row_confidence,
         })
 
+    if coverage_gap_count:
+        for row in rows:
+            row["confidence"] = _cap("MED", confidence_cap)
+
     total_campaigns = len(campaigns)
-    no_stopped_campaigns_detected = total_campaigns >= 2 and stopped_count == 0
+    coverage_complete = total_campaigns == confirmed_count
     rows.append({
         "check_id": "D08",
         "finding": "summary",
         "total_campaigns": total_campaigns,
-        "stopped_campaign_count": stopped_count,
+        "confirmed_status_count": confirmed_count,
+        "coverage_gap_count": coverage_gap_count,
+        "coverage_complete": coverage_complete,
+        "confirmed_non_active_with_spend_count": problem_count,
         "period_end": period_end.isoformat() if period_end else None,
-        "no_stopped_campaigns_detected": no_stopped_campaigns_detected,
-        "confidence": _cap("MED", confidence_cap),
+        "has_problem": problem_count > 0,
+        "status": "problem" if problem_count else ("unverifiable" if coverage_gap_count else "pass"),
+        "confidence": _cap("HIGH" if coverage_complete else "MED", confidence_cap),
     })
 
     common.write_metric_artifact(metrics_dir, "d08", rows, confidence_cap=confidence_cap)
 
 
 # ── D09 — периоды/часовые пояса/даты не приведены к единому правилу ────────
-def _run_d09(paths: Any, confidence_cap: str, metrics_dir: Path, has_costs: bool) -> None:
-    """Неполный текущий месяц (каталог §4.1) + рассинхрон периодов visits/costs.
+def _d09_status(*, problem: bool = False, unknown: bool = False) -> str:
+    return "problem" if problem else ("unverifiable" if unknown else "pass")
 
-    Часовой пояс не проверяется: canonical visits.dt не несёт явного tz-поля
-    (нормализация — забота extract/transform, вне allowed_files этой задачи),
-    придумывать проверку без данных нельзя (CLAUDE.md, протокол микрозадач п.5).
+
+def _d09_row(
+    finding: str,
+    *,
+    confidence_cap: str,
+    problem: bool = False,
+    unknown: bool = False,
+    reason: str | None = None,
+    **evidence: Any,
+) -> dict[str, Any]:
+    status = _d09_status(problem=problem, unknown=unknown)
+    row = {
+        "check_id": "D09",
+        "finding": finding,
+        "status": status,
+        "has_problem": problem,
+        "confidence": _cap("HIGH" if status != "unverifiable" else "LOW", confidence_cap),
+        **evidence,
+    }
+    if reason is not None:
+        row["reason"] = reason
+    return row
+
+
+def _d09_requested_window(contract: Any, label: str) -> tuple[date | None, date | None, str | None]:
+    if not isinstance(contract, dict):
+        return None, None, f"{label}_raw_temporal_provenance_missing"
+    if contract.get("status") == "unknown":
+        return None, None, f"{label}_{contract.get('reason') or 'raw_temporal_provenance_unknown'}"
+    window = contract.get("requested_window")
+    if not isinstance(window, dict):
+        return None, None, f"{label}_requested_window_missing"
+    try:
+        return (
+            date.fromisoformat(str(window["date_from"])),
+            date.fromisoformat(str(window["date_to"])),
+            None,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None, None, f"{label}_requested_window_invalid"
+
+
+def _d09_raw_field(contract: Any, field_name: str, label: str) -> tuple[dict[str, Any] | None, str | None]:
+    if not isinstance(contract, dict) or contract.get("status") == "unknown":
+        return None, f"{label}_raw_temporal_provenance_missing"
+    field = (contract.get("fields") or {}).get(field_name)
+    if not isinstance(field, dict):
+        return None, f"{label}_{field_name}_contract_missing"
+    return field, None
+
+
+def _d09_known_visit_offset(field: dict[str, Any] | None) -> int | None:
+    timezone = (field or {}).get("timezone")
+    if not isinstance(timezone, dict) or timezone.get("status") != "known":
+        return None
+    offset = timezone.get("time_zone_offset")
+    return offset if isinstance(offset, int) and not isinstance(offset, bool) else None
+
+
+def _d09_range_row(
+    finding: str,
+    observed_min: date | None,
+    observed_max: date | None,
+    window_from: date | None,
+    window_to: date | None,
+    window_reason: str | None,
+    confidence_cap: str,
+) -> dict[str, Any]:
+    evidence = {
+        "observed_date_from": observed_min.isoformat() if observed_min else None,
+        "observed_date_to": observed_max.isoformat() if observed_max else None,
+        "requested_date_from": window_from.isoformat() if window_from else None,
+        "requested_date_to": window_to.isoformat() if window_to else None,
+    }
+    if window_reason is not None:
+        return _d09_row(finding, confidence_cap=confidence_cap, unknown=True, reason=window_reason, **evidence)
+    if observed_min is None or observed_max is None:
+        return _d09_row(finding, confidence_cap=confidence_cap, unknown=True,
+                        reason=f"{finding}_observed_range_empty", **evidence)
+    outside = observed_min < window_from or observed_max > window_to
+    return _d09_row(finding, confidence_cap=confidence_cap, problem=outside,
+                    reason="canonical_dates_outside_requested_window" if outside else None,
+                    **evidence)
+
+
+def _d09_partial_month_row(
+    partial_months: Any, source_name: str, confidence_cap: str,
+) -> dict[str, Any]:
+    partial = (partial_months or {}).get(source_name) if isinstance(partial_months, dict) else None
+    if not isinstance(partial, dict) or partial.get("status") == "unknown":
+        return _d09_row(
+            f"{source_name}_partial_months", confidence_cap=confidence_cap,
+            unknown=True, reason=f"{source_name}_partial_months_missing",
+        )
+    first = partial.get("first_month")
+    last = partial.get("last_month")
+    if not isinstance(first, dict) or not isinstance(last, dict):
+        return _d09_row(
+            f"{source_name}_partial_months", confidence_cap=confidence_cap,
+            unknown=True, reason=f"{source_name}_partial_months_invalid",
+        )
+    return _d09_row(
+        f"{source_name}_partial_months", confidence_cap=confidence_cap,
+        declared_first_month=first, declared_last_month=last,
+        basis=partial.get("basis"),
+    )
+
+
+def _d09_semantics_row(
+    finding: str, value: Any, unknown_reason: str, confidence_cap: str,
+) -> dict[str, Any]:
+    return _d09_row(
+        finding, confidence_cap=confidence_cap,
+        unknown=not isinstance(value, str) or value == "unknown",
+        reason=unknown_reason if not isinstance(value, str) or value == "unknown" else None,
+        declared_value=value,
+    )
+
+
+def _run_d09(
+    paths: Any,
+    confidence_cap: str,
+    metrics_dir: Path,
+    has_costs: bool,
+    has_goal_achievements: bool,
+) -> None:
+    """Проверить D09 только по temporal_provenance canonical-слоя.
+
+    MIN/MAX таблиц — доказательство только выхода за заявленное окно. Пропуск
+    края окна, отдельного дня расходов или declared_partial не доказывает
+    проблему и не подменяется нулём.
     """
+    manifest_path = Path(paths.canonical) / "manifest.json"
+    try:
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except FileNotFoundError:
+        rows = [_d09_row("manifest", confidence_cap=confidence_cap, unknown=True,
+                         reason="canonical_temporal_manifest_missing")]
+        rows.append(_d09_row("summary", confidence_cap=confidence_cap, unknown=True,
+                             reason="canonical_temporal_manifest_missing", subcheck_count=1))
+        common.write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
+        return
+    except (OSError, json.JSONDecodeError):
+        rows = [_d09_row("manifest", confidence_cap=confidence_cap, unknown=True,
+                         reason="canonical_temporal_manifest_unreadable")]
+        rows.append(_d09_row("summary", confidence_cap=confidence_cap, unknown=True,
+                             reason="canonical_temporal_manifest_unreadable", subcheck_count=1))
+        common.write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
+        return
+
+    temporal = manifest.get("temporal_provenance") if isinstance(manifest, dict) else None
+    if not isinstance(temporal, dict):
+        rows = [_d09_row("manifest", confidence_cap=confidence_cap, unknown=True,
+                         reason="canonical_temporal_provenance_missing")]
+        rows.append(_d09_row("summary", confidence_cap=confidence_cap, unknown=True,
+                             reason="canonical_temporal_provenance_missing", subcheck_count=1))
+        common.write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
+        return
+
+    raw_sources = temporal.get("raw_sources") or {}
+    canonical_fields = temporal.get("canonical_fields") or {}
+    partial_months = temporal.get("partial_months") or {}
+    visits_contract = raw_sources.get("metrika_logs")
+    visits_from, visits_to, visits_window_reason = _d09_requested_window(visits_contract, "visits")
+    visits_raw_field, visits_field_reason = _d09_raw_field(
+        visits_contract, "ym:s:dateTime", "visits"
+    )
+    visits_mapping = (canonical_fields.get("visits") or {})
+    dt_mapping = visits_mapping.get("dt") if isinstance(visits_mapping, dict) else None
+    date_mapping = visits_mapping.get("date") if isinstance(visits_mapping, dict) else None
+
+    visits_problem = False
+    visits_reason = visits_window_reason or visits_field_reason
+    if visits_reason is None:
+        if not isinstance(dt_mapping, dict) or not isinstance(date_mapping, dict):
+            visits_reason = "visits_canonical_mapping_missing"
+        elif (
+            dt_mapping.get("raw_source") != "metrika_logs"
+            or dt_mapping.get("raw_field") != "ym:s:dateTime"
+            or dt_mapping.get("raw_field_contract") != visits_raw_field
+            or dt_mapping.get("timezone_conversion") != "none"
+            or dt_mapping.get("local_time_basis") != "counter_local_time"
+            or date_mapping.get("derived_from") != "visits.dt"
+            or date_mapping.get("operation") != "calendar_date_without_timezone_conversion"
+        ):
+            visits_problem = True
+            visits_reason = "visits_event_date_mapping_conflict"
+        elif visits_raw_field.get("event") != "visit" or visits_raw_field.get("data_type") != "datetime":
+            visits_problem = True
+            visits_reason = "visits_event_date_mapping_conflict"
+        elif _d09_known_visit_offset(visits_raw_field) is None:
+            visits_reason = "visits_timezone_unknown"
+
+    rows: list[dict[str, Any]] = [_d09_row(
+        "visits_contract", confidence_cap=confidence_cap,
+        problem=visits_problem, unknown=visits_reason is not None and not visits_problem,
+        reason=visits_reason,
+    )]
+
     con = common.open_duckdb(paths)
     try:
         visits_min, visits_max = con.execute("SELECT MIN(date), MAX(date) FROM visits").fetchone()
@@ -568,39 +927,165 @@ def _run_d09(paths: Any, confidence_cap: str, metrics_dir: Path, has_costs: bool
             costs_min, costs_max = con.execute("SELECT MIN(date), MAX(date) FROM costs").fetchone()
     finally:
         con.close()
+    rows.append(_d09_range_row(
+        "visits_observed_range", visits_min, visits_max, visits_from, visits_to,
+        visits_window_reason, confidence_cap,
+    ))
+    rows.append(_d09_semantics_row(
+        "visits_boundary_semantics",
+        (visits_contract.get("requested_window") or {}).get("boundary_semantics")
+        if isinstance(visits_contract, dict) else None,
+        "visits_boundary_semantics_unknown", confidence_cap,
+    ))
+    rows.append(_d09_partial_month_row(partial_months, "metrika_logs", confidence_cap))
 
-    rows: list[dict[str, Any]] = []
+    visit_offset = _d09_known_visit_offset(visits_raw_field)
 
-    if visits_max is not None:
-        days_in_month = calendar.monthrange(visits_max.year, visits_max.month)[1]
-        is_incomplete = visits_max.day < days_in_month
-        rows.append({
-            "check_id": "D09",
-            "finding": "incomplete_last_month",
-            "last_month": visits_max.strftime("%Y-%m"),
-            "last_date": visits_max.isoformat(),
-            "days_in_month": days_in_month,
-            "days_elapsed": visits_max.day,
-            "is_incomplete": is_incomplete,
-            "confidence": _cap("HIGH", confidence_cap),
-        })
+    if has_costs:
+        costs_contract = raw_sources.get("direct")
+        costs_from, costs_to, costs_window_reason = _d09_requested_window(costs_contract, "costs")
+        costs_raw_field, costs_field_reason = _d09_raw_field(costs_contract, "Date", "costs")
+        costs_mapping = ((canonical_fields.get("costs") or {}).get("date"))
+        costs_problem = False
+        costs_reason = costs_window_reason or costs_field_reason
+        if costs_reason is None:
+            if not isinstance(costs_mapping, dict):
+                costs_reason = "costs_canonical_mapping_missing"
+            elif (
+                costs_mapping.get("raw_source") != "direct"
+                or costs_mapping.get("raw_field") != "Date"
+                or costs_mapping.get("raw_field_contract") != costs_raw_field
+                or costs_mapping.get("timezone_conversion") != "none"
+            ):
+                costs_problem = True
+                costs_reason = "costs_event_date_mapping_conflict"
+            elif (
+                costs_raw_field.get("event") != "direct_statistics_day"
+                or costs_raw_field.get("data_type") != "date"
+                or costs_raw_field.get("timezone_contract") != "Europe/Moscow"
+            ):
+                costs_problem = True
+                costs_reason = "costs_event_date_mapping_conflict"
+            elif visit_offset is None:
+                costs_reason = "visits_timezone_unknown"
+            elif visit_offset != 180:
+                costs_problem = True
+                costs_reason = "visits_costs_timezone_incompatible"
+        rows.append(_d09_row(
+            "costs_contract", confidence_cap=confidence_cap,
+            problem=costs_problem, unknown=costs_reason is not None and not costs_problem,
+            reason=costs_reason,
+        ))
+        rows.append(_d09_range_row(
+            "costs_observed_range", costs_min, costs_max, costs_from, costs_to,
+            costs_window_reason, confidence_cap,
+        ))
+        rows.append(_d09_semantics_row(
+            "costs_boundary_semantics",
+            (costs_contract.get("requested_window") or {}).get("boundary_semantics")
+            if isinstance(costs_contract, dict) else None,
+            "costs_boundary_semantics_unknown", confidence_cap,
+        ))
+        rows.append(_d09_semantics_row(
+            "costs_zero_day_policy",
+            costs_contract.get("zero_day_policy") if isinstance(costs_contract, dict) else None,
+            "costs_zero_day_policy_unknown", confidence_cap,
+        ))
+        rows.append(_d09_partial_month_row(partial_months, "direct", confidence_cap))
+        if visits_window_reason is None and costs_window_reason is None:
+            windows_differ = (visits_from, visits_to) != (costs_from, costs_to)
+            rows.append(_d09_row(
+                "visits_costs_requested_window", confidence_cap=confidence_cap,
+                problem=windows_differ,
+                reason="requested_window_mismatch" if windows_differ else None,
+                visits_requested_window={"date_from": visits_from.isoformat(), "date_to": visits_to.isoformat()},
+                costs_requested_window={"date_from": costs_from.isoformat(), "date_to": costs_to.isoformat()},
+            ))
+        else:
+            rows.append(_d09_row(
+                "visits_costs_requested_window", confidence_cap=confidence_cap,
+                unknown=True, reason=visits_window_reason or costs_window_reason,
+            ))
+    else:
+        rows.append(_d09_row(
+            "costs_contract", confidence_cap=confidence_cap,
+            reason="costs_optional_source_absent",
+        ))
+        rows[-1]["status"] = "not_applicable"
 
-    if has_costs and costs_min is not None and visits_min is not None:
-        mismatch = (
-            visits_min.strftime("%Y-%m") != costs_min.strftime("%Y-%m")
-            or visits_max.strftime("%Y-%m") != costs_max.strftime("%Y-%m")
+    goal_flags = manifest.get("flags") or {}
+    goal_status = goal_flags.get("goal_achievements") if isinstance(goal_flags, dict) else None
+    if not isinstance(goal_status, dict):
+        rows.append(_d09_row(
+            "goal_achievements_contract", confidence_cap=confidence_cap,
+            unknown=True, reason="goal_achievements_status_missing",
+        ))
+    elif (
+        goal_status.get("status") in {"degraded", "unavailable"}
+        or int(goal_status.get("mismatched_visits") or 0) > 0
+        or int(goal_status.get("malformed_goal_datetime") or 0) > 0
+    ):
+        reason = (
+            "goal_achievements_mismatched_visits" if int(goal_status.get("mismatched_visits") or 0) > 0 else
+            "goal_achievements_malformed_goal_datetime" if int(goal_status.get("malformed_goal_datetime") or 0) > 0 else
+            f"goal_achievements_{goal_status.get('status')}"
         )
-        rows.append({
-            "check_id": "D09",
-            "finding": "visits_costs_period_mismatch",
-            "visits_date_from": visits_min.isoformat(),
-            "visits_date_to": visits_max.isoformat(),
-            "costs_date_from": costs_min.isoformat(),
-            "costs_date_to": costs_max.isoformat() if costs_max else None,
-            "mismatch": mismatch,
-            "confidence": _cap("MED", confidence_cap),
-        })
+        rows.append(_d09_row(
+            "goal_achievements_contract", confidence_cap=confidence_cap,
+            unknown=True, reason=reason, goal_achievements_status=goal_status.get("status"),
+        ))
+    elif has_goal_achievements:
+        goals_raw_field, goals_field_reason = _d09_raw_field(
+            visits_contract, "ym:s:goalsDateTime", "goal_achievements"
+        )
+        goal_mapping = ((canonical_fields.get("goal_achievements") or {}).get("goal_datetime"))
+        goal_problem = False
+        goal_reason = goals_field_reason
+        if goal_reason is None:
+            if not isinstance(goal_mapping, dict):
+                goal_reason = "goal_achievements_canonical_mapping_missing"
+            elif (
+                goal_mapping.get("raw_source") != "metrika_logs"
+                or goal_mapping.get("raw_field") != "ym:s:goalsDateTime"
+                or goal_mapping.get("raw_field_contract") != goals_raw_field
+                or goal_mapping.get("timezone_conversion") != "none"
+            ):
+                goal_problem = True
+                goal_reason = "goal_achievements_event_date_mapping_conflict"
+            elif (
+                goals_raw_field.get("event") != "goal_achievement"
+                or goals_raw_field.get("timezone_contract") != "UTC+03:00"
+            ):
+                goal_problem = True
+                goal_reason = "goal_achievements_event_date_mapping_conflict"
+            elif visit_offset is None:
+                goal_reason = "visits_timezone_unknown"
+            elif visit_offset != 180:
+                goal_problem = True
+                goal_reason = "visits_goal_timezone_incompatible"
+        rows.append(_d09_row(
+            "goal_achievements_contract", confidence_cap=confidence_cap,
+            problem=goal_problem, unknown=goal_reason is not None and not goal_problem,
+            reason=goal_reason,
+        ))
+    else:
+        rows.append(_d09_row(
+            "goal_achievements_contract", confidence_cap=confidence_cap,
+            reason="goal_achievements_optional_table_absent",
+        ))
+        rows[-1]["status"] = "not_applicable"
 
+    problem_count = sum(row["status"] == "problem" for row in rows)
+    unknown_count = sum(row["status"] == "unverifiable" for row in rows)
+    rows.append(_d09_row(
+        "summary", confidence_cap=confidence_cap,
+        problem=problem_count > 0,
+        unknown=problem_count == 0 and unknown_count > 0,
+        has_costs=has_costs,
+        has_goal_achievements=has_goal_achievements,
+        problem_subcheck_count=problem_count,
+        unverifiable_subcheck_count=unknown_count,
+    ))
     common.write_metric_artifact(metrics_dir, "d09", rows, confidence_cap=confidence_cap)
 
 
@@ -722,57 +1207,145 @@ def _run_d11(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
 
 
 # ── D12 — таблицы соединяются на неверном уровне детализации ───────────────
-def _run_d12(paths: Any, confidence_cap: str, metrics_dir: Path, has_costs: bool) -> None:
-    """Уникальность ключей внутри canonical-таблиц самого блока 0.
+def _is_non_negative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
-    visits.visit_id уже дедуплицирован в transform (dedupe_visits) — здесь
-    независимая защитная проверка, не переиспользующая внутренности другого
-    слоя (CLAUDE.md, принцип 2: слои читают только выход предыдущего слоя).
-    costs — составной ключ (date, source_tag, campaign_id): дубль = вероятный
-    фан-аут join выше по конвейеру (каталог: «JOIN один-ко-многим размножает
-    расходы»), проверяем на самой таблице, доступной этому блоку.
+
+def _validate_join_frame(frame: Any, controls: list[str], name: str) -> list[str]:
+    """Вернуть отсутствующие обязательные части агрегатов JOIN-record."""
+    if not isinstance(frame, dict):
+        return [f"{name}_controls_absent"]
+    errors: list[str] = []
+    for field in ("rows", "distinct_keys"):
+        if not _is_non_negative_int(frame.get(field)):
+            errors.append(f"{name}_{field}_absent")
+    checksums = frame.get("checksums")
+    counts = frame.get("non_null_counts")
+    if not isinstance(checksums, dict) or not isinstance(counts, dict):
+        return errors + [f"{name}_checksums_or_counts_absent"]
+    for control in controls:
+        if not isinstance(checksums.get(control), (int, float)):
+            errors.append(f"{name}_checksum_{control}_absent")
+        if not _is_non_negative_int(counts.get(control)):
+            errors.append(f"{name}_count_{control}_absent")
+    return errors
+
+
+def _validate_join_record(record: Any) -> tuple[list[str], list[str]]:
+    """Вернуть (missing_controls, violations) для одного PASS JOIN-record."""
+    if not isinstance(record, dict):
+        return ["record_not_object"], []
+    missing: list[str] = []
+    violations: list[str] = []
+    if not isinstance(record.get("join_id"), str) or not record["join_id"]:
+        missing.append("join_id_absent")
+    tables = record.get("tables")
+    if not isinstance(tables, dict) or any(not isinstance(tables.get(k), str) for k in ("left", "right", "output")):
+        missing.append("tables_absent")
+    keys = record.get("keys")
+    if not isinstance(keys, list) or not keys or any(not isinstance(key, str) or not key for key in keys):
+        missing.append("keys_absent")
+    cardinality = record.get("expected_cardinality")
+    if cardinality not in {"1:1", "N:1"}:
+        missing.append("expected_cardinality_absent")
+    controls = record.get("preserved_controls")
+    if not isinstance(controls, list) or any(not isinstance(control, str) for control in controls):
+        missing.append("preserved_controls_absent")
+        controls = []
+    missing.extend(_validate_join_frame(record.get("pre"), controls, "pre"))
+    missing.extend(_validate_join_frame(record.get("right"), [], "right"))
+    missing.extend(_validate_join_frame(record.get("post"), controls, "post"))
+    unmatched = record.get("unmatched")
+    policy = record.get("unmatched_policy")
+    if not isinstance(unmatched, dict) or not all(_is_non_negative_int(unmatched.get(side)) for side in ("left", "right")):
+        missing.append("unmatched_absent")
+    if not isinstance(policy, dict) or any(policy.get(side) not in {"allowed", "forbidden"} for side in ("left", "right")):
+        missing.append("unmatched_policy_absent")
+    if not _is_non_negative_int(record.get("matched")):
+        missing.append("matched_absent")
+    if missing:
+        return missing, violations
+
+    pre = record["pre"]
+    right = record["right"]
+    post = record["post"]
+    if post["rows"] > pre["rows"]:
+        violations.append("fan_out_rows")
+    if cardinality == "1:1":
+        for name, frame in (("pre", pre), ("right", right), ("post", post)):
+            if frame["rows"] != frame["distinct_keys"]:
+                violations.append(f"{name}_key_not_unique")
+    elif cardinality == "N:1":
+        if right["rows"] != right["distinct_keys"]:
+            violations.append("right_key_not_unique")
+        if post["rows"] != pre["rows"] or post["distinct_keys"] != pre["distinct_keys"]:
+            violations.append("left_grain_changed")
+    for control in controls:
+        if abs(float(pre["checksums"][control]) - float(post["checksums"][control])) > 0.01:
+            violations.append(f"checksum_mismatch_{control}")
+        if pre["non_null_counts"][control] != post["non_null_counts"][control]:
+            violations.append(f"count_mismatch_{control}")
+    if record["matched"] + unmatched["left"] != pre["distinct_keys"]:
+        violations.append("left_match_accounting_mismatch")
+    if record["matched"] + unmatched["right"] != right["distinct_keys"]:
+        violations.append("right_match_accounting_mismatch")
+    for side in ("left", "right"):
+        if policy[side] == "forbidden" and unmatched[side] > 0:
+            violations.append(f"required_match_unmatched_{side}")
+    return missing, violations
+
+
+def _run_d12(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
+    """Проверить агрегированные доказательства JOIN из canonical manifest.
+
+    D12 не выводит риск из дублей произвольной canonical-таблицы: без записи
+    фактического JOIN это не доказывает fan-out (например, сегментация costs).
+    Отсутствующий или неполный контракт даёт explicit unavailable/unverifiable.
     """
-    con = common.open_duckdb(paths)
+    manifest_path = Path(paths.canonical) / "manifest.json"
+    if not manifest_path.exists():
+        rows = [{"check_id": "D12", "status": "unavailable", "reason": "join_integrity_manifest_absent",
+                 "confidence": _cap("LOW", confidence_cap)}]
+        common.write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
+        return
     try:
-        visits_total, visits_distinct = con.execute(
-            "SELECT COUNT(*), COUNT(DISTINCT visit_id) FROM visits"
-        ).fetchone()
-        costs_total = costs_distinct = None
-        if has_costs:
-            costs_total = con.execute("SELECT COUNT(*) FROM costs").fetchone()[0]
-            costs_distinct = con.execute(
-                "SELECT COUNT(*) FROM (SELECT DISTINCT date, source_tag, campaign_id FROM costs) t"
-            ).fetchone()[0]
-    finally:
-        con.close()
+        with manifest_path.open("r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        rows = [{"check_id": "D12", "status": "unavailable", "reason": "join_integrity_manifest_unreadable",
+                 "confidence": _cap("LOW", confidence_cap)}]
+        common.write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
+        return
 
-    visits_total = int(visits_total or 0)
-    visits_distinct = int(visits_distinct or 0)
-    rows: list[dict[str, Any]] = [{
-        "check_id": "D12",
-        "table": "visits",
-        "key": "visit_id",
-        "total_rows": visits_total,
-        "distinct_key_count": visits_distinct,
-        "duplicate_key_count": visits_total - visits_distinct,
-        "has_duplicate_keys": visits_total != visits_distinct,
-        "confidence": _cap("HIGH", confidence_cap),
-    }]
+    records = manifest.get("join_integrity") if isinstance(manifest, dict) else None
+    if not isinstance(records, list) or not records:
+        rows = [{"check_id": "D12", "status": "unavailable", "reason": "join_integrity_records_absent",
+                 "confidence": _cap("LOW", confidence_cap)}]
+        common.write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
+        return
 
-    if has_costs:
-        costs_total = int(costs_total or 0)
-        costs_distinct = int(costs_distinct or 0)
-        rows.append({
-            "check_id": "D12",
-            "table": "costs",
-            "key": "date+source_tag+campaign_id",
-            "total_rows": costs_total,
-            "distinct_key_count": costs_distinct,
-            "duplicate_key_count": costs_total - costs_distinct,
-            "has_duplicate_keys": costs_total != costs_distinct,
-            "confidence": _cap("HIGH", confidence_cap),
-        })
-
+    rows: list[dict[str, Any]] = []
+    for index, record in enumerate(sorted(records, key=lambda item: str(item.get("join_id", "")) if isinstance(item, dict) else ""), start=1):
+        join_id = record.get("join_id") if isinstance(record, dict) else None
+        if isinstance(record, dict) and record.get("status") == "NOT_APPLICABLE":
+            rows.append({"check_id": "D12", "join_id": join_id, "status": "not_applicable",
+                         "has_problem": False, "confidence": _cap("HIGH", confidence_cap)})
+            continue
+        if not isinstance(record, dict) or record.get("status") != "PASS":
+            rows.append({"check_id": "D12", "join_id": join_id or f"record_{index}", "status": "unverifiable",
+                         "reason": "join_integrity_status_invalid", "has_problem": False,
+                         "confidence": _cap("LOW", confidence_cap)})
+            continue
+        missing, violations = _validate_join_record(record)
+        if missing:
+            rows.append({"check_id": "D12", "join_id": join_id, "status": "unverifiable",
+                         "missing_controls": sorted(set(missing)), "has_problem": False,
+                         "confidence": _cap("LOW", confidence_cap)})
+        else:
+            rows.append({"check_id": "D12", "join_id": join_id,
+                         "status": "problem" if violations else "pass",
+                         "violations": sorted(set(violations)), "has_problem": bool(violations),
+                         "confidence": _cap("HIGH", confidence_cap)})
     common.write_metric_artifact(metrics_dir, "d12", rows, confidence_cap=confidence_cap)
 
 
@@ -790,19 +1363,20 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         _run_d01(paths, defaults, caps.get("D01", "HIGH"), metrics_dir)
         artifacts.append("d01")
 
-    # D02/D03: не гейтятся через runnable_ids — см. докстринг модуля.
     visits_available = "visits" in canonical
     goals_available = _table_nonempty(canonical.get("goals"))
-    if visits_available and goals_available:
-        _run_d02(paths, caps.get("D02", "HIGH"), metrics_dir)
-        artifacts.append("d02")
-        _run_d03(paths, caps.get("D03", "HIGH"), metrics_dir)
-        artifacts.append("d03")
-    else:
-        reason = "goals metadata недоступна" if not goals_available else "визиты недоступны"
-        _write_unavailable(metrics_dir, "D02", reason)
-        _write_unavailable(metrics_dir, "D03", reason)
-        artifacts.extend(["d02", "d03"])
+    for check_id, artifact, runner in (
+        ("D02", "d02", _run_d02),
+        ("D03", "d03", _run_d03),
+    ):
+        if check_id not in runnable_ids:
+            continue
+        if visits_available and goals_available:
+            runner(paths, caps.get(check_id, "HIGH"), metrics_dir)
+        else:
+            reason = "goals metadata недоступна" if not goals_available else "визиты недоступны"
+            _write_unavailable(metrics_dir, check_id, reason)
+        artifacts.append(artifact)
 
     if "D04" in runnable_ids and "visits" in canonical:
         _run_d04(paths, defaults, caps.get("D04", "HIGH"), metrics_dir)
@@ -820,12 +1394,23 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         _run_d07(paths, caps.get("D07", "HIGH"), metrics_dir)
         artifacts.append("d07")
 
-    if "D08" in runnable_ids and "costs" in canonical:
-        _run_d08(paths, caps.get("D08", "HIGH"), metrics_dir)
+    if "D08" in runnable_ids:
+        if "costs" in canonical and "campaign_status" in canonical:
+            _run_d08(paths, caps.get("D08", "HIGH"), metrics_dir)
+        else:
+            missing = []
+            if "costs" not in canonical:
+                missing.append("расходы")
+            if "campaign_status" not in canonical:
+                missing.append("статусы кампаний Директа")
+            _write_unavailable(metrics_dir, "D08", "нет источника: " + "; ".join(missing))
         artifacts.append("d08")
 
     if "D09" in runnable_ids and "visits" in canonical:
-        _run_d09(paths, caps.get("D09", "HIGH"), metrics_dir, "costs" in canonical)
+        _run_d09(
+            paths, caps.get("D09", "HIGH"), metrics_dir,
+            "costs" in canonical, "goal_achievements" in canonical,
+        )
         artifacts.append("d09")
 
     if "D10" in runnable_ids and "visits" in canonical:
@@ -837,7 +1422,7 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         artifacts.append("d11")
 
     if "D12" in runnable_ids and "visits" in canonical:
-        _run_d12(paths, caps.get("D12", "HIGH"), metrics_dir, "costs" in canonical)
+        _run_d12(paths, caps.get("D12", "HIGH"), metrics_dir)
         artifacts.append("d12")
 
     return artifacts

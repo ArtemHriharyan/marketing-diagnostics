@@ -414,7 +414,9 @@ def test_build_writes_only_tables_with_raw_source(tmp_path):
 
     built = bc.build(paths, config, defaults)
 
-    assert set(built) == {"visits", "costs", "direct_queries", "campaign_strategies"}
+    assert set(built) == {
+        "visits", "costs", "direct_queries", "campaign_strategies", "campaign_status",
+    }
     assert not (paths.canonical / "seo_queries.parquet").exists()
     assert not (paths.canonical / "crm.parquet").exists()
 
@@ -520,6 +522,43 @@ def test_build_direct_campaigns_cost_rub_always_computed_cost_normalized_null(tm
     assert row["cost_rub"] == pytest.approx(65.63)
     assert pd.isna(row["cost_normalized"])
     assert row["vat_basis_applied"] == False  # noqa: E712
+
+
+def test_build_campaign_status_keeps_api_status_and_provenance_without_name(tmp_path):
+    """D08 получает status-snapshot без клиентского текста Name."""
+    import pyarrow.parquet as pq
+
+    direct_dir = tmp_path / "direct"
+    direct_dir.mkdir()
+    (direct_dir / "campaign_strategies.json").write_text(json.dumps([
+        {
+            "Id": 1, "Name": "Клиентское имя кампании", "State": "SUSPENDED",
+            "Status": "ACCEPTED", "StatusPayment": "ELIGIBLE",
+            "StatusClarification": "",
+        },
+    ], ensure_ascii=False), encoding="utf-8")
+    entry = {
+        "fetched_at": "2026-06-30T12:00:00+00:00",
+        "campaign_status_provenance": {
+            "source": "direct.campaigns.get",
+            "requested_states": ["ON", "SUSPENDED", "ARCHIVED"],
+        },
+    }
+
+    df = bc.build_campaign_status(direct_dir, entry)
+    out_path = tmp_path / "campaign_status.parquet"
+    bc.write_canonical_table(df, "campaign_status", out_path)
+
+    assert list(df.columns) == list(bc.SCHEMAS["campaign_status"])
+    assert "campaign_name" not in df.columns
+    assert df.iloc[0].to_dict() == {
+        "campaign_id": "1", "state": "SUSPENDED", "status": "ACCEPTED",
+        "status_payment": "ELIGIBLE", "status_clarification": None,
+        "observed_at": "2026-06-30T12:00:00+00:00",
+        "source": "direct.campaigns.get",
+        "requested_states": '["ON", "SUSPENDED", "ARCHIVED"]',
+    }
+    assert pq.read_schema(out_path).names == list(bc.SCHEMAS["campaign_status"])
 
 
 def _write_direct_geo_fixture(direct_dir: Path) -> None:
@@ -659,13 +698,37 @@ def test_join_goal_convs_invariant_uses_cost_rub_not_cost_normalized(tmp_path):
         encoding="utf-8",
     )
 
+    join_integrity: list[dict] = []
     df = bc.build_direct_queries(
-        direct_dir, None, macro_goals=[{"id": 10}],
+        direct_dir, None, macro_goals=[{"id": 10}], join_integrity=join_integrity,
     )
     assert "goal_conv_10" in df.columns
     assert df.iloc[0]["goal_conv_10"] == 1
     # cost_rub не изменился джойном (иначе _join_goal_convs бросил бы ValueError).
     assert df.iloc[0]["cost_rub"] == pytest.approx(65.63)
+    assert join_integrity[0]["status"] == "PASS"
+    assert join_integrity[0]["pre"]["checksums"]["cost_rub"] == pytest.approx(65.63)
+    assert join_integrity[0]["post"]["checksums"]["cost_rub"] == pytest.approx(65.63)
+
+
+def test_canonical_manifest_sorts_join_integrity_deterministically(tmp_path):
+    records = [
+        bc._join_not_applicable_record(
+            join_id="z_join", left_table="left", right_table="right", output_table="out",
+            keys=["key"], expected_cardinality="1:1", reason="source_absent",
+        ),
+        bc._join_not_applicable_record(
+            join_id="a_join", left_table="left", right_table="right", output_table="out",
+            keys=["key"], expected_cardinality="1:1", reason="source_absent",
+        ),
+    ]
+    bc._write_canonical_manifest(tmp_path, ["visits"], {}, records)
+    first = json.loads((tmp_path / "manifest.json").read_text("utf-8"))
+    bc._write_canonical_manifest(tmp_path, ["visits"], {}, records)
+    second = json.loads((tmp_path / "manifest.json").read_text("utf-8"))
+
+    assert [record["join_id"] for record in first["join_integrity"]] == ["a_join", "z_join"]
+    assert first["join_integrity"] == second["join_integrity"]
 
 
 # ═════════════════════════════ build_ad_texts ═════════════════════════════
@@ -2079,6 +2142,35 @@ def test_seo_queries_build_deduplicates_via_orchestrator(tmp_path):
     assert pd.isna(row2["demand"])
 
 
+def test_seo_queries_build_keeps_same_query_page_in_two_months(tmp_path):
+    """Месячные срезы одного query×page сохраняются как отдельные строки."""
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    gsc_dir = paths.raw / "gsc"
+    gsc_dir.mkdir()
+    header = "month,query,page,device,clicks,impressions,ctr,position\n"
+    (gsc_dir / "gsc_2026-05.csv").write_text(
+        header + "2026-05-01,q,/page,DESKTOP,5,50,0.1,3.0\n",
+        encoding="utf-8",
+    )
+    (gsc_dir / "gsc_2026-06.csv").write_text(
+        header + "2026-06-01,q,/page,DESKTOP,7,70,0.1,4.0\n",
+        encoding="utf-8",
+    )
+    manifest_mod.update_source(
+        paths.raw, "gsc", date_from="2026-05-01", date_to="2026-06-30",
+        rows=2, script_version="test", canonical_tables=["seo_queries"],
+    )
+
+    built = bc.build(paths, {"brand_terms": []}, {"utm_undefined_threshold": 0.25})
+
+    assert "seo_queries" in built
+    seo = pd.read_parquet(paths.canonical / "seo_queries.parquet")
+    assert list(seo["month"]) == ["2026-05", "2026-06"]
+    assert list(seo["total_shows"]) == [50, 70]
+    assert list(seo["total_clicks"]) == [5, 7]
+
+
 # ═════════════════════════════ seo_queries: порог total_shows ═══════════════
 def test_filter_seo_queries_min_shows_excludes_below_threshold():
     df = pd.DataFrame({
@@ -2300,6 +2392,182 @@ def test_build_wires_goals_table_and_qa_caveat(tmp_path):
     assert canonical_manifest["flags"]["goals_missing_fields"] == ["created_at", "updated_at"]
     assert canonical_manifest["flags"]["goals_qa"] == {
         "missing_in_visits": ["999"], "mismatch": True,
+    }
+
+
+# ═════════════════════ D09: canonical temporal contract ════════════════════
+def _d09_metrika_provenance(date_from: str = "2026-06-01", date_to: str = "2026-06-30") -> dict:
+    return {
+        "requested_window": {
+            "date_from": date_from, "date_to": date_to,
+            "boundary_semantics": "unknown",
+        },
+        "fields": {
+            "ym:s:dateTime": {
+                "event": "visit", "data_type": "datetime",
+                "timezone": {
+                    "status": "known", "time_zone_name": "Asia/Vladivostok",
+                    "time_zone_offset": 600, "evidence": "metrika_management_counter",
+                },
+            },
+            "ym:s:goalsDateTime": {
+                "event": "goal_achievement", "data_type": "array_datetime",
+                "timezone_contract": "UTC+03:00",
+            },
+        },
+    }
+
+
+def _d09_direct_provenance(date_from: str = "2026-06-03", date_to: str = "2026-07-28") -> dict:
+    return {
+        "requested_window": {
+            "date_from": date_from, "date_to": date_to,
+            "boundary_semantics": "unknown",
+        },
+        "zero_day_policy": "unknown",
+        "fields": {
+            "Date": {
+                "event": "direct_statistics_day", "data_type": "date",
+                "timezone_contract": "Europe/Moscow", "evidence": "direct_reports_contract",
+            },
+        },
+    }
+
+
+def _write_goal_achievement_rows(metrika_dir: Path, rows: list[dict]) -> None:
+    metrika_dir.mkdir(parents=True, exist_ok=True)
+    lines = ["\t".join(VISIT_FIELDS)]
+    for row in rows:
+        cells = {field: "" for field in VISIT_FIELDS}
+        cells.update({
+            "ym:s:visitID": row["visit_id"],
+            "ym:s:dateTime": row.get("visit_datetime", "2026-06-01 10:00:00"),
+            "ym:s:goalsID": row.get("goals_id", ""),
+            "ym:s:goalsDateTime": row.get("goals_datetime", ""),
+            "ym:s:goalsSerialNumber": row.get("goals_serial_number", ""),
+        })
+        lines.append("\t".join(cells[field] for field in VISIT_FIELDS))
+    with gzip.open(metrika_dir / "visits_2026-06-01_2026-06-30_part000.csv.gz", "wt", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def test_canonical_manifest_preserves_raw_temporal_contracts_and_partial_months(tmp_path):
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    _write_goal_achievement_rows(paths.raw / "metrika_logs", [])
+    metrika_provenance = _d09_metrika_provenance()
+    direct_provenance = _d09_direct_provenance()
+    manifest_mod.update_source(
+        paths.raw, "metrika_logs", date_from="2026-06-01", date_to="2026-06-30",
+        rows=0, script_version="test", canonical_tables=["visits"],
+        extra={"temporal_provenance": metrika_provenance},
+    )
+    manifest_mod.update_source(
+        paths.raw, "direct", date_from="2026-06-03", date_to="2026-07-28",
+        rows=0, script_version="test", canonical_tables=["costs"],
+        extra={"temporal_provenance": direct_provenance},
+    )
+
+    bc.build(paths, {"data_window": {"date_from": "2026-06-03", "date_to": "2026-07-28"}}, {})
+    canonical_manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
+    temporal = canonical_manifest["temporal_provenance"]
+
+    assert temporal["raw_sources"]["metrika_logs"] == metrika_provenance
+    assert temporal["raw_sources"]["direct"] == direct_provenance
+    assert temporal["canonical_fields"]["visits"]["dt"]["raw_field_contract"] == (
+        metrika_provenance["fields"]["ym:s:dateTime"]
+    )
+    assert temporal["canonical_fields"]["visits"]["date"] == {
+        "derived_from": "visits.dt",
+        "operation": "calendar_date_without_timezone_conversion",
+    }
+    assert temporal["canonical_fields"]["goal_achievements"]["goal_datetime"]["raw_field_contract"] == (
+        metrika_provenance["fields"]["ym:s:goalsDateTime"]
+    )
+    assert temporal["canonical_fields"]["costs"]["date"]["raw_field_contract"] == (
+        direct_provenance["fields"]["Date"]
+    )
+    assert temporal["partial_months"]["direct"] == {
+        "first_month": {"month": "2026-06", "status": "declared_partial"},
+        "last_month": {"month": "2026-07", "status": "declared_partial"},
+        "basis": "requested_window_only",
+    }
+
+
+def test_canonical_manifest_marks_missing_raw_temporal_provenance_unknown(tmp_path):
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    manifest_mod.update_source(
+        paths.raw, "direct", date_from="2026-06-01", date_to="2026-06-30",
+        rows=0, script_version="test", canonical_tables=["costs"],
+    )
+
+    bc.build(paths, {"data_window": {"date_from": "2026-06-01", "date_to": "2026-06-30"}}, {})
+    temporal = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))["temporal_provenance"]
+    assert temporal["raw_sources"]["direct"] == {
+        "status": "unknown", "reason": "raw_temporal_provenance_missing",
+    }
+    assert temporal["canonical_fields"]["costs"]["date"]["raw_field_contract"] == {
+        "status": "unknown", "reason": "raw_temporal_provenance_missing",
+    }
+
+
+def test_build_goal_achievements_keeps_repeated_goals_and_parallel_indexes(tmp_path):
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    _write_goal_achievement_rows(paths.raw / "metrika_logs", [{
+        "visit_id": "v1", "goals_id": "20,20,30",
+        "goals_datetime": "2026-06-01 10:01:00,2026-06-01 10:02:00,2026-06-01 10:03:00",
+        "goals_serial_number": "1,2,3",
+    }])
+    manifest_mod.update_source(
+        paths.raw, "metrika_logs", date_from="2026-06-01", date_to="2026-06-30",
+        rows=1, script_version="test", canonical_tables=["visits", "goal_achievements"],
+        extra={"temporal_provenance": _d09_metrika_provenance()},
+    )
+
+    built = bc.build(paths, {"data_window": {"date_from": "2026-06-01", "date_to": "2026-06-30"}}, {})
+    assert "goal_achievements" in built
+    achievements = pd.read_parquet(paths.canonical / "goal_achievements.parquet")
+    assert achievements[["goal_id", "serial_number", "achievement_index"]].to_dict("records") == [
+        {"goal_id": "20", "serial_number": "1", "achievement_index": 0},
+        {"goal_id": "20", "serial_number": "2", "achievement_index": 1},
+        {"goal_id": "30", "serial_number": "3", "achievement_index": 2},
+    ]
+    assert achievements["goal_datetime"].astype(str).tolist() == [
+        "2026-06-01 10:01:00", "2026-06-01 10:02:00", "2026-06-01 10:03:00",
+    ]
+
+
+def test_build_goal_achievements_records_mismatch_and_malformed_datetime(tmp_path):
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    _write_goal_achievement_rows(paths.raw / "metrika_logs", [
+        {
+            "visit_id": "mismatch", "goals_id": "20,21",
+            "goals_datetime": "2026-06-01 10:01:00", "goals_serial_number": "1,2",
+        },
+        {
+            "visit_id": "malformed", "goals_id": "30,31",
+            "goals_datetime": "2026-06-01 10:03:00,not-a-datetime",
+            "goals_serial_number": "1,2",
+        },
+    ])
+    manifest_mod.update_source(
+        paths.raw, "metrika_logs", date_from="2026-06-01", date_to="2026-06-30",
+        rows=2, script_version="test", canonical_tables=["visits", "goal_achievements"],
+        extra={"temporal_provenance": _d09_metrika_provenance()},
+    )
+
+    bc.build(paths, {"data_window": {"date_from": "2026-06-01", "date_to": "2026-06-30"}}, {})
+    achievements = pd.read_parquet(paths.canonical / "goal_achievements.parquet")
+    assert achievements[["visit_id", "goal_id", "achievement_index"]].to_dict("records") == [
+        {"visit_id": "malformed", "goal_id": "30", "achievement_index": 0},
+    ]
+    flags = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))["flags"]
+    assert flags["goal_achievements"] == {
+        "status": "degraded", "source_visits": 2, "emitted_rows": 1,
+        "mismatched_visits": 1, "mismatched_values": 2, "malformed_goal_datetime": 1,
     }
 
 

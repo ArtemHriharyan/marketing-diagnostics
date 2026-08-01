@@ -30,7 +30,7 @@ from . import _common as C
 
 SCRIPT_VERSION = "0.2.0"
 SOURCE = "metrika_reports"
-CANONICAL_TABLES = ["visits"]
+CANONICAL_TABLES = ["visits", "goals"]
 
 MANAGEMENT_BASE = "https://api-metrika.yandex.net/management/v1/counter"
 STAT_URL = "https://api-metrika.yandex.net/stat/v1/data"

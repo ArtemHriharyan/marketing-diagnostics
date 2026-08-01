@@ -237,8 +237,66 @@ def test_s04_flags_ctr_anomaly_vs_bucket_median(tmp_path):
     assert normal["ctr_anomalously_low"] is False
 
 
+def test_s04_mixed_devices_excludes_unknown_from_ctr_proxy(tmp_path):
+    paths = _Paths(tmp_path)
+    rows_in = [
+        _base_seo_row(query=f"q{i}", page=f"/p{i}", device="desktop",
+                       total_shows=100, total_clicks=10, avg_show_position=7.0)
+        for i in range(4)
+    ]
+    rows_in.extend([
+        _base_seo_row(query="q_outlier", page="/p_outlier", device="desktop",
+                       total_shows=100, total_clicks=2, avg_show_position=7.0),
+        _base_seo_row(query="q_unknown", page="/p_unknown", device="unknown",
+                       total_shows=100, total_clicks=0, avg_show_position=7.0),
+    ])
+    _write_seo_queries(paths, rows_in)
+
+    block4_seo.run(paths, DEFAULTS, {"S04"})
+
+    rows = _read_metric(paths, "s04")
+    assert all(row.get("status") != "manual_required" for row in rows)
+    assert next(row for row in rows if row.get("query") == "q_outlier")["ctr_anomalously_low"] is True
+    assert not any(row.get("query") == "q_unknown" for row in rows)
+
+
+def test_s04_all_unknown_or_null_devices_requires_manual_check(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query=f"q{i}", page=f"/p{i}", device=device,
+                       total_shows=100, total_clicks=10, avg_show_position=7.0)
+        for i, device in enumerate(["unknown", None, "UNKNOWN", "unknown", None])
+    ])
+
+    block4_seo.run(paths, DEFAULTS, {"S04"})
+
+    assert _read_metric(paths, "s04") == [{
+        "check_id": "S04",
+        "status": "manual_required",
+        "reason": (
+            "S04 требует известного device: seo_queries.device не заполнен "
+            "или содержит только unknown"
+        ),
+        "confidence": "MED",
+    }]
+
+
+def test_s04_without_device_column_requires_manual_check(tmp_path):
+    paths = _Paths(tmp_path)
+    row = _base_seo_row(total_shows=100, total_clicks=10, avg_show_position=7.0)
+    row.pop("device")
+    _write_seo_queries(paths, [row])
+
+    block4_seo.run(paths, DEFAULTS, {"S04"})
+
+    rows = _read_metric(paths, "s04")
+    assert rows[0]["status"] == "manual_required"
+    assert rows[0]["confidence"] == "MED"
+    assert "отсутствует" in rows[0]["reason"]
+
+
 # ── S05 — отдельные страницы теряют клики и позиции ─────────────────────────
-def test_s05_flags_declining_page_and_insufficient_history(tmp_path):
+def test_s05_is_unavailable_without_query_cluster(tmp_path):
     paths = _Paths(tmp_path)
     _write_seo_queries(paths, [
         _base_seo_row(query="a", page="/blog/a", month="2026-01",
@@ -253,10 +311,11 @@ def test_s05_flags_declining_page_and_insufficient_history(tmp_path):
 
     assert "s05" in artifacts
     rows = _read_metric(paths, "s05")
-    declining = next(r for r in rows if r.get("page") == "/blog/a")
-    assert declining["page_declining"] is True
-    summary = next(r for r in rows if r["finding"] == "summary")
-    assert summary["pages_with_insufficient_month_history"] == 1
+    assert rows == [{
+        "check_id": "S05",
+        "status": "unavailable",
+        "reason": "кластер запросов для сравнения страниц не представлен в canonical seo_queries",
+    }]
 
 
 # ── S06 — сезонность vs SEO (легаси 5.5) ────────────────────────────────────
@@ -284,8 +343,12 @@ def test_s06_confidence_rises_to_med_when_seasonality_confirmed(tmp_path):
     подтверждена, confidence реально поднимается выше жёсткого LOW."""
     paths = _Paths(tmp_path)
     _write_seo_queries(paths, [
-        _base_seo_row(query="q", page="/p", month=m, total_shows=s, total_clicks=10)
-        for m, s in [("2026-01", 100), ("2026-02", 100), ("2026-03", 100), ("2026-04", 300)]
+        _base_seo_row(query="q", page="/p", month=m, total_shows=s, total_clicks=10,
+                      avg_show_position=p)
+        for m, s, p in [
+            ("2026-01", 100, 5.0), ("2026-02", 100, 5.0),
+            ("2026-03", 100, 5.0), ("2026-04", 300, 4.0),
+        ]
     ])
     _write_wordstat(paths, [
         _base_wordstat_row(phrase="q", normalized_phrase="q", month=m, date=f"{m}-01",
@@ -303,6 +366,8 @@ def test_s06_confidence_rises_to_med_when_seasonality_confirmed(tmp_path):
     assert reconciliation["verdict"] == "seasonality_explains_anomaly"
     month_entry = next(m for m in reconciliation["months"] if m["month"] == "2026-04")
     assert month_entry["seasonality_confirmed"] is True
+    assert month_entry["wordstat_direction_matches_shows"] is True
+    assert month_entry["position_direction"] == "improved"
 
 
 def test_s06_confidence_rises_to_med_when_seasonality_not_confirmed(tmp_path):
@@ -328,6 +393,69 @@ def test_s06_confidence_rises_to_med_when_seasonality_not_confirmed(tmp_path):
     assert reconciliation["verdict"] == "anomaly_not_fully_explained_by_seasonality"
     month_entry = next(m for m in reconciliation["months"] if m["month"] == "2026-04")
     assert month_entry["seasonality_confirmed"] is False
+
+
+def test_s06_rejects_seasonality_when_position_direction_conflicts(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="q", page="/p", month=m, total_shows=s, total_clicks=10,
+                      avg_show_position=p)
+        for m, s, p in [
+            ("2026-01", 100, 5.0), ("2026-02", 100, 5.0),
+            ("2026-03", 100, 5.0), ("2026-04", 300, 8.0),
+        ]
+    ])
+    _write_wordstat(paths, [
+        _base_wordstat_row(phrase="q", normalized_phrase="q", month=m, date=f"{m}-01",
+                            count=c, purpose="seasonality", scope="gap-specific")
+        for m, c in [("2026-01", 100), ("2026-02", 100), ("2026-03", 100), ("2026-04", 300)]
+    ])
+
+    block4_seo.run(paths, DEFAULTS, {"S06"})
+
+    rows = _read_metric(paths, "s06")
+    reconciliation = next(r for r in rows if r["finding"] == "seasonality_reconciliation")
+    month_entry = next(m for m in reconciliation["months"] if m["month"] == "2026-04")
+    assert reconciliation["verdict"] == "anomaly_not_fully_explained_by_seasonality"
+    assert month_entry["direction_conflict"] is True
+    assert month_entry["position_direction"] == "worsened"
+    assert month_entry["seasonality_confirmed"] is False
+
+
+def test_s06_marks_missing_wordstat_data_for_anomaly_month(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="q", page="/p", month=m, total_shows=s, total_clicks=10)
+        for m, s in [("2026-01", 100), ("2026-02", 100), ("2026-03", 100), ("2026-04", 300)]
+    ])
+    _write_wordstat(paths, [
+        _base_wordstat_row(phrase="q", normalized_phrase="q", month=m, date=f"{m}-01",
+                            count=100, purpose="seasonality", scope="gap-specific")
+        for m in ("2026-01", "2026-02", "2026-03")
+    ])
+
+    block4_seo.run(paths, DEFAULTS, {"S06"})
+
+    rows = _read_metric(paths, "s06")
+    reconciliation = next(r for r in rows if r["finding"] == "seasonality_reconciliation")
+    assert reconciliation["verdict"] == "no_wordstat_data_for_anomaly_months"
+    month_entry = next(m for m in reconciliation["months"] if m["month"] == "2026-04")
+    assert month_entry["seasonality_confirmed"] is None
+
+
+def test_s06_marks_webmaster_dynamics_unavailable_without_gsc(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(source="webmaster", month=m, total_shows=s, total_clicks=10)
+        for m, s in [("2026-01", 100), ("2026-02", 100), ("2026-03", 100), ("2026-04", 300)]
+    ])
+
+    block4_seo.run(paths, DEFAULTS, {"S06"})
+
+    rows = _read_metric(paths, "s06")
+    webmaster = next(r for r in rows if r["finding"] == "webmaster_monthly_dynamics")
+    assert webmaster["status"] == "unavailable"
+    assert not any(r["finding"] == "monthly_shows_trend" for r in rows)
 
 
 # ── S07 — коммерческий спрос без посадочной (FIX-s07-site-pages-join:
@@ -503,9 +631,42 @@ def test_s09_overall_includes_unknown_device_but_by_device_excludes_it(tmp_path)
     overall = next(r for r in rows if r["finding"] == "query_page_overlap_overall")
     assert overall["competing_page_count"] == 2
     assert overall["total_shows"] == 25
+    assert all(r.get("status") != "manual_required" for r in rows)
 
     by_device = [r for r in rows if r["finding"] == "query_page_overlap_by_device"]
     assert by_device == []  # только 1 не-unknown устройство несёт данные -> нет пересечения
+
+
+def test_s09_partial_gsc_page_dimension_excludes_blank_pages(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="shoes", page="/a", total_shows=15, total_clicks=2),
+        _base_seo_row(query="shoes", page=" ", total_shows=100, total_clicks=10),
+        _base_seo_row(query="shoes", page="/b", total_shows=10, total_clicks=1),
+    ])
+
+    block4_seo.run(paths, DEFAULTS, {"S09"})
+
+    rows = _read_metric(paths, "s09")
+    overall = next(r for r in rows if r["finding"] == "query_page_overlap_overall")
+    assert overall["total_shows"] == 25
+    assert {p["page"] for p in overall["pages"]} == {"/a", "/b"}
+
+
+def test_s09_all_empty_gsc_page_dimension_requires_manual(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(query="a", page=None, total_shows=100),
+        _base_seo_row(query="b", page=" ", total_shows=100),
+    ])
+
+    block4_seo.run(paths, DEFAULTS, {"S09"})
+
+    rows = _read_metric(paths, "s09")
+    assert len(rows) == 1
+    assert rows[0]["status"] == "manual_required"
+    assert rows[0]["confidence"] == "MED"
+    assert "page-dimension" in rows[0]["reason"]
 
 
 # ── S10 — по запросу ранжируется не та страница ─────────────────────────────
@@ -913,6 +1074,42 @@ def test_s24_flags_high_value_page_losing_visibility(tmp_path):
     assert candidate["losing_visibility_candidate"] is True
     summary = next(r for r in rows if r["finding"] == "summary")
     assert summary["losing_visibility_candidates"] == 1
+    assert all(r.get("status") != "manual_required" for r in rows)
+
+
+def test_s24_two_month_gsc_page_history_writes_summary_at_boundary(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(page="/boundary", month="2026-01", total_shows=50, total_clicks=10),
+        _base_seo_row(page="/boundary", month="2026-02", total_shows=50, total_clicks=10),
+    ])
+    _write_visits(paths, [
+        _base_visit(entry_page="/boundary", form_submit=(i < 1)) for i in range(20)
+    ])
+
+    block4_seo.run(paths, DEFAULTS, {"S24"})
+
+    rows = _read_metric(paths, "s24")
+    summary = next(r for r in rows if r["finding"] == "summary")
+    assert summary["pages_evaluated"] == 1
+    assert summary["losing_visibility_candidates"] == 0
+
+
+def test_s24_no_nonempty_gsc_page_with_two_months_requires_manual(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_seo_queries(paths, [
+        _base_seo_row(page=None, month="2026-01", total_shows=100, total_clicks=20),
+        _base_seo_row(page=" ", month="2026-02", total_shows=100, total_clicks=5),
+    ])
+    _write_visits(paths, [_base_visit()])
+
+    block4_seo.run(paths, DEFAULTS, {"S24"})
+
+    rows = _read_metric(paths, "s24")
+    assert len(rows) == 1
+    assert rows[0]["status"] == "manual_required"
+    assert rows[0]["confidence"] == "MED"
+    assert "двумя месяцами" in rows[0]["reason"]
 
 
 # ── S23/S24 device-разрез (задача 5bC, промт: "используют device так же,

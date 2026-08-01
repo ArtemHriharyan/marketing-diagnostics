@@ -359,7 +359,10 @@ def test_metrika_reports_writes_slices_and_manifest(paths):
 
     assert result["goals"] == 2
     manifest = manifest_mod.load_manifest(paths.raw)
-    assert manifest["sources"]["metrika_reports"]["canonical_tables"] == ["visits"]
+    assert manifest["sources"]["metrika_reports"]["canonical_tables"] == [
+        "visits",
+        "goals",
+    ]
 
     # Токен нигде не утёк в сохранённое сырьё.
     for f in src_dir.glob("*.json"):
@@ -505,7 +508,11 @@ def test_direct_writes_reports_strategies_and_manifest(paths):
     entry = manifest["sources"]["direct"]
     assert entry["cost_basis"] == "net_no_vat"
     assert entry["cost_micros_per_rub"] == 1_000_000
-    assert entry["canonical_tables"] == ["costs", "direct_queries"]
+    assert entry["canonical_tables"] == [
+        "costs",
+        "direct_queries",
+        "campaign_status",
+    ]
     # Приёмочные флаги (у фикстуры базового отчёта нет LostImpressionShare и State).
     assert entry["campaign_report_has_lost_impression_share"] is False
     assert entry["archived_campaigns_retrievable"] is False

@@ -64,8 +64,10 @@ def test_manual_form_tests_checks_unaffected():
         assert _check(methodology, check_id)["requires"] == ["manual_form_tests"]
 
 
-def test_c14_requires_unchanged():
-    """C14 осознанно оставлена на requires: [site_crawl] отдельным аудитом —
-    этот фикс её не трогает."""
+def test_c14_requires_crawl_and_manual_audit():
+    """C14 требует URL краулера и ручной G2-аудит элементов доверия."""
     methodology = orchestrator.load_methodology()
-    assert _check(methodology, "C14")["requires"] == ["site_crawl"]
+    assert _check(methodology, "C14")["requires"] == [
+        "site_crawl",
+        "manual_form_tests",
+    ]

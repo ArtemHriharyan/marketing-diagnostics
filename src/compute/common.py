@@ -243,6 +243,24 @@ def _import_block(name: str) -> Any:
     return importlib.import_module(f"src.compute.{name}")
 
 
+def _remove_skipped_metric_artifacts(paths: Any, degradation_report: dict[str, Any]) -> None:
+    """Удалить устаревшие парные metric-артефакты текущих skipped-проверок.
+
+    Актуальная причина unavailable остаётся единой в degradation_report и
+    metrics_summary; здесь не создаётся обобщённый ряд без причины проверки.
+    """
+    metrics_dir = Path(paths.metrics)
+    for skipped in degradation_report.get("skipped") or []:
+        check_id = skipped.get("id") if isinstance(skipped, dict) else None
+        if not isinstance(check_id, str):
+            continue
+        for suffix in (".json", ".csv"):
+            try:
+                (metrics_dir / f"{check_id.lower()}{suffix}").unlink()
+            except FileNotFoundError:
+                pass
+
+
 def dispatch_blocks(
     paths: Any,
     defaults: dict[str, Any],
@@ -269,6 +287,7 @@ def dispatch_blocks(
     реальных (пока нереализованных) block0..block6.
     """
     runnable_ids = set(degradation_report.get("runnable_check_ids") or [])
+    _remove_skipped_metric_artifacts(paths, degradation_report)
 
     if modules is None:
         named_modules = [(name, _import_block(name)) for name in block_names]

@@ -544,7 +544,7 @@ def test_c13_unavailable_without_any_source(tmp_path):
     assert rows[0]["status"] == "unavailable"
 
 
-# ── C14 — недостаточно доверия (manual_form_tests + optional webvisor) ─────
+# ── C14 — site_crawl + обязательный manual G2, Webvisor только enrichment ──
 def test_c14_manual_present(tmp_path):
     paths = _Paths(tmp_path)
     _write_site_pages(paths, [{"url": "https://example.com/", "http_status": 200,
@@ -571,6 +571,38 @@ def test_c14_unavailable_without_manual_or_webvisor(tmp_path):
     assert "c14" in artifacts
     rows = _read_metric(paths, "c14")
     assert rows[0]["status"] == "unavailable"
+
+
+def test_c14_webvisor_does_not_replace_required_manual_g2(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [{"url": "https://example.com/", "http_status": 200,
+                               "redirect_chain": "[]", "final_url": "https://example.com/"}])
+    _write_input_yaml(paths, "webvisor_findings", {
+        "meta": {"sessions_reviewed": 5, "date": "2026-07-20"},
+        "patterns": [{"pattern": "нет отзывов"}],
+    })
+
+    block3.run(paths, DEFAULTS, {"C14"})
+
+    rows = _read_metric(paths, "c14")
+    assert rows[0]["status"] == "unavailable"
+    assert "обязателен ручной G2" in rows[0]["reason"]
+
+
+def test_c14_manual_g2_respects_degraded_confidence_cap(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_site_pages(paths, [{"url": "https://example.com/", "http_status": 200,
+                               "redirect_chain": "[]", "final_url": "https://example.com/"}])
+    _write_input_yaml(paths, "manual_form_tests", {
+        "meta": {"tested_at": "2026-07-20"},
+        "patterns": [{"step": "первый экран", "issue": "нет кейсов"}],
+    })
+    _write_degradation(paths, [{"check_id": "C14", "confidence_cap": "LOW"}])
+
+    block3.run(paths, DEFAULTS, {"C14"})
+
+    rows = _read_metric(paths, "c14")
+    assert rows[0]["confidence"] == "LOW"
 
 
 # ── C15/C16/C18/C25 — A+B без применимой авто-части ─────────────────────────
@@ -702,10 +734,9 @@ def test_c22_always_unavailable(tmp_path):
     assert rows[0]["status"] == "unavailable"
 
 
-# ── C20 — попап/чат/cookie-баннер (webvisor optional) ───────────────────────
+# ── C20 — только ручной G2/Webvisor ─────────────────────────────────────────
 def test_c20_webvisor_present(tmp_path):
     paths = _Paths(tmp_path)
-    _write_visits(paths, [_base_visit()])
     _write_input_yaml(paths, "webvisor_findings", {
         "meta": {"sessions_reviewed": 5, "date": "2026-07-20", "filter": "мобильные"},
         "patterns": [{"pattern": "cookie-баннер перекрывает форму на мобильных", "count": 4}],
@@ -720,13 +751,26 @@ def test_c20_webvisor_present(tmp_path):
 
 def test_c20_unavailable_without_webvisor(tmp_path):
     paths = _Paths(tmp_path)
-    _write_visits(paths, [_base_visit()])
 
     artifacts = block3.run(paths, DEFAULTS, {"C20"})
 
     assert "c20" in artifacts
     rows = _read_metric(paths, "c20")
     assert rows[0]["status"] == "unavailable"
+
+
+def test_c20_webvisor_g2_respects_degraded_confidence_cap(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_input_yaml(paths, "webvisor_findings", {
+        "meta": {"sessions_reviewed": 5, "date": "2026-07-20"},
+        "patterns": [{"pattern": "баннер перекрывает CTA"}],
+    })
+    _write_degradation(paths, [{"check_id": "C20", "confidence_cap": "LOW"}])
+
+    block3.run(paths, DEFAULTS, {"C20"})
+
+    rows = _read_metric(paths, "c20")
+    assert rows[0]["confidence"] == "LOW"
 
 
 # ── C21 — browser/os/screen сегментация конверсии ────────────────────────────
@@ -755,10 +799,12 @@ def test_c21_browser_segment_underperforms(tmp_path):
     assert safari_row["segment_underperforms_baseline"] is True
 
 
-# ── C24 — реклама/SEO ведут на недоступный товар/услугу (client_facts) ──────
-def test_c24_client_capacity_limit_fact(tmp_path):
+# ── C24 — без URL-level availability только UNVERIFIABLE ────────────────────
+def test_c24_client_fact_does_not_replace_url_level_availability(tmp_path):
     paths = _Paths(tmp_path)
     _write_visits(paths, [_base_visit()])
+    _write_site_pages(paths, [{"url": "https://example.com/", "http_status": 200,
+                               "redirect_chain": "[]", "final_url": "https://example.com/"}])
     _write_client_answers(paths, {
         "capacity_limits": [{"limit": "нет свободных слотов на выходные", "period": "2026-08"}],
     })
@@ -767,11 +813,12 @@ def test_c24_client_capacity_limit_fact(tmp_path):
 
     assert "c24" in artifacts
     rows = _read_metric(paths, "c24")
-    fact_row = next(r for r in rows if r["finding"] == "client_fact_capacity_limit")
-    assert fact_row["confidence"] == "client-HIGH"
+    assert rows[0]["status"] == "unavailable"
+    assert "UNVERIFIABLE" in rows[0]["reason"]
+    assert "client_answers" in rows[0]["reason"]
 
 
-def test_c24_unavailable_without_client_answers(tmp_path):
+def test_c24_unavailable_without_site_crawl(tmp_path):
     paths = _Paths(tmp_path)
     _write_visits(paths, [_base_visit()])
 
@@ -780,3 +827,18 @@ def test_c24_unavailable_without_client_answers(tmp_path):
     assert "c24" in artifacts
     rows = _read_metric(paths, "c24")
     assert rows[0]["status"] == "unavailable"
+    assert "site_pages недоступна" in rows[0]["reason"]
+
+
+def test_c24_degraded_scenario_stays_unverifiable(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_visits(paths, [_base_visit()])
+    _write_site_pages(paths, [{"url": "https://example.com/", "http_status": 200,
+                               "redirect_chain": "[]", "final_url": "https://example.com/"}])
+    _write_degradation(paths, [{"check_id": "C24", "confidence_cap": "LOW"}])
+
+    block3.run(paths, DEFAULTS, {"C24"})
+
+    rows = _read_metric(paths, "c24")
+    assert rows[0]["status"] == "unavailable"
+    assert "confidence" not in rows[0]

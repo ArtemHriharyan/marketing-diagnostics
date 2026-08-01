@@ -154,7 +154,7 @@ def test_report_includes_detailed_checks():
     assert set(by_id) == {c["id"] for c in methodology["checks"]}
     entry = by_id["D01"]
     assert set(entry) == {
-        "check_id", "runnable", "type_effective",
+        "check_id", "runnable", "requires", "type_effective",
         "source_modes", "confidence_cap", "reason_if_not_runnable",
     }
 

@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts import verify_metrika as vm  # noqa: E402
+from src.extract import metrika_reports  # noqa: E402
 
 FORM_SUBMIT_ID = 371497275
 CONFIG = {"goals": {"form_submit_goal_ids": [FORM_SUBMIT_ID]}}
@@ -58,6 +59,11 @@ def _write_reports(raw_dir: Path, entries: list[dict]):
     rep_dir.mkdir(parents=True, exist_ok=True)
     (rep_dir / "goals_by_month.json").write_text(
         json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+
+
+def test_metrika_reports_declares_goals_canonical_table():
+    """Extract объявляет goals для raw manifest и штатной degradation."""
+    assert metrika_reports.CANONICAL_TABLES == ["visits", "goals"]
 
 
 def _report_entry(month, visits, goal_reaches, goal_id=FORM_SUBMIT_ID):
