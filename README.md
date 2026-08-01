@@ -4,6 +4,14 @@
 
 Архитектурные принципы и описание слоёв — в [CLAUDE.md](CLAUDE.md).
 
+> [!WARNING]
+> Проект находится в стадии стабилизации. До закрытия P1-проблем из
+> [реестра текущих рисков](docs/current_risks.md) результаты нельзя выпускать
+> клиенту как воспроизводимый диагностический отчёт.
+
+Правила передачи данных во внешний LLM и действующие ограничения описаны в
+[политике безопасности и конфиденциальности](docs/security-and-privacy.md).
+
 ## Установка
 
 ```bash
@@ -31,7 +39,7 @@ cp -r clients/_template clients/acme        # или скопировать вр
 ## Запуск этапов
 
 ```bash
-python run.py acme --stage intake      # проверка конфига и живости токенов
+python run.py acme --stage intake      # предварительная проверка конфигурации
 python run.py acme --stage extract     # выгрузка сырых данных в data/raw/
 python run.py acme --stage transform   # raw -> data/canonical/*.parquet
 python run.py acme --stage compute      # canonical -> data/metrics/
@@ -52,9 +60,17 @@ python run.py acme --stage all          # всё подряд с останов�
 
 ## Тесты
 
+Единый запуск тестов в Windows — через скрипт ниже. Он создаёт временные каталоги
+в рабочем дереве, направляет в `tmp/` переменные `TMP` и `TEMP`, а pytest — в
+`.pytest_tmp/`; системная `%TEMP%` и `.pytest_cache/` не используются. При
+невозможности создать эти каталоги скрипт завершится до запуска тестов.
+
 ```bash
-pytest tests/
+powershell -ExecutionPolicy Bypass -File scripts/run_tests.ps1 tests/
 ```
+
+Дополнительные аргументы pytest передаются после пути: например,
+`powershell -ExecutionPolicy Bypass -File scripts/run_tests.ps1 tests/ -q`.
 
 Фикстуры для внешних TSV/CSV/JSON источников (Директ, GSC, Вебмастер,
 Метрика) обязаны основываться на реальном байтовом образце ответа API/экспорта,

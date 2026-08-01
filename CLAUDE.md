@@ -164,7 +164,7 @@ Intake автоматически распознаёт старый `months` и 
    «улучшение заодно».
 5. Бизнес-логика проверок берётся из источников истины в таком порядке:
    a) `catalog-proveryaemyh-marketingovyh-ugroz-v2.md` — смысл и формулы;
-   b) `data-export-spec-v1.md` — поля и контракты выгрузки;
+   b) `data-export-spec-v2.md` — поля и контракты выгрузки;
    c) `marketing-diagnostics-methodology-v2.md` — порядок, продуктовые
       правила, confidence и деградация;
    d) `config/methodology.yaml` — машинный реестр ID.
