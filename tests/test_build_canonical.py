@@ -194,6 +194,16 @@ def test_parse_goal_ids_splits_on_common_delimiters():
     assert bc.parse_goal_ids(None) == []
 
 
+@pytest.mark.parametrize("raw,expected", [
+    ("[]", []),
+    ("[123]", ["123"]),
+    ("[123,456]", ["123", "456"]),
+    ("[123,123,456]", ["123", "123", "456"]),
+])
+def test_parse_goal_ids_handles_bracketed_logs_api_arrays(raw, expected):
+    assert bc.parse_goal_ids(raw) == expected
+
+
 def test_goal_flags_marks_visit_level_achievements_and_counts_submits():
     goals_cfg = {
         "form_open_goal_ids": [10],
@@ -415,7 +425,8 @@ def test_build_writes_only_tables_with_raw_source(tmp_path):
     built = bc.build(paths, config, defaults)
 
     assert set(built) == {
-        "visits", "costs", "direct_queries", "campaign_strategies", "campaign_status",
+        "visits", "visit_goals", "costs", "direct_queries", "campaign_strategies",
+        "campaign_status",
     }
     assert not (paths.canonical / "seo_queries.parquet").exists()
     assert not (paths.canonical / "crm.parquet").exists()
@@ -2569,6 +2580,95 @@ def test_build_goal_achievements_records_mismatch_and_malformed_datetime(tmp_pat
         "status": "degraded", "source_visits": 2, "emitted_rows": 1,
         "mismatched_visits": 1, "mismatched_values": 2, "malformed_goal_datetime": 1,
     }
+
+
+def test_visit_goals_is_independent_from_temporal_arrays_and_idempotent(tmp_path):
+    paths = _Paths(tmp_path)
+    paths.raw.mkdir(parents=True, exist_ok=True)
+    _write_goal_achievement_rows(paths.raw / "metrika_logs", [{
+        "visit_id": "v1", "goals_id": "[20,20,30]",
+        "goals_datetime": "2026-06-01 10:01:00",
+        "goals_serial_number": "1,2",
+    }])
+    manifest_mod.update_source(
+        paths.raw, "metrika_logs", date_from="2026-06-01", date_to="2026-06-30",
+        rows=1, script_version="test", canonical_tables=["visits", "visit_goals"],
+    )
+
+    first_built = bc.build(paths, {"goals": {"form_submit_goal_ids": [20]}}, {})
+    first = pd.read_parquet(paths.canonical / "visit_goals.parquet")
+    second_built = bc.build(paths, {"goals": {"form_submit_goal_ids": [20]}}, {})
+    second = pd.read_parquet(paths.canonical / "visit_goals.parquet")
+
+    assert first_built == second_built
+    assert "visit_goals" in first_built
+    assert first.to_dict("records") == second.to_dict("records") == [
+        {"visit_id": "v1", "goal_id": "20", "achievement_count": 2},
+        {"visit_id": "v1", "goal_id": "30", "achievement_count": 1},
+    ]
+    visits = pd.read_parquet(paths.canonical / "visits.parquet")
+    assert visits.iloc[0]["form_submit"] == True  # noqa: E712
+    assert visits.iloc[0]["form_submit_count"] == 2
+
+    manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
+    assert "visit_goals" in manifest["tables"]
+    assert manifest["schemas"]["visit_goals"] == [
+        "visit_id", "goal_id", "achievement_count",
+    ]
+
+
+def test_visits_preserve_available_attribution_keys_and_nullable_absence(tmp_path):
+    paths = _Paths(tmp_path)
+    metrika = paths.raw / "metrika_logs"
+    metrika.mkdir(parents=True, exist_ok=True)
+    extra_fields = ["ym:s:lastsignUTMTerm", "ym:s:yclid"]
+    header = VISIT_FIELDS + extra_fields
+    rows = []
+    for visit_id, values in (
+        ("with_keys", {
+            "ym:s:lastsignUTMMedium": "cpc",
+            "ym:s:lastsignUTMCampaign": "summer",
+            "ym:s:lastsignUTMTerm": "car rent",
+            "ym:s:lastSignDirectClickOrder": "campaign-42",
+            "ym:s:yclid": "click-99",
+        }),
+        ("without_keys", {}),
+    ):
+        cells = {field: "" for field in header}
+        cells.update({
+            "ym:s:visitID": visit_id,
+            "ym:s:clientID": visit_id,
+            "ym:s:dateTime": "2026-06-01 10:00:00",
+            "ym:s:lastsignTrafficSource": "ad",
+            "ym:s:deviceCategory": "2",
+            "ym:s:startURL": "https://site.ru/",
+        })
+        cells.update(values)
+        rows.append("\t".join(cells[field] for field in header))
+    with gzip.open(metrika / "visits_2026-06.csv.gz", "wt", encoding="utf-8") as fh:
+        fh.write("\t".join(header) + "\n" + "\n".join(rows) + "\n")
+    manifest_mod.update_source(
+        paths.raw, "metrika_logs", date_from="2026-06-01", date_to="2026-06-30",
+        rows=2, script_version="test", canonical_tables=["visits", "visit_goals"],
+    )
+
+    bc.build(paths, {"goals": {}}, {"utm_undefined_threshold": 0.25})
+    visits = pd.read_parquet(paths.canonical / "visits.parquet").set_index("visit_id")
+    assert visits.loc["with_keys", [
+        "utm_medium_raw", "utm_campaign_raw", "utm_term_raw",
+        "direct_click_order", "click_id",
+    ]].tolist() == ["cpc", "summer", "car rent", "campaign-42", "click-99"]
+    assert visits.loc["without_keys", [
+        "utm_medium_raw", "utm_campaign_raw", "utm_term_raw",
+        "direct_click_order", "click_id",
+    ]].isna().all()
+
+    manifest = json.loads((paths.canonical / "manifest.json").read_text("utf-8"))
+    for field in (
+        "utm_medium_raw", "utm_campaign_raw", "utm_term_raw",
+        "direct_click_order", "click_id",
+    ):
+        assert field in manifest["schemas"]["visits"]
 
 
 # ═══════════════════════════ build_wordstat (FIX-wordstat-canonical) ═══════

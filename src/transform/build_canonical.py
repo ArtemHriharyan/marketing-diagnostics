@@ -303,7 +303,7 @@ def normalize_entry_page(start_url: str | None) -> str:
 
 
 def parse_goal_ids(raw: str | None) -> list[str]:
-    """ym:s:goalsID ("123,456" и т.п.) -> список id как строк.
+    """ym:s:goalsID (``[]``, ``[123]``, ``[123,456]``) -> список id как строк.
 
     Разделители: запятая, точка с запятой, вертикальная черта. Дубликаты
     (если один и тот же id встретился несколько раз — визит достигал цель
@@ -312,8 +312,13 @@ def parse_goal_ids(raw: str | None) -> list[str]:
     """
     if not raw or not raw.strip():
         return []
-    parts = re.split(r"[,;|]", raw.strip())
-    return [p.strip() for p in parts if p.strip()]
+    text = raw.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    if not text:
+        return []
+    parts = re.split(r"[,;|]", text)
+    return [p.strip().strip("\"'") for p in parts if p.strip().strip("\"'")]
 
 
 def goal_flags(goal_ids: list[str], goals_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -832,6 +837,27 @@ def _read_metrika_logs_rows(raw_dir: Path) -> list[dict[str, str]]:
     return rows
 
 
+def build_visit_goals(metrika_logs_dir: Path) -> pd.DataFrame:
+    """Развернуть goalsID независимо от временных массивов достижений.
+
+    Одна строка результата — уникальная пара visit_id x goal_id. Повторные
+    ID внутри последней сырой версии визита сохраняются в achievement_count.
+    """
+    by_visit = _latest_goal_rows(_read_metrika_logs_rows(metrika_logs_dir))
+    records: list[dict[str, Any]] = []
+    for visit_id in sorted(by_visit):
+        counts: dict[str, int] = {}
+        for goal_id in parse_goal_ids(by_visit[visit_id].get("ym:s:goalsID")):
+            counts[goal_id] = counts.get(goal_id, 0) + 1
+        for goal_id, achievement_count in counts.items():
+            records.append({
+                "visit_id": visit_id,
+                "goal_id": goal_id,
+                "achievement_count": achievement_count,
+            })
+    return pd.DataFrame(records)
+
+
 _GOAL_ACHIEVEMENT_FIELDS = (
     "ym:s:goalsID",
     "ym:s:goalsDateTime",
@@ -1143,6 +1169,13 @@ def _parse_visit_row(
         v = (row.get(key) or "").strip()
         return v or None
 
+    def _first(*keys: str) -> str | None:
+        for key in keys:
+            value = _s(key)
+            if value is not None:
+                return value
+        return None
+
     width = _parse_backfill_int(row.get("ym:s:screenWidth"))
     height = _parse_backfill_int(row.get("ym:s:screenHeight"))
     resolution = f"{width}x{height}" if (width is not None and height is not None) else None
@@ -1159,6 +1192,16 @@ def _parse_visit_row(
         # (resolve_traffic_source, T02/T03) и QA-сверке.
         "last_sign_traffic_source_raw": _to_optional_str(row.get("ym:s:lastsignTrafficSource")),
         "utm_source_raw": (row.get("ym:s:lastsignUTMSource") or "").strip(),
+        "utm_medium_raw": _s("ym:s:lastsignUTMMedium"),
+        "utm_campaign_raw": _s("ym:s:lastsignUTMCampaign"),
+        "utm_term_raw": _s("ym:s:lastsignUTMTerm"),
+        # В Logs API order — доступный ключ кампании Директа для связи визита.
+        "direct_click_order": _s("ym:s:lastSignDirectClickOrder"),
+        # Сохраняем только фактически пришедший ID; hasGCLID-флаг не является ID.
+        "click_id": _first(
+            "ym:s:yclid", "ym:s:lastSignYCLID", "ym:s:YCLID",
+            "ym:s:gclid", "ym:s:lastSignGCLID", "ym:s:GCLID",
+        ),
         "entry_page": normalize_entry_page(row.get("ym:s:startURL")),
         "form_open": flags["form_open"],
         "form_submit": flags["form_submit"],
@@ -2187,6 +2230,10 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "source_final": "string", "is_ad": "bool", "entry_page": "string",
         "form_open": "bool", "form_submit": "bool", "call_click": "bool",
         "messenger_click": "bool", "form_submit_count": "int", "is_new_user": "bool",
+        # ── Атрибуционные ключи P01 (отсутствие в raw -> null) ──────────────
+        "utm_medium_raw": "string", "utm_campaign_raw": "string",
+        "utm_term_raw": "string", "direct_click_order": "string",
+        "click_id": "string",
         # ── Симметричные *_count (goal-flags-overtrigger-symmetry-check) ────
         "form_open_count": "int", "call_click_count": "int",
         "messenger_click_count": "int",
@@ -2206,6 +2253,9 @@ SCHEMAS: dict[str, dict[str, str]] = {
         "last_sign_traffic_source_raw": "string",
         "source_group_resolved": "string",
         "traffic_source_resolved": "bool",
+    },
+    "visit_goals": {
+        "visit_id": "string", "goal_id": "string", "achievement_count": "int",
     },
     "costs": {
         "date": "date", "source_tag": "string", "campaign_id": "string",
@@ -2473,6 +2523,11 @@ def _write_canonical_manifest(
 
     payload = {
         "tables": sorted(tables),
+        "schemas": {
+            table: list(SCHEMAS["ad_texts" if table == "ad_texts_archived" else table])
+            for table in sorted(tables)
+            if ("ad_texts" if table == "ad_texts_archived" else table) in SCHEMAS
+        },
         "flags": flags,
         "join_integrity": sorted(join_integrity, key=lambda record: record["join_id"]),
         "temporal_provenance": temporal_provenance or {
@@ -2534,6 +2589,12 @@ def build(
             # флага робота, is_robot_available) — фиксируется для аналитика,
             # а не «молча».
             flags["metrika_backfill"] = backfill_stats
+
+        visit_goals_df = build_visit_goals(raw_dir / "metrika_logs")
+        write_canonical_table(
+            visit_goals_df, "visit_goals", canonical_dir / "visit_goals.parquet",
+        )
+        built.append("visit_goals")
 
         goal_achievements_df, goal_achievements_stats = build_goal_achievements(
             raw_dir / "metrika_logs"
