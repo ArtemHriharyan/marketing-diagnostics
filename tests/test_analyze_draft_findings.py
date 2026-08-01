@@ -217,6 +217,69 @@ def test_build_input_pack_byte_cap_is_deterministic_and_audited(tmp_path):
     assert "S06" in first["coverage"]["included_check_ids"]
 
 
+def test_pognali_fixture_compacts_funnels_and_keeps_every_candidate(tmp_path):
+    paths = _Paths(tmp_path)
+    candidate_columns = [*CANDIDATE_COLUMNS, "row_ref", "context_refs"]
+    candidate_rows = [
+        [
+            "A04", "detail", False, "ok", "MED", True,
+            {"detail": "x" * 2500}, f"detail-{index}", [],
+        ]
+        for index in range(45)
+    ]
+    candidate_rows.extend([
+        ["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}, "c06", []],
+        ["S06", "candidate", True, "ok", "MED", True, {"trend": "down"}, "s06", []],
+        ["A04", "candidate", True, "ok", "MED", True, {"cost_rub": 5000}, "a04", []],
+    ])
+    _write_json(paths.metrics, "analysis_candidates", {
+        "columns": candidate_columns,
+        "rows": candidate_rows,
+        "coverage": {"checks_calculated": 3},
+    })
+    segments = [
+        {
+            "dimension": "landing_page",
+            "segment": f"/cars/{index}",
+            "stages": [
+                {"stage_id": "form_open", "visits": 100 + index},
+                {"stage_id": "form_submit", "visits": 40 + index},
+            ],
+            "transitions": [{
+                "from_stage": "form_open", "to_stage": "form_submit",
+                "rate": 0.4, "gap_visits": 60,
+            }],
+        }
+        for index in range(420)
+    ]
+    funnels = {
+        "funnels": [{
+            "id": "booking",
+            "stages": [
+                {"stage_id": "form_open", "visits": 3002},
+                {"stage_id": "form_submit", "visits": 634},
+            ],
+            "segments": {"landing_page": segments},
+        }]
+    }
+    assert len(json.dumps(funnels, ensure_ascii=False).encode("utf-8")) > 90_000
+    _write_json(paths.metrics, "funnels", funnels)
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+
+    projection = pack["compact_context"]["funnels"]
+    funnel_columns = projection["funnels"]["columns"]
+    funnel_row = projection["funnels"]["rows"][0]
+    segment_projection = funnel_row[funnel_columns.index("segments")]["landing_page"]
+    assert segment_projection["columns"]
+    assert len(segment_projection["rows"]) == len(segments)
+    assert pack["audit"]["byte_cap"] == 100_000
+    assert pack["audit"]["input_pack_bytes"] < 100_000
+    assert pack["coverage"]["included_check_ids"] == ["A04", "C06", "S06"]
+    assert pack["coverage"]["candidates_omitted"] == 0
+    assert pack["excluded_candidates"] == []
+
+
 # ── 3. draft(): аудиторский артефакт всегда пишется первым ─────────────────
 # Задача 6B подключила вызов модели (см. tests/test_analyze_draft_findings_llm.py
 # для сценариев с находками) — здесь только проверяем, что при пустом ответе

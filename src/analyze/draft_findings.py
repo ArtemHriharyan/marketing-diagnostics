@@ -139,6 +139,63 @@ def _candidate_rows(payload: Any) -> tuple[list[str], list[Any], list[int]]:
     return columns, rows, indexes
 
 
+def _context_ref_tokens(value: Any) -> set[str]:
+    """Нормализовать явные ссылки P06 без привязки к порядку строк."""
+    if isinstance(value, list):
+        tokens: set[str] = set()
+        for item in value:
+            tokens.update(_context_ref_tokens(item))
+        return tokens
+    if isinstance(value, dict):
+        tokens = {
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        }
+        for key in ("row_ref", "ref", "id"):
+            if value.get(key) not in (None, ""):
+                tokens.add(str(value[key]))
+        artifact = value.get("artifact") or value.get("source_artifact")
+        row_ref = value.get("row_ref") or value.get("ref")
+        if artifact not in (None, "") and row_ref not in (None, ""):
+            tokens.add(f"{artifact}:{row_ref}")
+        return tokens
+    if value not in (None, ""):
+        return {str(value)}
+    return set()
+
+
+def _row_ref_tokens(row: dict[str, Any], index: int) -> set[str]:
+    tokens = {str(index)}
+    for key in ("row_ref", "ref", "id"):
+        if row.get(key) not in (None, ""):
+            tokens.add(str(row[key]))
+    artifact = row.get("artifact") or row.get("source_artifact")
+    row_ref = row.get("row_ref") or row.get("ref")
+    if artifact not in (None, "") and row_ref not in (None, ""):
+        tokens.add(f"{artifact}:{row_ref}")
+    return tokens
+
+
+def _project_analysis_candidates(payload: Any) -> dict[str, Any]:
+    """Оставить всех кандидатов и только явно связанный с ними контекст P06."""
+    if not isinstance(payload, dict):
+        return {"columns": [], "rows": [], "coverage": {}}
+    columns, rows, indexes = _candidate_rows(payload)
+    if not columns or not isinstance(rows, list):
+        return {**payload, "columns": columns, "rows": []}
+
+    candidate_refs: set[str] = set()
+    for index in indexes:
+        candidate_refs.update(
+            _context_ref_tokens(_row_dict(columns, rows[index]).get("context_refs"))
+        )
+    selected_rows = []
+    for index, row in enumerate(rows):
+        decoded = _row_dict(columns, row)
+        if index in indexes or candidate_refs.intersection(_row_ref_tokens(decoded, index)):
+            selected_rows.append(row)
+    return {**payload, "rows": selected_rows}
+
+
 def _is_unavailable_row(row: dict[str, Any]) -> bool:
     return (
         row.get("status") in _NON_FINDING_STATUSES
@@ -195,6 +252,7 @@ def _refresh_coverage(pack: dict[str, Any], *, detected: int, included: int) -> 
     coverage["candidates_detected"] = detected
     coverage["candidates_included"] = included
     coverage["candidates_excluded"] = detected - included
+    coverage["candidates_omitted"] = detected - included
     check_ids = []
     columns, rows, indexes = _candidate_rows(pack.get("analysis_candidates"))
     for index in indexes:
@@ -213,6 +271,7 @@ def _apply_byte_cap(pack: dict[str, Any], byte_cap: int) -> None:
     decoded_all = {index: _row_dict(columns, row) for index, row in enumerate(rows)}
     decoded = {index: decoded_all[index] for index in indexes}
     included = set(indexes)
+    context_included = set(decoded_all) - included
     for index in [index for index in indexes if _is_unavailable_row(decoded[index])]:
         included.discard(index)
         pack["excluded_candidates"].append({
@@ -226,12 +285,19 @@ def _apply_byte_cap(pack: dict[str, Any], byte_cap: int) -> None:
     def rebuild_rows() -> None:
         candidates["rows"] = [
             row for index, row in enumerate(rows)
-            if index not in unavailable_rows and (index not in indexes or index in included)
+            if index not in unavailable_rows
+            and (index in included or index in context_included)
         ]
 
     rebuild_rows()
     _refresh_coverage(pack, detected=len(indexes), included=len(included))
     _set_pack_size(pack)
+    for index in sorted(context_included, reverse=True):
+        if pack["audit"]["input_pack_bytes"] <= byte_cap:
+            break
+        context_included.remove(index)
+        rebuild_rows()
+        _set_pack_size(pack)
     anchors: set[int] = set()
     by_block: dict[str, list[int]] = {}
     for index in included:
@@ -269,6 +335,71 @@ def _compact_degradation(report: dict[str, Any]) -> dict[str, Any]:
         for check in report.get("checks") or []
     ]
     return {"columns": columns, "rows": rows, "counts": report.get("counts") or {}}
+
+
+def _segment_item_label(item: dict[str, Any], index: int) -> str:
+    if item.get("from_stage") not in (None, "") and item.get("to_stage") not in (None, ""):
+        return f"{item['from_stage']}->{item['to_stage']}"
+    for key in ("stage_id", "transition_id", "id", "name", "stage"):
+        if item.get(key) not in (None, ""):
+            return str(item[key])
+    return str(index)
+
+
+def _flatten_segment_row(value: Any, prefix: str = "") -> dict[str, Any]:
+    """Развернуть повторяющиеся stage/transition внутри одного сегмента."""
+    result: dict[str, Any] = {}
+
+    def visit(item: Any, path: str) -> None:
+        if isinstance(item, dict):
+            for key in sorted(item):
+                visit(item[key], f"{path}.{key}" if path else str(key))
+            return
+        if isinstance(item, list) and item and all(isinstance(child, dict) for child in item):
+            for index, child in enumerate(item):
+                label = _segment_item_label(child, index)
+                visit(child, f"{path}.{label}" if path else label)
+            return
+        result[path] = item
+
+    visit(value, prefix)
+    return result
+
+
+def _columnar_dict_rows(rows: list[dict[str, Any]], *, flatten: bool) -> dict[str, Any]:
+    decoded = [
+        _flatten_segment_row(row) if flatten else {
+            key: _compact_funnel_value(value, segment_scope=key == "segments")
+            for key, value in row.items()
+        }
+        for row in rows
+    ]
+    columns = sorted({key for row in decoded for key in row})
+    return {
+        "columns": columns,
+        "rows": [[row.get(column) for column in columns] for row in decoded],
+    }
+
+
+def _compact_funnel_value(value: Any, *, segment_scope: bool = False) -> Any:
+    """Перевести повторяющиеся структуры funnels в columns+rows."""
+    if isinstance(value, dict):
+        return {
+            key: _compact_funnel_value(
+                item, segment_scope=segment_scope or key == "segments"
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
+        return _columnar_dict_rows(value, flatten=segment_scope)
+    if isinstance(value, list):
+        return [_compact_funnel_value(item, segment_scope=segment_scope) for item in value]
+    return value
+
+
+def _compact_funnels(payload: Any) -> Any:
+    """Самодостаточная LLM-проекция funnels без повторения схем сегментов."""
+    return _compact_funnel_value(payload)
 
 
 def _load_inputs(paths: Any) -> dict[str, Any]:
@@ -332,11 +463,13 @@ def build_input_pack(
     """
     defaults = defaults or {}
     degradation_report = _load_degradation_report(paths)
-    analysis_candidates = _load_json_artifact(paths, "analysis_candidates") or {
-        "columns": [], "rows": [], "coverage": {}
-    }
+    analysis_candidates = _project_analysis_candidates(
+        _load_json_artifact(paths, "analysis_candidates") or {
+            "columns": [], "rows": [], "coverage": {}
+        }
+    )
     compact_context = {
-        stem: payload
+        stem: _compact_funnels(payload) if stem == "funnels" else payload
         for stem in _COMPACT_CONTEXT_ARTIFACTS
         if (payload := _load_json_artifact(paths, stem)) is not None
     }
