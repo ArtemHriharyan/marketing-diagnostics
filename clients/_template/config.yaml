@@ -80,6 +80,19 @@ funnels:              # последовательности этапов; не�
     - stage: form_submit
       goal_ids: []
 
+# Конечные фактически уплаченные суммы с НДС. НДС повторно не пересчитывается.
+spend_components: []
+  # - id: direct_media
+  #   channel: direct
+  #   kind: media
+  #   source: canonical_costs
+  #   source_tag: direct
+  # - id: direct_management
+  #   channel: direct
+  #   kind: management
+  #   source: monthly_fixed
+  #   amount_rub_month: 28500
+
 costs_manual:         # для клиентов без Директа или с ручными фиксами расходов
   agency_fee_rub_month: 0     # ведение контекста, руб/мес
   seo_fee_rub_month: 0        # ведение SEO, руб/мес

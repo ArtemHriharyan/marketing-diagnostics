@@ -233,7 +233,7 @@ def write_metric_artifact(
 # остаются NotImplementedError-заглушками (вне скоупа этого фикса).
 BLOCK_MODULE_NAMES: tuple[str, ...] = (
     "block0", "block1", "block2", "funnels", "block3", "block4_seo", "block5", "block6",
-    "money_frame",
+    "cost_summary", "money_frame",
 )
 
 

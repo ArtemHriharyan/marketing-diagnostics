@@ -90,6 +90,9 @@ class TestTemplateConfig:
                 assert isinstance(stage.get("stage"), str)
                 assert isinstance(stage.get("goal_ids"), list)
 
+    def test_spend_components_is_list(self):
+        assert isinstance(self.cfg.get("spend_components"), list)
+
 
 # ── _template/inputs/client_answers.yaml ─────────────────────────────────────
 
