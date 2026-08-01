@@ -93,6 +93,22 @@ spend_components: []
   #   source: monthly_fixed
   #   amount_rub_month: 28500
 
+# Модели стоимости привлечения. Доли, ID компонентов и связи воронки задаются
+# только здесь. Для канальной tracked-модели обязательны channel и надёжный
+# traffic_filter по сохранённому полю canonical visits.
+acquisition_models: []
+  # - id: estimated_site_booking
+  #   mode: crm_share_estimate
+  #   crm_share: 0.90
+  #   spend_components: [direct_media, direct_management]
+  # - id: tracked_direct_booking
+  #   mode: tracked_funnel
+  #   funnel: booking
+  #   stage: form_submit
+  #   channel: direct
+  #   traffic_filter: {field: source_group_resolved, value: ad}
+  #   spend_components: [direct_media, direct_management]
+
 costs_manual:         # для клиентов без Директа или с ручными фиксами расходов
   agency_fee_rub_month: 0     # ведение контекста, руб/мес
   seo_fee_rub_month: 0        # ведение SEO, руб/мес
@@ -138,6 +154,8 @@ top_n_seasonality: 10  # топ-K запросов для сезонности (
                        # general НЕ вырезается; seed-маска добавляется всегда, даже вне топа
 
 crm_csv:              # правила разбора ручной выгрузки CRM (sources.crm_csv.path)
+  record_unit: "unknown"  # paid_booking | lead | opportunity | unknown; задаётся явно
+  attribution_reliable: false  # true только при подтверждённом source в CRM
   # canonical -> заголовок в CSV. Каноничные: lead_date, source, phone_or_id,
   # status, amount_rub, is_new_client. Пусто = заголовки совпадают с каноничными.
   column_map: {}      # напр. {lead_date: "Дата", phone_or_id: "Телефон", status: "Статус"}

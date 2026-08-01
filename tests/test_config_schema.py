@@ -93,6 +93,13 @@ class TestTemplateConfig:
     def test_spend_components_is_list(self):
         assert isinstance(self.cfg.get("spend_components"), list)
 
+    def test_acquisition_models_and_crm_semantics_are_explicit(self):
+        assert isinstance(self.cfg.get("acquisition_models"), list)
+        assert self.cfg["crm_csv"]["record_unit"] in {
+            "paid_booking", "lead", "opportunity", "unknown",
+        }
+        assert isinstance(self.cfg["crm_csv"]["attribution_reliable"], bool)
+
 
 # ── _template/inputs/client_answers.yaml ─────────────────────────────────────
 
