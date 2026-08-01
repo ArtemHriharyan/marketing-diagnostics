@@ -234,6 +234,7 @@ def write_metric_artifact(
 BLOCK_MODULE_NAMES: tuple[str, ...] = (
     "block0", "block1", "block2", "funnels", "seasonality", "block3", "block4_seo", "block5", "block6",
     "cost_summary", "acquisition_economics", "money_frame",
+    "candidates",
 )
 
 
