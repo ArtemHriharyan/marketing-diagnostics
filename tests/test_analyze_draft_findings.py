@@ -50,6 +50,7 @@ METHODOLOGY = {
         {"id": "D01", "name": "Ключевая цель срабатывает несколько раз в одном визите"},
         {"id": "A04", "name": "Кампания расходует деньги и не даёт ни одной чистой конверсии"},
         {"id": "C06", "name": "Большой отвал между открытием и отправкой формы"},
+        {"id": "S06", "name": "Сезонность объясняет SEO-аномалию"},
     ]
 }
 
@@ -70,6 +71,19 @@ CONFIG = {
 def _write_json(directory: Path, name: str, data) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / f"{name}.json").write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+CANDIDATE_COLUMNS = [
+    "check_id", "row_role", "candidate", "status", "confidence", "significant", "payload",
+]
+
+
+def _write_candidates(paths: _Paths, rows: list[list], coverage: dict | None = None) -> None:
+    _write_json(paths.metrics, "analysis_candidates", {
+        "columns": CANDIDATE_COLUMNS,
+        "rows": rows,
+        "coverage": coverage or {"checks_calculated": 2},
+    })
 
 
 def _write_degradation(paths: _Paths, checks: list[dict]) -> None:
@@ -93,68 +107,72 @@ def test_build_input_pack_collects_all_sections(tmp_path):
         {"check_id": "D01", "runnable": True, "confidence_cap": "HIGH", "type_effective": "A"},
         {"check_id": "A04", "runnable": True, "confidence_cap": "MED", "type_effective": "A"},
     ])
-    _write_json(paths.metrics, "a04", [
-        {"check_id": "A04", "campaign_id": "c1", "cost_normalized_rub": 10000.0,
-         "zero_conversion_campaign": True, "confidence": "MED"},
+    _write_candidates(paths, [
+        ["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}],
+        ["S06", "candidate", True, "ok", "MED", True, {"trend": "down"}],
     ])
-    # Служебные артефакты не должны попасть в metrics-пакет как обычные проверки.
-    _write_json(paths.metrics, "metrics_summary", {"counts": {"total": 2}})
+    _write_json(paths.metrics, "funnels", {"booking": {"open": 100, "submit": 45}})
+    _write_json(paths.metrics, "acquisition_economics", {"models": [{"value_rub": 2500.0}]})
+    _write_json(paths.metrics, "seasonality", {"peaks": ["2026-06"]})
+    _write_json(paths.metrics, "a04", [{"raw": "x" * 10_000}])
 
     paths.inputs.mkdir(parents=True)
     (paths.inputs / "client_answers.yaml").write_text(
-        "business:\n  avg_check_rub: 5000\n", encoding="utf-8"
+        "business:\n  avg_check_rub: 5000\n  comment: ''\n", encoding="utf-8"
     )
 
     pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
 
     assert pack["client_context"]["name"] == "Клиент Тест"
     assert pack["client_context"]["niche"] == "аренда авто"
-    assert pack["methodology_check_names"]["A04"].startswith("Кампания расходует")
-    assert set(pack["known_check_ids"]) == {"D01", "A04", "C06"}
-
-    assert "a04" in pack["metrics"]
-    assert "metrics_summary" not in pack["metrics"]
-    assert "degradation_report" not in pack["metrics"]
+    assert pack["check_names"]["A04"].startswith("Кампания расходует")
+    assert set(pack["known_check_ids"]) == {"D01", "A04", "C06", "S06"}
+    assert pack["coverage"]["included_check_ids"] == ["C06", "S06"]
+    assert set(pack["compact_context"]) == {"funnels", "acquisition_economics", "seasonality"}
+    assert "metrics" not in pack
+    assert "raw" not in json.dumps(pack, ensure_ascii=False)
 
     assert pack["inputs"]["client_answers"]["business"]["avg_check_rub"] == 5000
+    assert "comment" not in pack["inputs"]["client_answers"]["business"]
 
-    assert pack["degradation"]["runnable_check_ids"] == ["D01", "A04"]
-    assert pack["confidence_ceilings"]["source_cap_by_check"] == {"D01": "HIGH", "A04": "MED"}
-    assert pack["confidence_ceilings"]["sample_size_rule"]["min_sample_visits"] == 500
-    assert pack["confidence_ceilings"]["sample_size_rule"]["significance_alpha"] == 0.05
-
-    assert pack["money_categories"] == dict(schemas.MONEY_CATEGORIES)
-    assert pack["max_findings_per_run"] == schemas.MAX_FINDINGS_PER_RUN
+    assert pack["constraints"]["source_cap_by_check"] == {"D01": "HIGH", "A04": "MED"}
+    assert pack["constraints"]["sample_size_rule"]["min_sample_visits"] == 500
+    assert pack["constraints"]["money_categories"] == dict(schemas.MONEY_CATEGORIES)
+    assert pack["audit"]["input_pack_bytes"] < pack["audit"]["byte_cap"]
 
 
 def test_build_input_pack_missing_sources_are_empty_not_broken(tmp_path):
     paths = _Paths(tmp_path)
     pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
 
-    assert pack["metrics"] == {}
+    assert pack["analysis_candidates"]["rows"] == []
+    assert pack["compact_context"] == {}
     assert pack["inputs"] == {}
-    assert pack["degradation"]["checks"] == []
-    assert pack["confidence_ceilings"]["source_cap_by_check"] == {}
+    assert pack["degradation"]["rows"] == []
+    assert pack["constraints"]["source_cap_by_check"] == {}
 
 
-def test_build_input_pack_excludes_non_finding_metrics(tmp_path):
+def test_build_input_pack_filters_unavailable_rows_not_mixed_artifact(tmp_path):
     paths = _Paths(tmp_path)
-    _write_json(paths.metrics, "t03", [{"check_id": "T03", "status": "unavailable"}])
-    _write_json(paths.metrics, "t09", {
-        "summary": {"status": "unavailable_for_cause"},
-        "anomalies": [{"finding": "channel_anomaly_context"}],
-    })
+    _write_candidates(paths, [
+        ["S06", "candidate", True, "ok", "MED", True, {"source": "gsc+wordstat"}],
+        ["S06", "candidate", True, "unavailable", "LOW", False, {"source": "webmaster"}],
+        ["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}],
+    ])
 
     pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
 
-    assert "t03" not in pack["metrics"]
-    assert "t09" not in pack["metrics"]
+    rows = pack["analysis_candidates"]["rows"]
+    assert [row[0] for row in rows] == ["S06", "C06"]
+    assert pack["coverage"]["candidates_detected"] == 3
+    assert pack["coverage"]["candidates_excluded"] == 1
+    assert pack["excluded_candidates"][0]["reason"] == "unavailable_row"
 
 
 def test_input_pack_round_trips_through_json(tmp_path):
     paths = _Paths(tmp_path)
     _write_degradation(paths, [{"check_id": "D01", "runnable": True, "confidence_cap": "HIGH"}])
-    _write_json(paths.metrics, "d01", [{"check_id": "D01", "confidence": "HIGH"}])
+    _write_candidates(paths, [["D01", "candidate", True, "ok", "HIGH", True, {"value": 1}]])
 
     pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
     pack["system_prompt"] = draft_findings.build_system_prompt(DEFAULTS)
@@ -164,87 +182,39 @@ def test_input_pack_round_trips_through_json(tmp_path):
     assert restored == pack
 
 
-def test_build_input_pack_projects_only_reportable_a19_a20_c21_rows(tmp_path):
+def test_build_input_pack_uses_only_p06_candidates_not_raw_metric_arrays(tmp_path):
     paths = _Paths(tmp_path)
-    a19_rows = [
-        {"campaign": "high", "cpc_anomalously_high": True, "cost": 1500.0},
-        {"campaign": "normal", "cpc_anomalously_high": False, "cost": 500.0},
-    ]
-    a20_rows = [
-        {"campaign": "low", "anomalously_low_ctr": True, "ctr": 0.01},
-        {"campaign": "normal", "anomalously_low_ctr": False, "ctr": 0.04},
-    ]
-    c21_rows = [
-        {"segment": "bad", "segment_underperforms_baseline": True, "sessions": 20},
-        {"segment": "control", "is_baseline": True, "sessions": 100},
-        {"segment": "other", "segment_underperforms_baseline": False, "sessions": 80},
-    ]
-    _write_json(paths.metrics, "a19", a19_rows)
-    _write_json(paths.metrics, "a20", a20_rows)
-    _write_json(paths.metrics, "c21", c21_rows)
-    _write_json(paths.metrics, "a04", [{"check_id": "A04", "some_bool": False}])
+    _write_candidates(paths, [["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}]])
+    _write_json(paths.metrics, "a19", [{"details": "RAW_SENTINEL" * 1000}])
+    _write_json(paths.metrics, "c21", [{"details": "RAW_SENTINEL" * 1000}])
 
     pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
 
-    assert json.loads((paths.metrics / "a19.json").read_text(encoding="utf-8")) == a19_rows
-    assert json.loads((paths.metrics / "a20.json").read_text(encoding="utf-8")) == a20_rows
-    assert json.loads((paths.metrics / "c21.json").read_text(encoding="utf-8")) == c21_rows
-    assert pack["metrics"]["a19"] == {
-        "summary": {
-            "total_rows": 2,
-            "candidate_rows": 1,
-            "context_rows": 0,
-            "candidate_flag": "cpc_anomalously_high",
-        },
-        "candidates": [a19_rows[0]],
-    }
-    assert pack["metrics"]["a20"]["candidates"] == [a20_rows[0]]
-    assert pack["metrics"]["c21"]["candidates"] == [c21_rows[0]]
-    assert pack["metrics"]["c21"]["context"] == [c21_rows[1]]
-    assert pack["metrics"]["a04"] == [{"check_id": "A04", "some_bool": False}]
+    assert "RAW_SENTINEL" not in json.dumps(pack, ensure_ascii=False)
+    assert pack["analysis_candidates"]["rows"][0][0] == "C06"
 
 
-def test_build_input_pack_omits_rows_when_projected_artifact_has_no_candidates(tmp_path):
-    paths = _Paths(tmp_path)
-    _write_json(paths.metrics, "a19", [{"cpc_anomalously_high": False}])
-    _write_json(paths.metrics, "a20", [{"anomalously_low_ctr": False}])
-    _write_json(paths.metrics, "c21", [{"is_baseline": True, "segment_underperforms_baseline": False}])
-
-    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
-
-    assert pack["metrics"]["a19"] == {
-        "summary": {
-            "total_rows": 1,
-            "candidate_rows": 0,
-            "context_rows": 0,
-            "candidate_flag": "cpc_anomalously_high",
-        }
-    }
-    assert pack["metrics"]["a20"]["summary"]["candidate_rows"] == 0
-    assert pack["metrics"]["c21"] == {
-        "summary": {
-            "total_rows": 1,
-            "candidate_rows": 0,
-            "context_rows": 1,
-            "candidate_flag": "segment_underperforms_baseline",
-        }
-    }
-
-
-def test_llm_metric_projection_is_deterministic_and_substantially_smaller(tmp_path):
+def test_build_input_pack_byte_cap_is_deterministic_and_audited(tmp_path):
     paths = _Paths(tmp_path)
     rows = [
-        {"campaign": f"normal-{i}", "cpc_anomalously_high": False, "details": "x" * 200}
-        for i in range(50)
+        ["C06", "candidate", True, "ok", "LOW", False, {"detail": "x" * 1200, "n": i}]
+        for i in range(8)
     ]
-    rows.append({"campaign": "high", "cpc_anomalously_high": True, "details": "x" * 200})
-    _write_json(paths.metrics, "a19", rows)
+    rows.append([
+        "S06", "candidate", True, "ok", "HIGH", True,
+        {"money_amount_rub": 10000.0, "detail": "x" * 1200},
+    ])
+    _write_candidates(paths, rows)
+    defaults = {**DEFAULTS, "analyze_input_pack_byte_cap": 4500}
 
-    first_pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
-    second_pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+    first = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, defaults)
+    second = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, defaults)
 
-    assert first_pack == second_pack
-    assert len(json.dumps(first_pack["metrics"]["a19"])) < len(json.dumps(rows)) / 2
+    assert first == second
+    assert first["audit"]["input_pack_bytes"] <= 4500
+    assert first["coverage"]["candidates_excluded"] > 0
+    assert any(item["reason"] == "byte_cap" for item in first["excluded_candidates"])
+    assert "S06" in first["coverage"]["included_check_ids"]
 
 
 # ── 3. draft(): аудиторский артефакт всегда пишется первым ─────────────────

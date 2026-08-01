@@ -145,7 +145,11 @@ def test_call_llm_sends_expected_request_and_parses_response():
     capture: list[dict] = []
     client = _MockClient([_finding_dict("A04")], capture)
 
-    result = draft_findings._call_llm("системный промт", {"metrics": {}}, client=client)
+    result = draft_findings._call_llm(
+        "системный промт",
+        {"known_check_ids": ["A04", "D01"], "analysis_candidates": {}},
+        client=client,
+    )
 
     assert result == {"findings": [_finding_dict("A04")]}
     assert len(capture) == 1
@@ -159,9 +163,14 @@ def test_call_llm_sends_expected_request_and_parses_response():
     assert kwargs["text"]["format"]["schema"]["required"] == ["findings"]
     item_schema = kwargs["text"]["format"]["schema"]["properties"]["findings"]["items"]
     assert set(item_schema["required"]) == set(item_schema["properties"])
+    properties = item_schema["properties"]
+    assert properties["status"]["enum"] == sorted(schemas.STATUS_VALUES)
+    assert properties["confidence"]["enum"] == sorted(schemas.CONFIDENCE_VALUES)
+    assert set(properties["money_category"]["enum"]) == {None, *schemas.MONEY_CATEGORY_VALUES}
+    assert properties["check_id"]["enum"] == ["A04", "D01"]
     assert len(kwargs["input"]) == 1
     assert kwargs["input"][0]["role"] == "user"
-    assert '"metrics"' in kwargs["input"][0]["content"]
+    assert '"analysis_candidates"' in kwargs["input"][0]["content"]
 
 
 def test_call_llm_fails_clearly_without_proxyapi_api_key(monkeypatch):
@@ -258,30 +267,47 @@ def test_draft_numbers_multiple_findings_in_same_block_sequentially(tmp_path):
     paths = _Paths(tmp_path)
     _write_degradation(paths, [{"check_id": "A04", "runnable": True, "confidence_cap": "MED"}])
     _write_metrics(paths, "a04", [_evidence_metrics_row("A04", "MED")])
-    payload = [_finding_dict("A04"), _finding_dict("A04")]
+    payload = [_finding_dict("A04"), _finding_dict("A04", name="Другая проблема")]
 
     names = draft_findings.draft(paths, CONFIG, METHODOLOGY, client=_MockClient(payload))
 
     assert names == [draft_findings.INPUT_PACK_ARTIFACT_NAME, "F-A-01.yaml", "F-A-02.yaml"]
 
 
-def test_draft_sends_metric_projection_to_llm(tmp_path):
+def test_draft_sends_only_p06_candidates_to_llm(tmp_path, monkeypatch):
     paths = _Paths(tmp_path)
     _write_degradation(paths, [{"check_id": "A04", "runnable": True, "confidence_cap": "MED"}])
     _write_metrics(paths, "a04", [_evidence_metrics_row("A04", "MED")])
-    a19_rows = [
-        {"campaign": "high", "cpc_anomalously_high": True, "cost": 5000.0},
-        {"campaign": "normal", "cpc_anomalously_high": False, "cost": 1000.0},
-    ]
-    _write_metrics(paths, "a19", a19_rows)
+    paths.metrics.mkdir(parents=True, exist_ok=True)
+    (paths.metrics / "analysis_candidates.json").write_text(
+        json.dumps({
+            "columns": ["check_id", "row_role", "candidate", "payload"],
+            "rows": [["A04", "candidate", True, {"cost": 5000.0}]],
+            "coverage": {"checks_calculated": 1},
+        }),
+        encoding="utf-8",
+    )
+    _write_metrics(paths, "a19", [{"details": "RAW_SENTINEL" * 100}])
     capture: list[dict] = []
+    loaded_stems: list[str] = []
+    original_loader = draft_findings._load_json_artifact
 
-    draft_findings.draft(paths, CONFIG, METHODOLOGY, client=_MockClient([], capture))
+    def tracked_loader(current_paths, stem):
+        loaded_stems.append(stem)
+        return original_loader(current_paths, stem)
+
+    monkeypatch.setattr(draft_findings, "_load_json_artifact", tracked_loader)
+
+    draft_findings.draft(
+        paths, CONFIG, METHODOLOGY, client=_MockClient([_finding_dict("A04")], capture)
+    )
 
     sent_pack = json.loads(capture[0]["input"][0]["content"].partition("\n\n")[2])
-    assert sent_pack["metrics"]["a19"]["summary"]["total_rows"] == 2
-    assert sent_pack["metrics"]["a19"]["candidates"] == [a19_rows[0]]
-    assert "normal" not in json.dumps(sent_pack["metrics"]["a19"])
+    assert sent_pack["analysis_candidates"]["rows"][0][0] == "A04"
+    assert "metrics" not in sent_pack
+    assert "RAW_SENTINEL" not in json.dumps(sent_pack)
+    assert "a04" in loaded_stems
+    assert "a19" not in loaded_stems
 
 
 # ── 4. Невалидные находки отбрасываются в rejected/ без повторного вызова
@@ -312,15 +338,24 @@ def test_draft_drops_invalid_findings_without_regenerating(tmp_path):
 
 # ── 5. Лимит MAX_FINDINGS_PER_RUN соблюдается ───────────────────────────────
 
-def test_draft_truncates_findings_over_max_per_run(tmp_path):
+def test_draft_applies_limit_after_grouping_repeated_segments(tmp_path):
     paths = _Paths(tmp_path)
     _write_degradation(paths, [{"check_id": "A04", "runnable": True, "confidence_cap": "MED"}])
     _write_metrics(paths, "a04", [_evidence_metrics_row("A04", "MED")])
-    payload = [_finding_dict("A04") for _ in range(schemas.MAX_FINDINGS_PER_RUN + 1)]
+    payload = [
+        _finding_dict("A04", segment=f"segment-{index}")
+        for index in range(schemas.MAX_FINDINGS_PER_RUN + 1)
+    ]
     capture: list[dict] = []
 
     names = draft_findings.draft(paths, CONFIG, METHODOLOGY, client=_MockClient(payload, capture))
 
     finding_names = [n for n in names if n != draft_findings.INPUT_PACK_ARTIFACT_NAME]
-    assert len(finding_names) == schemas.MAX_FINDINGS_PER_RUN
+    assert finding_names == ["F-A-01.yaml"]
     assert len(capture) == 1
+
+    import yaml
+
+    grouped = yaml.safe_load((paths.findings_draft / "F-A-01.yaml").read_text(encoding="utf-8"))
+    assert "segment-0" in grouped["segment"]
+    assert f"segment-{schemas.MAX_FINDINGS_PER_RUN}" in grouped["segment"]

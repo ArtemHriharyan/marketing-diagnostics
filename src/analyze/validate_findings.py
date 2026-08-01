@@ -56,15 +56,15 @@ _DIAGNOSTIC_CONTEXT_MARKERS = frozenset({"channel_anomaly_context"})
 
 
 def _is_non_finding_metric(payload: Any) -> bool:
-    """True для статуса ограничения или контекста, который нельзя превратить в finding."""
+    """True, только если весь артефакт, а не соседняя строка, недоступен."""
     if isinstance(payload, dict):
         if payload.get("status") in _NON_FINDING_STATUSES:
             return True
         if payload.get("finding") in _DIAGNOSTIC_CONTEXT_MARKERS:
             return True
-        return any(_is_non_finding_metric(value) for value in payload.values())
+        return False
     if isinstance(payload, list):
-        return any(_is_non_finding_metric(value) for value in payload)
+        return bool(payload) and all(_is_non_finding_metric(value) for value in payload)
     return False
 
 

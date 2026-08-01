@@ -148,6 +148,26 @@ def test_channel_anomaly_context_is_rejected_as_finding():
     assert any("диагностический контекст" in error for error in errors)
 
 
+def test_mixed_unavailable_neighbor_does_not_reject_candidate_row():
+    finding = _finding(
+        check_id="S06",
+        evidence="Показатель равен 10",
+        money_category=None,
+        money_amount_rub=None,
+        money_not_assessable=True,
+    )
+    metrics = {
+        "s06": [
+            {"check_id": "S06", "value": 10, "confidence": "MED"},
+            {"check_id": "S06", "status": "unavailable", "source": "webmaster"},
+        ]
+    }
+
+    errors = validate_findings.validate_finding_evidence(finding, metrics=metrics)
+
+    assert errors == []
+
+
 def test_unconfirmed_number_in_assumptions_is_rejected():
     finding = _finding(assumptions=["Средний чек взят как 999999 ₽"])
     errors = validate_findings.validate_finding_evidence(
