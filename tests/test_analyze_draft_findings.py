@@ -194,7 +194,7 @@ def test_build_input_pack_uses_only_p06_candidates_not_raw_metric_arrays(tmp_pat
     assert pack["analysis_candidates"]["rows"][0][0] == "C06"
 
 
-def test_build_input_pack_byte_cap_is_deterministic_and_audited(tmp_path):
+def test_build_input_pack_prioritizes_candidates_over_optional_context(tmp_path):
     paths = _Paths(tmp_path)
     rows = [
         ["C06", "candidate", True, "ok", "LOW", False, {"detail": "x" * 1200, "n": i}]
@@ -205,64 +205,63 @@ def test_build_input_pack_byte_cap_is_deterministic_and_audited(tmp_path):
         {"money_amount_rub": 10000.0, "detail": "x" * 1200},
     ])
     _write_candidates(paths, rows)
-    defaults = {**DEFAULTS, "analyze_input_pack_byte_cap": 4500}
+    paths.inputs.mkdir(parents=True)
+    (paths.inputs / "optional_context.yaml").write_text(
+        "comment: '" + "я" * 80_000 + "'\n", encoding="utf-8"
+    )
 
-    first = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, defaults)
-    second = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, defaults)
+    first = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+    second = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
 
     assert first == second
-    assert first["audit"]["input_pack_bytes"] <= 4500
-    assert first["coverage"]["candidates_excluded"] > 0
-    assert any(item["reason"] == "byte_cap" for item in first["excluded_candidates"])
+    assert first["audit"]["final_serialized_bytes"] < 100_000
+    assert first["coverage"]["candidates_omitted"] == 0
+    assert first["excluded_candidates"] == []
+    assert "inputs.optional_context" in first["audit"]["omitted_context"]
     assert "S06" in first["coverage"]["included_check_ids"]
 
 
-def test_pognali_fixture_compacts_funnels_and_keeps_every_candidate(tmp_path):
+def test_real_p10_stress_pack_keeps_638_candidates_under_final_cap(tmp_path):
     paths = _Paths(tmp_path)
-    candidate_columns = [*CANDIDATE_COLUMNS, "row_ref", "context_refs"]
-    candidate_rows = [
-        [
-            "A04", "detail", False, "ok", "MED", True,
-            {"detail": "x" * 2500}, f"detail-{index}", [],
-        ]
-        for index in range(45)
+    candidate_columns = [
+        *CANDIDATE_COLUMNS, "candidate_reason", "segment", "row_ref", "context_refs",
     ]
-    candidate_rows.extend([
-        ["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}, "c06", []],
-        ["S06", "candidate", True, "ok", "MED", True, {"trend": "down"}, "s06", []],
-        ["A04", "candidate", True, "ok", "MED", True, {"cost_rub": 5000}, "a04", []],
-    ])
+    candidate_rows = []
+    for index in range(319):
+        candidate_rows.append([
+            "C06", "candidate", True, "ok", "HIGH", True,
+            {"rate": 0.45, "gap_visits": 60, "metric": "open_to_submit"},
+            "funnel_gap", f"landing_page=/cars/{index}", f"c06-{index}", [],
+        ])
+        candidate_rows.append([
+            "S06", "candidate", True, "ok", "MED", True,
+            {"trend": "down", "demand_index": 0.82, "metric": "seasonality"},
+            "seasonality_conflict", f"month=2026-{index % 12 + 1:02d}",
+            f"s06-{index}", [],
+        ])
+    assert len(candidate_rows) == 638
     _write_json(paths.metrics, "analysis_candidates", {
         "columns": candidate_columns,
         "rows": candidate_rows,
-        "coverage": {"checks_calculated": 3},
+        "coverage": {"checks_calculated": 2},
     })
-    segments = [
-        {
-            "dimension": "landing_page",
-            "segment": f"/cars/{index}",
-            "stages": [
-                {"stage_id": "form_open", "visits": 100 + index},
-                {"stage_id": "form_submit", "visits": 40 + index},
-            ],
-            "transitions": [{
-                "from_stage": "form_open", "to_stage": "form_submit",
-                "rate": 0.4, "gap_visits": 60,
-            }],
-        }
-        for index in range(420)
-    ]
     funnels = {
         "funnels": [{
             "id": "booking",
-            "stages": [
-                {"stage_id": "form_open", "visits": 3002},
-                {"stage_id": "form_submit", "visits": 634},
+            "totals": {"form_open": 3002, "form_submit": 634},
+            "transitions": [{
+                "from_stage": "form_open", "to_stage": "form_submit", "rate": 0.2112,
+            }],
+            "gaps": [{"stage": "form_open", "next_stage": "form_submit", "visits": 2368}],
+            "anomalies": [{"code": "late_without_early", "visits": 14}],
+            "segments": [
+                {"segment": f"/cars/{index}", "raw": "x" * 400}
+                for index in range(420)
             ],
-            "segments": {"landing_page": segments},
+            "qa_details": ["RAW_FUNNEL_SENTINEL" * 1000],
         }]
     }
-    assert len(json.dumps(funnels, ensure_ascii=False).encode("utf-8")) > 90_000
+    assert len(json.dumps(funnels, ensure_ascii=False).encode("utf-8")) > 100_000
     _write_json(paths.metrics, "funnels", funnels)
 
     pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
@@ -270,12 +269,27 @@ def test_pognali_fixture_compacts_funnels_and_keeps_every_candidate(tmp_path):
     projection = pack["compact_context"]["funnels"]
     funnel_columns = projection["funnels"]["columns"]
     funnel_row = projection["funnels"]["rows"][0]
-    segment_projection = funnel_row[funnel_columns.index("segments")]["landing_page"]
-    assert segment_projection["columns"]
-    assert len(segment_projection["rows"]) == len(segments)
+    assert set(funnel_columns) == {"id", "totals", "transitions", "gaps", "anomalies"}
+    assert "RAW_FUNNEL_SENTINEL" not in json.dumps(projection, ensure_ascii=False)
+
+    candidate_projection = pack["analysis_candidates"]
+    assert candidate_projection["columns"] == [
+        "check_id", "candidate_reason", "candidate_count", "common", "segments",
+    ]
+    assert sum(row[2] for row in candidate_projection["rows"]) == 638
+    assert all(row[4]["columns"] and row[4]["rows"] for row in candidate_projection["rows"])
+
+    system_prompt = draft_findings.build_system_prompt(DEFAULTS)
+    final_size = len(json.dumps(
+        {**pack, "system_prompt": system_prompt},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8"))
     assert pack["audit"]["byte_cap"] == 100_000
-    assert pack["audit"]["input_pack_bytes"] < 100_000
-    assert pack["coverage"]["included_check_ids"] == ["A04", "C06", "S06"]
+    assert final_size == pack["audit"]["final_serialized_bytes"]
+    assert final_size < 100_000
+    assert pack["coverage"]["included_check_ids"] == ["C06", "S06"]
+    assert pack["coverage"]["candidates_included"] == 638
     assert pack["coverage"]["candidates_omitted"] == 0
     assert pack["excluded_candidates"] == []
 

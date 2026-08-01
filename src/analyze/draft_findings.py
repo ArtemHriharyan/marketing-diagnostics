@@ -72,6 +72,8 @@ _DIAGNOSTIC_CONTEXT_MARKERS = frozenset({"channel_anomaly_context"})
 _COMPACT_CONTEXT_ARTIFACTS = (
     "funnels", "cost_summary", "acquisition_economics", "seasonality",
 )
+_FUNNEL_SUMMARY_KEYS = ("totals", "transitions", "gaps", "anomalies")
+_FUNNEL_ID_KEYS = ("id", "funnel_id", "name", "period")
 
 INPUT_PACK_ARTIFACT_NAME = "_analyze_input_pack.json"
 INPUT_PACK_BYTE_CAP = 100_000
@@ -175,25 +177,97 @@ def _row_ref_tokens(row: dict[str, Any], index: int) -> set[str]:
     return tokens
 
 
-def _project_analysis_candidates(payload: Any) -> dict[str, Any]:
-    """Оставить всех кандидатов и только явно связанный с ними контекст P06."""
+def _flatten_candidate_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Развернуть вложенные поля кандидата в стабильные dotted columns."""
+    result: dict[str, Any] = {}
+
+    def visit(value: Any, path: str) -> None:
+        if isinstance(value, dict):
+            for key in sorted(value):
+                visit(value[key], f"{path}.{key}" if path else str(key))
+            return
+        result[path] = value
+
+    visit(row, "")
+    return result
+
+
+def _group_candidate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Сгруппировать кандидатов по check_id+candidate_reason без потери сегментов."""
+    grouped: dict[tuple[Any, Any], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (row.get("check_id"), row.get("candidate_reason"))
+        grouped.setdefault(key, []).append(row)
+
+    columns = ["check_id", "candidate_reason", "candidate_count", "common", "segments"]
+    packed_rows: list[list[Any]] = []
+    for (check_id, reason), group in grouped.items():
+        flattened = []
+        for row in group:
+            item = _flatten_candidate_row(row)
+            item.pop("check_id", None)
+            item.pop("candidate_reason", None)
+            flattened.append(item)
+        all_columns = sorted({key for row in flattened for key in row})
+        common: dict[str, Any] = {}
+        segment_columns: list[str] = []
+        for column in all_columns:
+            values = [row.get(column) for row in flattened]
+            fingerprints = {
+                json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                for value in values
+            }
+            if len(fingerprints) == 1:
+                common[column] = values[0]
+            else:
+                segment_columns.append(column)
+        segments = {
+            "columns": segment_columns,
+            "rows": [
+                [row.get(column) for column in segment_columns]
+                for row in flattened
+            ] if segment_columns else [],
+        }
+        packed_rows.append([check_id, reason, len(group), common, segments])
+    return {"columns": columns, "rows": packed_rows}
+
+
+def _project_analysis_candidates(
+    payload: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+    """Сгруппировать всех доступных кандидатов и отделить необязательный контекст."""
     if not isinstance(payload, dict):
-        return {"columns": [], "rows": [], "coverage": {}}
+        return {"columns": [], "rows": [], "coverage": {}}, [], 0
     columns, rows, indexes = _candidate_rows(payload)
     if not columns or not isinstance(rows, list):
-        return {**payload, "columns": columns, "rows": []}
+        return {"columns": [], "rows": [], "coverage": payload.get("coverage") or {}}, [], 0
 
     candidate_refs: set[str] = set()
     for index in indexes:
         candidate_refs.update(
             _context_ref_tokens(_row_dict(columns, rows[index]).get("context_refs"))
         )
-    selected_rows = []
+    candidate_rows: list[dict[str, Any]] = []
+    context_rows: list[Any] = []
+    excluded: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
         decoded = _row_dict(columns, row)
-        if index in indexes or candidate_refs.intersection(_row_ref_tokens(decoded, index)):
-            selected_rows.append(row)
-    return {**payload, "rows": selected_rows}
+        if index in indexes:
+            if _is_unavailable_row(decoded):
+                excluded.append({
+                    **_candidate_ref(decoded, index), "reason": "unavailable_row",
+                })
+            else:
+                candidate_rows.append(decoded)
+        elif candidate_refs.intersection(_row_ref_tokens(decoded, index)):
+            if not _is_unavailable_row(decoded):
+                context_rows.append(row)
+
+    result = _group_candidate_rows(candidate_rows)
+    result["coverage"] = payload.get("coverage") or {}
+    if context_rows:
+        result["context"] = {"columns": columns, "rows": context_rows}
+    return result, excluded, len(indexes)
 
 
 def _is_unavailable_row(row: dict[str, Any]) -> bool:
@@ -211,118 +285,86 @@ def _candidate_ref(row: dict[str, Any], index: int) -> dict[str, Any]:
     return result
 
 
-def _has_money_signal(value: Any, key: str = "") -> bool:
-    markers = ("money", "cost", "spend", "revenue", "rub")
-    if isinstance(value, dict):
-        return any(_has_money_signal(item, str(item_key)) for item_key, item in value.items())
-    if isinstance(value, list):
-        return any(_has_money_signal(item, key) for item in value)
-    return any(marker in key.lower() for marker in markers) and value not in (
-        None, "", 0, 0.0, False,
-    )
-
-
-def _candidate_priority(
-    row: dict[str, Any], index: int, *, coverage_anchor: bool = False
-) -> tuple[int, int, int, int, int]:
-    """Приоритет byte-cap: деньги, значимость, confidence, стабильный порядок."""
-    money = int(bool(row.get("money_category")) or _has_money_signal(row))
-    significant = int(row.get("significant") is True)
-    confidence = {"HIGH": 3, "MED": 2, "LOW": 1}.get(str(row.get("confidence")), 0)
-    return money, significant, confidence, int(coverage_anchor), -index
-
-
 def _json_size(value: Any) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
-def _set_pack_size(pack: dict[str, Any]) -> int:
-    """Записать устойчивый размер самого передаваемого JSON-пакета."""
+def _set_pack_size(pack: dict[str, Any], system_prompt: str) -> int:
+    """Записать устойчивые размеры тела запроса и финального audit-артефакта."""
     audit = pack.setdefault("audit", {})
-    for _ in range(4):
-        size = _json_size(pack)
-        if audit.get("input_pack_bytes") == size:
+    for _ in range(8):
+        input_size = _json_size(pack)
+        final_size = _json_size({**pack, "system_prompt": system_prompt})
+        if (
+            audit.get("input_pack_bytes") == input_size
+            and audit.get("final_serialized_bytes") == final_size
+        ):
             break
-        audit["input_pack_bytes"] = size
-    return _json_size(pack)
+        audit["input_pack_bytes"] = input_size
+        audit["final_serialized_bytes"] = final_size
+    return _json_size({**pack, "system_prompt": system_prompt})
 
 
-def _refresh_coverage(pack: dict[str, Any], *, detected: int, included: int) -> None:
+def _refresh_coverage(pack: dict[str, Any], *, detected: int) -> None:
     coverage = pack["coverage"]
+    candidates = pack.get("analysis_candidates") or {}
+    columns = candidates.get("columns") or []
+    rows = candidates.get("rows") or []
+    check_index = columns.index("check_id") if "check_id" in columns else -1
+    count_index = columns.index("candidate_count") if "candidate_count" in columns else -1
+    included = sum(
+        int(row[count_index])
+        for row in rows
+        if isinstance(row, list) and count_index >= 0 and len(row) > count_index
+    )
     coverage["candidates_detected"] = detected
     coverage["candidates_included"] = included
     coverage["candidates_excluded"] = detected - included
     coverage["candidates_omitted"] = detected - included
-    check_ids = []
-    columns, rows, indexes = _candidate_rows(pack.get("analysis_candidates"))
-    for index in indexes:
-        check_id = _row_dict(columns, rows[index]).get("check_id")
-        if check_id:
-            check_ids.append(check_id)
+    coverage["candidate_groups"] = len(rows)
+    check_ids = [
+        row[check_index]
+        for row in rows
+        if isinstance(row, list) and check_index >= 0 and len(row) > check_index and row[check_index]
+    ]
     coverage["included_check_ids"] = sorted(set(check_ids))
     coverage["included_blocks"] = sorted({check_id[0] for check_id in check_ids if check_id})
 
 
-def _apply_byte_cap(pack: dict[str, Any], byte_cap: int) -> None:
-    """Детерминированно исключить низкоприоритетных кандидатов после сборки пакета."""
-    candidates = pack.get("analysis_candidates") or {}
+def _apply_byte_cap(
+    pack: dict[str, Any], byte_cap: int, system_prompt: str, *, detected: int
+) -> None:
+    """Сначала зарезервировать всех кандидатов, затем урезать только контекст."""
     pack["audit"]["byte_cap_exceeded"] = False
-    columns, rows, indexes = _candidate_rows(candidates)
-    decoded_all = {index: _row_dict(columns, row) for index, row in enumerate(rows)}
-    decoded = {index: decoded_all[index] for index in indexes}
-    included = set(indexes)
-    context_included = set(decoded_all) - included
-    for index in [index for index in indexes if _is_unavailable_row(decoded[index])]:
-        included.discard(index)
-        pack["excluded_candidates"].append({
-            **_candidate_ref(decoded[index], index), "reason": "unavailable_row",
-        })
+    pack["audit"]["omitted_context"] = []
+    _refresh_coverage(pack, detected=detected)
+    final_size = _set_pack_size(pack, system_prompt)
 
-    unavailable_rows = {
-        index for index, row in decoded_all.items() if _is_unavailable_row(row)
-    }
+    candidates = pack.get("analysis_candidates") or {}
+    if final_size >= byte_cap and candidates.pop("context", None) is not None:
+        pack["audit"]["omitted_context"].append("analysis_candidates.context")
+        final_size = _set_pack_size(pack, system_prompt)
 
-    def rebuild_rows() -> None:
-        candidates["rows"] = [
-            row for index, row in enumerate(rows)
-            if index not in unavailable_rows
-            and (index in included or index in context_included)
-        ]
-
-    rebuild_rows()
-    _refresh_coverage(pack, detected=len(indexes), included=len(included))
-    _set_pack_size(pack)
-    for index in sorted(context_included, reverse=True):
-        if pack["audit"]["input_pack_bytes"] <= byte_cap:
+    optional_sections: list[tuple[int, str, dict[str, Any]]] = []
+    for name, value in (pack.get("compact_context") or {}).items():
+        optional_sections.append((_json_size(value), f"compact_context.{name}", pack["compact_context"]))
+    for name, value in (pack.get("inputs") or {}).items():
+        optional_sections.append((_json_size(value), f"inputs.{name}", pack["inputs"]))
+    for _, dotted_name, container in sorted(optional_sections, key=lambda item: (-item[0], item[1])):
+        if final_size < byte_cap:
             break
-        context_included.remove(index)
-        rebuild_rows()
-        _set_pack_size(pack)
-    anchors: set[int] = set()
-    by_block: dict[str, list[int]] = {}
-    for index in included:
-        check_id = str(decoded[index].get("check_id") or "")
-        by_block.setdefault(check_id[:1], []).append(index)
-    for block_indexes in by_block.values():
-        anchors.add(max(block_indexes, key=lambda index: _candidate_priority(decoded[index], index)))
-    removal_order = sorted(
-        included,
-        key=lambda index: _candidate_priority(
-            decoded[index], index, coverage_anchor=index in anchors
-        ),
-    )
-    for index in removal_order:
-        if pack["audit"]["input_pack_bytes"] <= byte_cap:
-            break
-        included.remove(index)
-        pack["excluded_candidates"].append({
-            **_candidate_ref(decoded[index], index), "reason": "byte_cap",
-        })
-        rebuild_rows()
-        _refresh_coverage(pack, detected=len(indexes), included=len(included))
-        _set_pack_size(pack)
-    pack["audit"]["byte_cap_exceeded"] = _set_pack_size(pack) > byte_cap
-    _set_pack_size(pack)
+        key = dotted_name.rsplit(".", 1)[1]
+        if container.pop(key, None) is not None:
+            pack["audit"]["omitted_context"].append(dotted_name)
+            final_size = _set_pack_size(pack, system_prompt)
+
+    pack["audit"]["byte_cap_exceeded"] = final_size >= byte_cap
+    final_size = _set_pack_size(pack, system_prompt)
+    if final_size >= byte_cap:
+        raise ValueError(
+            "обязательное кандидатное ядро analyze превышает byte-cap; "
+            "кандидаты не были удалены"
+        )
 
 
 def _compact_degradation(report: dict[str, Any]) -> dict[str, Any]:
@@ -337,41 +379,9 @@ def _compact_degradation(report: dict[str, Any]) -> dict[str, Any]:
     return {"columns": columns, "rows": rows, "counts": report.get("counts") or {}}
 
 
-def _segment_item_label(item: dict[str, Any], index: int) -> str:
-    if item.get("from_stage") not in (None, "") and item.get("to_stage") not in (None, ""):
-        return f"{item['from_stage']}->{item['to_stage']}"
-    for key in ("stage_id", "transition_id", "id", "name", "stage"):
-        if item.get(key) not in (None, ""):
-            return str(item[key])
-    return str(index)
-
-
-def _flatten_segment_row(value: Any, prefix: str = "") -> dict[str, Any]:
-    """Развернуть повторяющиеся stage/transition внутри одного сегмента."""
-    result: dict[str, Any] = {}
-
-    def visit(item: Any, path: str) -> None:
-        if isinstance(item, dict):
-            for key in sorted(item):
-                visit(item[key], f"{path}.{key}" if path else str(key))
-            return
-        if isinstance(item, list) and item and all(isinstance(child, dict) for child in item):
-            for index, child in enumerate(item):
-                label = _segment_item_label(child, index)
-                visit(child, f"{path}.{label}" if path else label)
-            return
-        result[path] = item
-
-    visit(value, prefix)
-    return result
-
-
-def _columnar_dict_rows(rows: list[dict[str, Any]], *, flatten: bool) -> dict[str, Any]:
+def _columnar_dict_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     decoded = [
-        _flatten_segment_row(row) if flatten else {
-            key: _compact_funnel_value(value, segment_scope=key == "segments")
-            for key, value in row.items()
-        }
+        {key: _compact_funnel_value(value) for key, value in row.items()}
         for row in rows
     ]
     columns = sorted({key for row in decoded for key in row})
@@ -381,25 +391,56 @@ def _columnar_dict_rows(rows: list[dict[str, Any]], *, flatten: bool) -> dict[st
     }
 
 
-def _compact_funnel_value(value: Any, *, segment_scope: bool = False) -> Any:
-    """Перевести повторяющиеся структуры funnels в columns+rows."""
+def _compact_funnel_value(value: Any) -> Any:
+    """Перевести повторяющиеся строки компактного funnel-summary в columns+rows."""
     if isinstance(value, dict):
-        return {
-            key: _compact_funnel_value(
-                item, segment_scope=segment_scope or key == "segments"
-            )
-            for key, item in value.items()
-        }
+        return {key: _compact_funnel_value(item) for key, item in value.items()}
     if isinstance(value, list) and value and all(isinstance(item, dict) for item in value):
-        return _columnar_dict_rows(value, flatten=segment_scope)
+        return _columnar_dict_rows(value)
     if isinstance(value, list):
-        return [_compact_funnel_value(item, segment_scope=segment_scope) for item in value]
+        return [_compact_funnel_value(item) for item in value]
     return value
 
 
 def _compact_funnels(payload: Any) -> Any:
-    """Самодостаточная LLM-проекция funnels без повторения схем сегментов."""
-    return _compact_funnel_value(payload)
+    """Оставить только totals/transitions/gaps/anomalies и идентификаторы воронок."""
+    if not isinstance(payload, dict):
+        return {}
+
+    def project_funnel(value: Any) -> Any:
+        if isinstance(value, list):
+            rows = [project_funnel(item) for item in value if isinstance(item, dict)]
+            return _columnar_dict_rows(rows) if rows else []
+        if not isinstance(value, dict):
+            return value
+        projected = {
+            key: value[key]
+            for key in _FUNNEL_ID_KEYS
+            if value.get(key) not in (None, "")
+        }
+        for key in _FUNNEL_SUMMARY_KEYS:
+            if key in value:
+                projected[key] = _compact_funnel_value(value[key])
+        return projected
+
+    result = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"funnels", *_FUNNEL_SUMMARY_KEYS}
+        and not isinstance(value, (dict, list))
+    }
+    if "funnels" in payload:
+        funnels = payload["funnels"]
+        if isinstance(funnels, dict):
+            result["funnels"] = {
+                key: project_funnel(value) for key, value in funnels.items()
+            }
+        else:
+            result["funnels"] = project_funnel(funnels)
+    for key in _FUNNEL_SUMMARY_KEYS:
+        if key in payload:
+            result[key] = _compact_funnel_value(payload[key])
+    return result
 
 
 def _load_inputs(paths: Any) -> dict[str, Any]:
@@ -463,7 +504,7 @@ def build_input_pack(
     """
     defaults = defaults or {}
     degradation_report = _load_degradation_report(paths)
-    analysis_candidates = _project_analysis_candidates(
+    analysis_candidates, excluded_candidates, detected_candidates = _project_analysis_candidates(
         _load_json_artifact(paths, "analysis_candidates") or {
             "columns": [], "rows": [], "coverage": {}
         }
@@ -497,10 +538,13 @@ def build_input_pack(
             "currency_round": defaults.get("currency_round", 0),
         },
         "coverage": {"source": analysis_candidates.get("coverage") or {}},
-        "excluded_candidates": [],
+        "excluded_candidates": excluded_candidates,
         "audit": {"byte_cap": byte_cap},
     }
-    _apply_byte_cap(pack, byte_cap)
+    system_prompt = build_system_prompt(defaults)
+    _apply_byte_cap(
+        pack, byte_cap, system_prompt, detected=detected_candidates
+    )
     return pack
 
 
@@ -823,14 +867,18 @@ def draft(
     system_prompt = build_system_prompt(defaults)
 
     out_path = Path(paths.findings_draft) / INPUT_PACK_ARTIFACT_NAME
-    out_path.write_text(
-        json.dumps(
-            {**pack, "system_prompt": system_prompt},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
-        encoding="utf-8",
+    serialized_pack = json.dumps(
+        {**pack, "system_prompt": system_prompt},
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
+    final_size = len(serialized_pack.encode("utf-8"))
+    if final_size >= pack["audit"]["byte_cap"]:
+        raise RuntimeError(
+            f"финальный analyze input-pack = {final_size} байт, "
+            f"cap = {pack['audit']['byte_cap']} байт"
+        )
+    out_path.write_text(serialized_pack, encoding="utf-8")
     written = [out_path.name]
 
     response_data = _call_llm(system_prompt, pack, client=client)
