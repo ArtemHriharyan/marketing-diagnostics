@@ -327,6 +327,152 @@ def test_real_p10_stress_pack_keeps_638_candidates_under_final_cap(tmp_path):
     assert pack["coverage"]["candidates_included"] == 638
     assert pack["coverage"]["candidates_omitted"] == 0
     assert pack["excluded_candidates"] == []
+    # PACK-2: клиент масштаба pognali.rent проходит без единой обрезки групп
+    assert pack["audit"]["truncated_candidate_groups"] == []
+    assert "candidates_aggregated" not in pack["coverage"]
+    assert all(
+        "tail_aggregate" not in row[4]
+        for row in candidate_projection["rows"]
+    )
+
+
+# ── 2b. PACK-2: последний эшелон byte-cap вместо исключения ────────────────
+
+def _oversized_candidate_rows() -> tuple[list[str], list[list]]:
+    """Синтетический клиент вдвое крупнее pognali: 1276 кандидатов, длинные URL.
+
+    Отличие от _union_schema_candidate_rows — вдвое больше строк и реалистично
+    длинные сегменты (URL с ЧПУ), из-за чего одно только кандидатное ядро уже
+    не влезает в byte-cap. До PACK-2 такой клиент ронял стадию ValueError'ом.
+    """
+    base_columns = [
+        *CANDIDATE_COLUMNS, "candidate_reason", "segment", "row_ref", "context_refs",
+    ]
+    filler_columns = [f"metric_{index:03d}" for index in range(190)]
+    columns = [*base_columns, *filler_columns]
+
+    slug = "arenda-avtomobilya-bez-voditelya-v-moskve-nedorogo"
+    rows = []
+    for index in range(638):
+        c06 = {
+            "check_id": "C06", "row_role": "candidate", "candidate": True,
+            "status": "ok", "confidence": "HIGH", "significant": True,
+            "payload": {
+                "rate": 0.45, "gap_visits": 60 + index, "metric": "open_to_submit",
+            },
+            "candidate_reason": "funnel_gap",
+            "segment": f"landing_page=/cars/{slug}/{index}",
+            "row_ref": f"c06-{slug}-{index}", "context_refs": [],
+        }
+        s06 = {
+            "check_id": "S06", "row_role": "candidate", "candidate": True,
+            "status": "ok", "confidence": "MED", "significant": True,
+            "payload": {
+                "trend": "down", "demand_index": 0.82, "metric": "seasonality",
+                "visits": 10 + index,
+            },
+            "candidate_reason": "seasonality_conflict",
+            "segment": f"query=/{slug}-{index}",
+            "row_ref": f"s06-{slug}-{index}", "context_refs": [],
+        }
+        for decoded in (c06, s06):
+            rows.append([decoded.get(column) for column in columns])
+    assert len(rows) == 1276
+    return columns, rows
+
+
+def _write_oversized_client(paths: _Paths) -> None:
+    columns, rows = _oversized_candidate_rows()
+    _write_json(paths.metrics, "analysis_candidates", {
+        "columns": columns, "rows": rows, "coverage": {"checks_calculated": 2},
+    })
+
+
+def test_client_twice_the_size_of_pognali_truncates_instead_of_raising(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_oversized_client(paths)
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+
+    truncations = pack["audit"]["truncated_candidate_groups"]
+    assert truncations, "ожидалась хотя бы одна зафиксированная обрезка"
+    assert pack["audit"]["final_serialized_bytes"] < pack["audit"]["byte_cap"]
+    assert pack["audit"]["byte_cap_exceeded"] is False
+
+    # Обрезка видна модели: и в audit, и в самой группе кандидатов
+    top_n = draft_findings.resolve_candidate_top_n(DEFAULTS)
+    for entry in truncations:
+        assert entry["check_id"] in {"C06", "S06"}
+        assert entry["candidates_sent"] == top_n
+        assert entry["candidates_aggregated"] > 0
+        assert entry["criterion"] in {"payload.gap_visits", "payload.visits"}
+    aggregated_total = sum(e["candidates_aggregated"] for e in truncations)
+    assert pack["coverage"]["candidates_aggregated"] == aggregated_total
+
+    truncated_ids = {e["check_id"] for e in truncations}
+    for row in pack["analysis_candidates"]["rows"]:
+        if row[0] not in truncated_ids:
+            continue
+        tail = row[4]["tail_aggregate"]
+        assert tail["truncated_candidates"] > 0
+        assert len(row[4]["rows"]) == top_n
+        assert tail["truncated_sum"] >= tail["truncated_max"] >= tail["truncated_min"]
+
+    # top-N выбраны по влиянию: отброшенные значения не выше оставленных
+    c06_rows = [row for row in pack["analysis_candidates"]["rows"] if row[0] == "C06"][0]
+    gap_index = c06_rows[4]["columns"].index("payload.gap_visits")
+    kept_values = [row[gap_index] for row in c06_rows[4]["rows"]]
+    assert min(kept_values) > c06_rows[4]["tail_aggregate"]["truncated_max"]
+
+
+def test_truncation_is_byte_identical_across_runs(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_oversized_client(paths)
+
+    first = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+    second = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+
+    dump = lambda pack: json.dumps(pack, ensure_ascii=False, separators=(",", ":"))  # noqa: E731
+    assert dump(first) == dump(second)
+    assert first["audit"]["truncated_candidate_groups"] == \
+        second["audit"]["truncated_candidate_groups"]
+
+
+def test_candidate_top_n_and_impact_keys_come_from_defaults(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_oversized_client(paths)
+
+    pack = draft_findings.build_input_pack(
+        paths, CONFIG, METHODOLOGY,
+        {**DEFAULTS, "analyze_candidate_top_n": 5,
+         "analyze_candidate_impact_keys": ["payload.rate", "payload.gap_visits"]},
+    )
+
+    entries = {e["check_id"]: e for e in pack["audit"]["truncated_candidate_groups"]}
+    assert entries
+    assert all(e["candidates_sent"] == 5 for e in entries.values())
+    # payload.rate одинаков во всех строках C06 -> уезжает в common и критерием
+    # быть не может; берётся следующий ключ списка
+    if "C06" in entries:
+        assert entries["C06"]["criterion"] == "payload.gap_visits"
+    assert draft_findings.resolve_candidate_top_n({}) == draft_findings.CANDIDATE_TOP_N
+    assert draft_findings.resolve_candidate_impact_keys(None) == \
+        list(draft_findings.CANDIDATE_IMPACT_KEYS)
+
+
+def test_impossible_cap_is_a_configuration_error(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_oversized_client(paths)
+
+    try:
+        draft_findings.build_input_pack(
+            paths, CONFIG, METHODOLOGY,
+            {**DEFAULTS, "analyze_input_pack_byte_cap": 1_000},
+        )
+    except ValueError as error:
+        assert "конфигурационная ошибка" in str(error)
+    else:  # pragma: no cover - защита от молчаливого прохода
+        raise AssertionError("ожидался ValueError о конфигурационной ошибке")
 
 
 # ── 3. draft(): аудиторский артефакт всегда пишется первым ─────────────────

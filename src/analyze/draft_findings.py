@@ -94,6 +94,22 @@ INPUT_PACK_ARTIFACT_NAME = "_analyze_input_pack.json"
 INPUT_PACK_BYTE_CAP = 150_000
 INPUT_PACK_WARN_BYTES = 120_000
 
+# Последний эшелон byte-cap (см. _truncate_candidate_groups): сколько кандидатов
+# группы уходит в модель поимённо и по какому полю выбирается top-N. Значения
+# переопределяются ключами config/defaults.yaml (analyze_candidate_top_n /
+# analyze_candidate_impact_keys); константы — только фолбэк, как у byte-cap.
+CANDIDATE_TOP_N = 25
+CANDIDATE_IMPACT_KEYS = (
+    "payload.money_amount_rub",
+    "money_amount_rub",
+    "payload.loss_rub",
+    "payload.cost_rub",
+    "payload.gap_visits",
+    "payload.visits",
+    "payload.clicks",
+    "payload.shows",
+)
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -368,12 +384,141 @@ def _refresh_coverage(pack: dict[str, Any], *, detected: int) -> None:
     coverage["included_blocks"] = sorted({check_id[0] for check_id in check_ids if check_id})
 
 
+def _numeric(value: Any) -> float | None:
+    """Число для ранжирования влияния. bool — не метрика, строки не приводим."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _group_impact_criterion(
+    segments: dict[str, Any], impact_keys: list[str]
+) -> tuple[str | None, int]:
+    """Первое поле из списка влияния, реально различающее кандидатов группы."""
+    columns = segments.get("columns") or []
+    rows = segments.get("rows") or []
+    for key in impact_keys:
+        if key not in columns:
+            continue
+        index = columns.index(key)
+        if any(
+            len(row) > index and _numeric(row[index]) is not None
+            for row in rows
+        ):
+            return key, index
+    return None, -1
+
+
+def _truncate_group(
+    packed_row: list[Any], top_n: int, impact_keys: list[str]
+) -> dict[str, Any] | None:
+    """Оставить top-N кандидатов группы по влиянию, хвост свернуть в агрегат.
+
+    Возвращает запись для audit либо None, если группа уже укладывается в N.
+    Порядок полностью детерминирован: ранжирование по убыванию метрики влияния
+    с тай-брейком по исходному индексу строки, а сами оставленные строки
+    возвращаются в исходном порядке.
+    """
+    segments = packed_row[4] if isinstance(packed_row[4], dict) else {}
+    rows = segments.get("rows") or []
+    if len(rows) <= top_n:
+        return None
+    criterion, index = _group_impact_criterion(segments, impact_keys)
+    if index >= 0:
+        def rank(position: int) -> tuple[int, float, int]:
+            value = _numeric(rows[position][index]) if len(rows[position]) > index else None
+            return (0 if value is not None else 1, -(value or 0.0), position)
+
+        order = sorted(range(len(rows)), key=rank)
+    else:
+        # Ни одного числового поля влияния: детерминированный фолбэк — исходный
+        # порядок строк группы (он уже детерминирован в _group_candidate_rows).
+        criterion = "row_order"
+        order = list(range(len(rows)))
+    kept = sorted(order[:top_n])
+    dropped = sorted(order[top_n:])
+
+    aggregate: dict[str, Any] = {
+        "truncated_candidates": len(dropped),
+        "criterion": criterion,
+        "note": "список кандидатов группы неполный: показаны только top-N по влиянию",
+    }
+    if index >= 0:
+        values = [
+            value
+            for position in dropped
+            if (value := (
+                _numeric(rows[position][index]) if len(rows[position]) > index else None
+            )) is not None
+        ]
+        if values:
+            aggregate["truncated_sum"] = sum(values)
+            aggregate["truncated_min"] = min(values)
+            aggregate["truncated_max"] = max(values)
+    segments["rows"] = [rows[position] for position in kept]
+    segments["tail_aggregate"] = aggregate
+    return {
+        "check_id": packed_row[0],
+        "candidate_reason": packed_row[1],
+        "candidates_sent": len(kept),
+        "candidates_aggregated": len(dropped),
+        "criterion": criterion,
+    }
+
+
+def _truncate_candidate_groups(
+    pack: dict[str, Any],
+    byte_cap: int,
+    system_prompt: str,
+    *,
+    top_n: int,
+    impact_keys: list[str],
+) -> int:
+    """Обрезать самые крупные группы кандидатов до попадания в cap.
+
+    Последний эшелон: вызывается, только когда весь опциональный контекст уже
+    снят, а пакет всё ещё не влезает. Группы обрабатываются по убыванию размера
+    и обрезаются не глубже необходимого — цикл прерывается сразу, как пакет
+    уложился в cap. Каждая обрезка фиксируется в pack["audit"].
+    """
+    rows = (pack.get("analysis_candidates") or {}).get("rows") or []
+    order = sorted(
+        range(len(rows)),
+        key=lambda position: (
+            -len((rows[position][4] or {}).get("rows") or []),
+            -_json_size(rows[position]),
+            str(rows[position][0]),
+            str(rows[position][1]),
+        ),
+    )
+    final_size = _set_pack_size(pack, system_prompt)
+    aggregated = 0
+    for position in order:
+        if final_size < byte_cap:
+            break
+        entry = _truncate_group(rows[position], top_n, impact_keys)
+        if entry is None:
+            continue
+        pack["audit"]["truncated_candidate_groups"].append(entry)
+        aggregated += entry["candidates_aggregated"]
+        final_size = _set_pack_size(pack, system_prompt)
+    if aggregated:
+        pack["coverage"]["candidates_aggregated"] = aggregated
+    return final_size
+
+
 def _apply_byte_cap(
-    pack: dict[str, Any], byte_cap: int, system_prompt: str, *, detected: int
+    pack: dict[str, Any],
+    byte_cap: int,
+    system_prompt: str,
+    *,
+    detected: int,
+    defaults: dict[str, Any] | None = None,
 ) -> None:
     """Сначала зарезервировать всех кандидатов, затем урезать только контекст."""
     pack["audit"]["byte_cap_exceeded"] = False
     pack["audit"]["omitted_context"] = []
+    pack["audit"]["truncated_candidate_groups"] = []
     _refresh_coverage(pack, detected=detected)
     final_size = _set_pack_size(pack, system_prompt)
 
@@ -395,12 +540,22 @@ def _apply_byte_cap(
             pack["audit"]["omitted_context"].append(dotted_name)
             final_size = _set_pack_size(pack, system_prompt)
 
+    if final_size >= byte_cap:
+        final_size = _truncate_candidate_groups(
+            pack,
+            byte_cap,
+            system_prompt,
+            top_n=resolve_candidate_top_n(defaults),
+            impact_keys=resolve_candidate_impact_keys(defaults),
+        )
+
     pack["audit"]["byte_cap_exceeded"] = final_size >= byte_cap
     final_size = _set_pack_size(pack, system_prompt)
     if final_size >= byte_cap:
         raise ValueError(
-            "обязательное кандидатное ядро analyze превышает byte-cap; "
-            "кандидаты не были удалены"
+            "конфигурационная ошибка: даже полная обрезка кандидатов до top-N "
+            "не укладывает пакет analyze в byte-cap — поднимите "
+            "analyze_input_pack_byte_cap или снизьте analyze_candidate_top_n"
         )
 
 
@@ -583,6 +738,20 @@ def resolve_warn_bytes(defaults: dict[str, Any] | None = None) -> int:
     return int((defaults or {}).get("analyze_input_pack_warn_bytes") or INPUT_PACK_WARN_BYTES)
 
 
+def resolve_candidate_top_n(defaults: dict[str, Any] | None = None) -> int:
+    """Сколько кандидатов группы отправляется поимённо при последней обрезке."""
+    value = (defaults or {}).get("analyze_candidate_top_n")
+    return max(1, int(value)) if value else CANDIDATE_TOP_N
+
+
+def resolve_candidate_impact_keys(defaults: dict[str, Any] | None = None) -> list[str]:
+    """Приоритет полей влияния, по которым выбирается top-N кандидатов группы."""
+    value = (defaults or {}).get("analyze_candidate_impact_keys")
+    if isinstance(value, list) and value:
+        return [str(item) for item in value]
+    return list(CANDIDATE_IMPACT_KEYS)
+
+
 def build_input_pack(
     paths: Any,
     config: dict[str, Any],
@@ -709,7 +878,7 @@ def build_input_pack(
 
     system_prompt = build_system_prompt(defaults)
     _apply_byte_cap(
-        pack, byte_cap, system_prompt, detected=detected_candidates
+        pack, byte_cap, system_prompt, detected=detected_candidates, defaults=defaults
     )
     if return_full:
         return pack, full_pack
