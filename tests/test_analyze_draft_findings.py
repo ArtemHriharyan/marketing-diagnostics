@@ -509,28 +509,54 @@ def _write_many_small_groups(
 
 
 def test_many_small_groups_below_top_n_collapse_progressively(tmp_path):
+    """400 групп по 10 кандидатов: снижение N + межгрупповое объединение.
+
+    Первый эшелон (снижение top-N) эту нагрузку не закрывает: фиксированный
+    оверхед схлопнутой группы растёт линейно с ЧИСЛОМ групп. Второй эшелон
+    (PACK-2-FIX-1B) сводит полностью схлопнутые группы в один агрегат.
+    """
     paths = _Paths(tmp_path)
-    total = _write_many_small_groups(paths, num_groups=200, per_group=10, detail_len=100)
+    total = _write_many_small_groups(paths, num_groups=400, per_group=10, detail_len=100)
 
     pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
 
     assert pack["audit"]["final_serialized_bytes"] < pack["audit"]["byte_cap"]
     assert pack["audit"]["byte_cap_exceeded"] is False
-    assert len(pack["analysis_candidates"]["rows"]) == 200
     assert pack["audit"]["truncated_candidate_groups"]
 
+    merged_entries = [
+        entry for entry in pack["audit"]["truncated_candidate_groups"]
+        if "merged_groups" in entry
+    ]
+    assert len(merged_entries) == 1
+    merged_entry = merged_entries[0]
+    assert merged_entry["merged_check_ids"] == ["C06"]
+    assert merged_entry["candidates_sent"] == 0
+    assert merged_entry["merged_groups"] > 1
+    # объединение сократило число элементов пакета ровно на слитые группы
+    assert len(pack["analysis_candidates"]["rows"]) == 400 - merged_entry["merged_groups"] + 1
+
     top_n = draft_findings.resolve_candidate_top_n(DEFAULTS)
+    merged_rows = 0
     for row in pack["analysis_candidates"]["rows"]:
-        # ни одна группа не превышала top_n=25 сама по себе (в ней 10
-        # кандидатов) — обрезка сработала только за счёт снижения N (B1)
-        assert row[2] < top_n
         assert row[4]["rows"] == []
         tail = row[4]["tail_aggregate"]
         assert tail["truncated_candidates"] == row[2]
+        if "merged_check_ids" in tail:
+            merged_rows += 1
+            assert tail["merged_groups"] == merged_entry["merged_groups"]
+            assert row[0] is None
+        else:
+            # ни одна исходная группа не превышала top_n=25 сама по себе (в ней
+            # 10 кандидатов) — обрезка сработала только за счёт снижения N (B1)
+            assert row[2] < top_n
+    assert merged_rows == 1
 
     assert pack["coverage"]["candidates_included"] == 0
     assert pack["coverage"]["candidates_omitted"] == total
     assert pack["coverage"]["candidates_aggregated"] == total
+    # проверка не исчезла из coverage вместе с объединёнными группами
+    assert pack["coverage"]["included_check_ids"] == ["C06"]
 
     # детерминизм: повторная сборка даёт байт-в-байт тот же пакет
     assert draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS) == pack
@@ -560,15 +586,59 @@ def test_coverage_included_plus_omitted_equals_total_for_any_truncation_case(tmp
         == 1276
     )
 
-    # (в) полное схлопывание группы
+    # (в) полное схлопывание групп + межгрупповое объединение (второй эшелон)
     paths_c = _Paths(tmp_path / "c")
-    total_c = _write_many_small_groups(paths_c, num_groups=200, per_group=10, detail_len=100)
+    total_c = _write_many_small_groups(paths_c, num_groups=400, per_group=10, detail_len=100)
     pack_c = draft_findings.build_input_pack(paths_c, CONFIG, METHODOLOGY, DEFAULTS)
     assert all(row[4]["rows"] == [] for row in pack_c["analysis_candidates"]["rows"])
+    assert any(
+        "merged_groups" in entry
+        for entry in pack_c["audit"]["truncated_candidate_groups"]
+    )
     assert (
         pack_c["coverage"]["candidates_included"] + pack_c["coverage"]["candidates_omitted"]
         == total_c
     )
+
+
+def test_real_ceiling_still_raises_after_both_echelons(tmp_path):
+    """5000 групп по 1 кандидату: оба эшелона исчерпаны, cap недостижим.
+
+    Группа из одного кандидата не имеет отличающихся колонок -> segments пуст,
+    хвоста нет. Снижение top-N её не режет, а объединять её нельзя (это не
+    схлопнутая группа, в ней осталось бы потерять не-null значения). Это и есть
+    реальный потолок, и сообщение об ошибке должно описывать именно его.
+    """
+    paths = _Paths(tmp_path)
+    _write_many_small_groups(paths, num_groups=5000, per_group=1, detail_len=100)
+
+    try:
+        draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+    except ValueError as error:
+        message = str(error)
+        assert "конфигурационная ошибка" in message
+        assert "оба эшелона обрезки исчерпаны" in message
+        # формулировка фактически верна: объединять было нечего, а все 5000
+        # кандидатов остались поимённо — они обрезке не подлежат
+        assert "объединено схлопнутых групп: 0" in message
+        assert "5000 групп и 5000 поимённых" in message
+        assert "analyze_input_pack_byte_cap" in message
+    else:  # pragma: no cover - защита от молчаливого прохода
+        raise AssertionError("ожидался ValueError о конфигурационной ошибке")
+
+
+def test_explicit_warn_bytes_zero_is_not_replaced_by_default(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_candidates(paths, [
+        ["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}],
+    ])
+    defaults = {**DEFAULTS, "analyze_input_pack_warn_bytes": 0}
+
+    assert draft_findings.resolve_warn_bytes(defaults) == 0
+    assert draft_findings.resolve_byte_cap({**DEFAULTS, "analyze_input_pack_byte_cap": 0}) == 0
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, defaults)
+    assert pack["audit"]["warn_bytes"] == 0
 
 
 def test_explicit_candidate_top_n_zero_is_not_replaced_by_default(tmp_path):

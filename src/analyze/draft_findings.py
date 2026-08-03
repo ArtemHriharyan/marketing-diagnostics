@@ -402,6 +402,15 @@ def _refresh_coverage(pack: dict[str, Any], *, detected: int) -> None:
         for row in rows
         if isinstance(row, list) and check_index >= 0 and len(row) > check_index and row[check_index]
     ]
+    # У объединённого элемента второго эшелона (см. _merge_collapsed_groups)
+    # собственного check_id нет — проверки читаются из merged_check_ids, иначе
+    # они молча исчезли бы из included_check_ids/included_blocks.
+    for row in rows:
+        if not isinstance(row, list) or segments_index < 0 or len(row) <= segments_index:
+            continue
+        segments = row[segments_index] if isinstance(row[segments_index], dict) else {}
+        merged = (segments.get("tail_aggregate") or {}).get("merged_check_ids") or []
+        check_ids.extend(str(item) for item in merged)
     coverage["included_check_ids"] = sorted(set(check_ids))
     coverage["included_blocks"] = sorted({check_id[0] for check_id in check_ids if check_id})
 
@@ -488,6 +497,90 @@ def _truncate_group(
     }
 
 
+def _collapsed_group_impact(
+    segments: dict[str, Any], impact_keys: list[str]
+) -> float:
+    """Суммарное влияние группы по тому же критерию, что и внутригрупповой top-N.
+
+    Считается по ИСХОДНЫМ (до обрезки) строкам группы через
+    `_group_impact_criterion` — новый критерий не вводится, переиспользуется
+    существующий. Группы без числового поля влияния получают 0.0 и уходят
+    в объединение первыми.
+    """
+    _, index = _group_impact_criterion(segments, impact_keys)
+    if index < 0:
+        return 0.0
+    rows = segments.get("rows") or []
+    return sum(
+        value
+        for row in rows
+        if (value := (_numeric(row[index]) if len(row) > index else None)) is not None
+    )
+
+
+def _merge_collapsed_groups(
+    merged_rows: list[list[Any]],
+) -> tuple[list[Any], dict[str, Any]]:
+    """Свести полностью схлопнутые группы в один общий tail_aggregate-элемент.
+
+    Второй эшелон byte-cap. Фиксированный оверхед схлопнутой группы
+    (check_id, candidate_reason, note агрегата, отдельная запись в
+    `audit.truncated_candidate_groups`) растёт линейно с ЧИСЛОМ ГРУПП, поэтому
+    снижение top-N этот вес не режет в принципе. Объединение честно теряет
+    гранулярность по check_id (сумма/диапазон критерия — общие), что допустимо
+    ровно потому, что поимённых кандидатов в этих группах уже не осталось.
+    """
+    check_ids = sorted({str(row[0]) for row in merged_rows if row[0]})
+    criteria: set[Any] = set()
+    total_aggregated = 0
+    total_candidates = 0
+    sums: list[float] = []
+    minimums: list[float] = []
+    maximums: list[float] = []
+    for row in merged_rows:
+        tail = (row[4] if isinstance(row[4], dict) else {}).get("tail_aggregate") or {}
+        criteria.add(tail.get("criterion"))
+        total_aggregated += int(tail.get("truncated_candidates") or 0)
+        total_candidates += int(row[2] or 0)
+        if "truncated_sum" in tail:
+            sums.append(tail["truncated_sum"])
+            minimums.append(tail["truncated_min"])
+            maximums.append(tail["truncated_max"])
+    criterion = criteria.pop() if len(criteria) == 1 else "mixed"
+
+    aggregate: dict[str, Any] = {
+        "merged_check_ids": check_ids,
+        "merged_groups": len(merged_rows),
+        "truncated_candidates": total_aggregated,
+        "criterion": criterion,
+        "note": (
+            "метаданные полностью схлопнутых групп объединены: поимённых "
+            "кандидатов в них не осталось, разбивка по check_id и "
+            "candidate_reason не отправлена"
+        ),
+    }
+    if sums:
+        aggregate["truncated_sum"] = sum(sums)
+        aggregate["truncated_min"] = min(minimums)
+        aggregate["truncated_max"] = max(maximums)
+
+    packed_row = [
+        None,
+        "merged_collapsed_groups",
+        total_candidates,
+        {},
+        {"columns": [], "rows": [], "tail_aggregate": aggregate},
+    ]
+    entry = {
+        "merged_check_ids": check_ids,
+        "merged_groups": len(merged_rows),
+        "candidates_sent": 0,
+        "candidates_aggregated": total_aggregated,
+        "criterion": criterion,
+    }
+    return packed_row, entry
+
+
 def _truncate_candidate_groups(
     pack: dict[str, Any],
     byte_cap: int,
@@ -516,9 +609,14 @@ def _truncate_candidate_groups(
     группы, а не к уже обрезанному — иначе повторное снижение теряло бы
     данные для агрегата (сумма/мин/макс отброшенного хвоста).
 
+    Второй эшелон (если пакет вне cap даже при N=0): полностью схлопнутые
+    группы объединяются в один общий агрегат — см. `_merge_collapsed_groups`.
+    Он режет ось «число групп», по которой снижение N бессильно.
+
     Порядок групп стабилен: сортировка по (check_id, candidate_reason).
     """
-    rows = (pack.get("analysis_candidates") or {}).get("rows") or []
+    candidates = pack.get("analysis_candidates") or {}
+    rows = candidates.get("rows") or []
     if not rows:
         return _set_pack_size(pack, system_prompt)
 
@@ -541,17 +639,31 @@ def _truncate_candidate_groups(
                 entries[position] = entry
         return entries
 
-    def apply_and_size(n: int) -> int:
+    def apply_and_size(n: int, merged_count: int = 0) -> int:
         # audit.truncated_candidate_groups обновляется ДО замера размера —
         # иначе возвращаемый final_size не учитывал бы вес самого audit-списка
         # (для сотен групп это не мелочь) и мог соврать о фактической
         # укладке пакета в cap.
         entries = apply_n(n)
-        pack["audit"]["truncated_candidate_groups"] = [
-            entries[position] for position in order if position in entries
+        merged_positions = merge_order[:merged_count] if merged_count else []
+        merged_set = set(merged_positions)
+        audit_entries = [
+            entries[position]
+            for position in order
+            if position in entries and position not in merged_set
         ]
+        packed_rows = [rows[position] for position in range(len(rows)) if position not in merged_set]
+        if merged_positions:
+            merged_row, merged_entry = _merge_collapsed_groups(
+                [rows[position] for position in merged_positions]
+            )
+            packed_rows.append(merged_row)
+            audit_entries.append(merged_entry)
+        candidates["rows"] = packed_rows
+        pack["audit"]["truncated_candidate_groups"] = audit_entries
         return _set_pack_size(pack, system_prompt)
 
+    merge_order: list[int] = []
     final_size = apply_and_size(top_n)
 
     n = top_n
@@ -559,7 +671,45 @@ def _truncate_candidate_groups(
         n = n // 2
         final_size = apply_and_size(n)
 
-    return final_size
+    if final_size < byte_cap:
+        return final_size
+
+    # Второй эшелон. Объединять можно только группы, у которых после снижения
+    # N не осталось ни одного поимённого кандидата (rows == [] и есть
+    # tail_aggregate): в группе с оставшимися кандидатами объединение теряло бы
+    # не-null значения сверх разрешённого. Порядок объединения — по
+    # возрастанию влияния, с конца.
+    merge_order = sorted(
+        (
+            position
+            for position in order
+            if isinstance(rows[position][4], dict)
+            and rows[position][4].get("tail_aggregate")
+            and not rows[position][4].get("rows")
+        ),
+        key=lambda position: (
+            _collapsed_group_impact(original_segments[position], impact_keys),
+            str(rows[position][0]),
+            str(rows[position][1]),
+        ),
+    )
+    if len(merge_order) < 2:
+        # Объединять нечего: одна группа «сама с собой» только добавила бы байт.
+        return final_size
+
+    # Размер монотонно убывает с числом объединённых групп, поэтому минимальное
+    # достаточное k ищется бинарно: это тот же результат, что и пошаговое
+    # объединение, но без O(N) полных сериализаций пакета.
+    low, high = 2, len(merge_order)
+    best: int | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        size = apply_and_size(n, middle)
+        if size < byte_cap:
+            best, high = middle, middle - 1
+        else:
+            low = middle + 1
+    return apply_and_size(n, best if best is not None else len(merge_order))
 
 
 def _apply_byte_cap(
@@ -612,10 +762,21 @@ def _apply_byte_cap(
     pack["audit"]["byte_cap_exceeded"] = final_size >= byte_cap
     final_size = _set_pack_size(pack, system_prompt)
     if final_size >= byte_cap:
+        # Формулировка описывает ФАКТИЧЕСКОЕ состояние на момент отказа: оба
+        # эшелона исчерпаны, но необрезаемый остаток (группы без свёрнутого
+        # хвоста — например, по одному кандидату в каждой) в cap не влезает.
+        merged = sum(
+            int(entry.get("merged_groups") or 0)
+            for entry in pack["audit"].get("truncated_candidate_groups") or []
+        )
+        groups = len((pack.get("analysis_candidates") or {}).get("rows") or [])
         raise ValueError(
-            "конфигурационная ошибка: даже полное схлопывание всех групп "
-            "кандидатов в агрегаты (прогрессивное снижение top-N до 0) не "
-            "укладывает пакет analyze в byte-cap — поднимите "
+            f"конфигурационная ошибка: пакет analyze = {final_size} байт при "
+            f"cap = {byte_cap} байт, оба эшелона обрезки исчерпаны "
+            f"(top-N снижен до 0, объединено схлопнутых групп: {merged}); "
+            f"в пакете осталось {groups} групп и "
+            f"{pack['coverage'].get('candidates_included')} поимённых "
+            "кандидатов, которые обрезке не подлежат — поднимите "
             "analyze_input_pack_byte_cap"
         )
 
@@ -789,14 +950,26 @@ def _client_context(
     }
 
 
+def _resolve_int_default(defaults: dict[str, Any] | None, key: str, fallback: int) -> int:
+    """Числовой ключ defaults.yaml с отличением «ключа нет» от «ключ = 0».
+
+    `value or default` спутал бы явный 0 (falsy) с отсутствием настройки, см.
+    обоснование в `resolve_candidate_top_n`.
+    """
+    defaults = defaults or {}
+    if key not in defaults or defaults[key] is None:
+        return fallback
+    return int(defaults[key])
+
+
 def resolve_byte_cap(defaults: dict[str, Any] | None = None) -> int:
     """Байтовый потолок отправляемого пакета: defaults.yaml, иначе константа."""
-    return int((defaults or {}).get("analyze_input_pack_byte_cap") or INPUT_PACK_BYTE_CAP)
+    return _resolve_int_default(defaults, "analyze_input_pack_byte_cap", INPUT_PACK_BYTE_CAP)
 
 
 def resolve_warn_bytes(defaults: dict[str, Any] | None = None) -> int:
     """Порог предупреждения о размере пакета: defaults.yaml, иначе константа."""
-    return int((defaults or {}).get("analyze_input_pack_warn_bytes") or INPUT_PACK_WARN_BYTES)
+    return _resolve_int_default(defaults, "analyze_input_pack_warn_bytes", INPUT_PACK_WARN_BYTES)
 
 
 def resolve_candidate_top_n(defaults: dict[str, Any] | None = None) -> int:
