@@ -77,6 +77,15 @@ _COMPACT_CONTEXT_ARTIFACTS = (
 _FUNNEL_SUMMARY_KEYS = ("totals", "transitions", "gaps", "anomalies")
 _FUNNEL_ID_KEYS = ("id", "funnel_id", "name", "period")
 
+# Ключи coverage, которые описывают качество сканирования артефактов самим
+# пайплайном (QA), а не evidence для находок — в отправляемый пакет не идут.
+_COVERAGE_TELEMETRY_KEYS = frozenset({"artifacts"})
+
+# inputs/*.yaml, которые являются входом стадии extract, а не доказательной
+# базой находки: стоп-слова Wordstat нужны при сборе частотностей, но модель
+# по ним ничего не формулирует.
+_NON_EVIDENCE_INPUTS = frozenset({"wordstat_stopwords"})
+
 INPUT_PACK_ARTIFACT_NAME = "_analyze_input_pack.json"
 
 # Дефолты на случай, если ключей нет в config/defaults.yaml
@@ -201,8 +210,23 @@ def _flatten_candidate_row(row: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _drop_null_values(mapping: dict[str, Any]) -> dict[str, Any]:
+    """Убрать ключи со значением null. Пустая строка, 0 и false — значимые.
+
+    Union-схема analysis_candidates объединяет поля всех типов проверок, из-за
+    чего каждая строка несёт сотни ключей со значением null, не несущих данных.
+    Отсутствие ключа и null здесь равнозначны по смыслу, поэтому убираем ключ.
+    """
+    return {key: value for key, value in mapping.items() if value is not None}
+
+
 def _group_candidate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Сгруппировать кандидатов по check_id+candidate_reason без потери сегментов."""
+    """Сгруппировать кандидатов по check_id+candidate_reason без потери сегментов.
+
+    `common` отдаётся без null-ключей (см. _drop_null_values); из `segments`
+    убираются колонки, пустые во ВСЕХ строках группы. Ни одно значимое
+    (не-null) значение при этом не теряется.
+    """
     grouped: dict[tuple[Any, Any], list[dict[str, Any]]] = {}
     for row in rows:
         key = (row.get("check_id"), row.get("candidate_reason"))
@@ -228,8 +252,9 @@ def _group_candidate_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             }
             if len(fingerprints) == 1:
                 common[column] = values[0]
-            else:
+            elif any(value is not None for value in values):
                 segment_columns.append(column)
+        common = _drop_null_values(common)
         segments = {
             "columns": segment_columns,
             "rows": [
@@ -270,12 +295,15 @@ def _project_analysis_candidates(
                 candidate_rows.append(decoded)
         elif candidate_refs.intersection(_row_ref_tokens(decoded, index)):
             if not _is_unavailable_row(decoded):
-                context_rows.append(row)
+                context_rows.append(_drop_null_values(decoded))
 
     result = _group_candidate_rows(candidate_rows)
     result["coverage"] = payload.get("coverage") or {}
     if context_rows:
-        result["context"] = {"columns": columns, "rows": context_rows}
+        # Union-массив columns здесь не нужен: строк контекста мало, а полей в
+        # union-схеме сотни, поэтому построчный словарь непустых полей заметно
+        # компактнее columnar-представления с null-дырами.
+        result["context"] = {"rows": context_rows}
     return result, excluded, len(indexes)
 
 
@@ -376,7 +404,14 @@ def _apply_byte_cap(
         )
 
 
-def _compact_degradation(report: dict[str, Any]) -> dict[str, Any]:
+def _compact_degradation(
+    report: dict[str, Any], used_check_ids: set[str] | None = None
+) -> dict[str, Any]:
+    """Компактная таблица деградации; при заданном used_check_ids — только по ним.
+
+    `counts` остаётся общерегистровым: это сводка по всем 100 проверкам, она и
+    показывает модели, что таблица сужена до задействованных проверок прогона.
+    """
     columns = ["check_id", "runnable", "type_effective", "confidence_cap", "reason"]
     rows = [
         [
@@ -384,8 +419,34 @@ def _compact_degradation(report: dict[str, Any]) -> dict[str, Any]:
             check.get("confidence_cap"), check.get("reason_if_not_runnable"),
         ]
         for check in report.get("checks") or []
+        if used_check_ids is None or check.get("check_id") in used_check_ids
     ]
     return {"columns": columns, "rows": rows, "counts": report.get("counts") or {}}
+
+
+def _not_runnable_count(report: dict[str, Any]) -> int:
+    """Сколько проверок реестра ушло в деградацию (runnable=false)."""
+    return sum(1 for check in report.get("checks") or [] if not check.get("runnable"))
+
+
+def _used_check_ids(analysis_candidates: dict[str, Any]) -> set[str]:
+    """check_id, реально присутствующие в кандидатах этого прогона.
+
+    Именно по этому множеству сужаются реестры пакета (check_names,
+    degradation, source_cap_by_check, known_check_ids): проверки, по которым в
+    прогоне нет ни одного кандидата, находкой стать всё равно не могут.
+    Компенсация сужения — client_context.checks_total /
+    client_context.checks_not_runnable, чтобы охват был виден явно.
+    """
+    columns = analysis_candidates.get("columns") or []
+    if "check_id" not in columns:
+        return set()
+    index = columns.index("check_id")
+    return {
+        row[index]
+        for row in analysis_candidates.get("rows") or []
+        if isinstance(row, list) and len(row) > index and row[index]
+    }
 
 
 def _columnar_dict_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -486,8 +547,19 @@ def _confidence_caps(degradation_report: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _client_context(config: dict[str, Any]) -> dict[str, Any]:
-    """Контекст клиента (ниша/гео/бренд/окно анализа) — не бизнес-числа, а рамка отчёта."""
+def _client_context(
+    config: dict[str, Any],
+    *,
+    checks_total: int = 0,
+    checks_not_runnable: int = 0,
+) -> dict[str, Any]:
+    """Контекст клиента (ниша/гео/бренд/окно анализа) — не бизнес-числа, а рамка отчёта.
+
+    `checks_total` / `checks_not_runnable` — охват реестра целиком, поверх
+    которого реестры пакета сужены до задействованных проверок (см.
+    _used_check_ids): сужение должно быть видно модели явно, а не выглядеть
+    полным охватом.
+    """
     config = config or {}
     client = config.get("client") or {}
     return {
@@ -496,6 +568,8 @@ def _client_context(config: dict[str, Any]) -> dict[str, Any]:
         "geo": client.get("geo"),
         "brand_terms": config.get("brand_terms") or [],
         "data_window": config.get("data_window") or {},
+        "checks_total": checks_total,
+        "checks_not_runnable": checks_not_runnable,
     }
 
 
@@ -552,20 +626,45 @@ def build_input_pack(
         for stem, payload in raw_context.items()
     }
     byte_cap = resolve_byte_cap(defaults)
+    used_check_ids = _used_check_ids(analysis_candidates)
+    # coverage переезжает в единственное место — pack["coverage"]; телеметрия
+    # сканирования артефактов (artifacts) — это QA пайплайна, не evidence.
+    source_coverage = {
+        key: value
+        for key, value in (analysis_candidates.pop("coverage", None) or {}).items()
+        if key not in _COVERAGE_TELEMETRY_KEYS
+    }
+    all_check_names = {
+        c.get("id"): c.get("name")
+        for c in (methodology.get("checks") or [])
+        if c.get("id")
+    }
+    all_known_check_ids = sorted(schemas.known_check_ids(methodology))
+    all_source_caps = _confidence_caps(degradation_report)
     common_sections = {
-        "client_context": _client_context(config),
+        "client_context": _client_context(
+            config,
+            checks_total=len(all_check_names),
+            checks_not_runnable=_not_runnable_count(degradation_report),
+        ),
         "check_names": {
-            c.get("id"): c.get("name")
-            for c in (methodology.get("checks") or [])
-            if c.get("id")
+            check_id: name
+            for check_id, name in all_check_names.items()
+            if check_id in used_check_ids
         },
-        "known_check_ids": sorted(schemas.known_check_ids(methodology)),
+        "known_check_ids": [
+            check_id for check_id in all_known_check_ids if check_id in used_check_ids
+        ],
         "constraints": {
             "sample_size_rule": {
                 "min_sample_visits": defaults.get("min_sample_visits"),
                 "significance_alpha": defaults.get("significance_alpha"),
             },
-            "source_cap_by_check": _confidence_caps(degradation_report),
+            "source_cap_by_check": {
+                check_id: cap
+                for check_id, cap in all_source_caps.items()
+                if check_id in used_check_ids
+            },
             "money_categories": dict(schemas.MONEY_CATEGORIES),
             "max_findings_per_run": schemas.MAX_FINDINGS_PER_RUN,
             "currency_round": defaults.get("currency_round", 0),
@@ -575,14 +674,30 @@ def build_input_pack(
         **copy.deepcopy(common_sections),
         "analysis_candidates": analysis_candidates,
         "compact_context": compact_context,
-        "inputs": inputs,
-        "degradation": _compact_degradation(degradation_report),
-        "coverage": {"source": analysis_candidates.get("coverage") or {}},
+        "inputs": {
+            name: value
+            for name, value in inputs.items()
+            if name not in _NON_EVIDENCE_INPUTS
+        },
+        "degradation": _compact_degradation(degradation_report, used_check_ids),
+        "coverage": source_coverage,
         "excluded_candidates": excluded_candidates,
         "audit": {"byte_cap": byte_cap, "warn_bytes": resolve_warn_bytes(defaults)},
     }
+    # full_pack — корпус сверки assumptions, он обязан оставаться полным:
+    # ни сужение реестров, ни отбор inputs на него не распространяются.
     full_pack = {
-        **common_sections,
+        "client_context": _client_context(
+            config,
+            checks_total=len(all_check_names),
+            checks_not_runnable=_not_runnable_count(degradation_report),
+        ),
+        "check_names": all_check_names,
+        "known_check_ids": all_known_check_ids,
+        "constraints": {
+            **common_sections["constraints"],
+            "source_cap_by_check": all_source_caps,
+        },
         "analysis_candidates": raw_candidates,
         "compact_context": raw_context,
         "inputs": inputs,

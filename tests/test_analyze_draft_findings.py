@@ -110,6 +110,7 @@ def test_build_input_pack_collects_all_sections(tmp_path):
     _write_candidates(paths, [
         ["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}],
         ["S06", "candidate", True, "ok", "MED", True, {"trend": "down"}],
+        ["D01", "candidate", True, "ok", "HIGH", True, {"repeats": 3}],
     ])
     _write_json(paths.metrics, "funnels", {"booking": {"open": 100, "submit": 45}})
     _write_json(paths.metrics, "acquisition_economics", {"models": [{"value_rub": 2500.0}]})
@@ -125,9 +126,12 @@ def test_build_input_pack_collects_all_sections(tmp_path):
 
     assert pack["client_context"]["name"] == "Клиент Тест"
     assert pack["client_context"]["niche"] == "аренда авто"
-    assert pack["check_names"]["A04"].startswith("Кампания расходует")
-    assert set(pack["known_check_ids"]) == {"D01", "A04", "C06", "S06"}
-    assert pack["coverage"]["included_check_ids"] == ["C06", "S06"]
+    # PACK-1: реестры сужены до задействованных проверок прогона — A04
+    # кандидатов не дал, поэтому в check_names/known_check_ids его нет
+    assert pack["check_names"]["C06"].startswith("Большой отвал")
+    assert set(pack["known_check_ids"]) == {"D01", "C06", "S06"}
+    assert "A04" not in pack["check_names"]
+    assert pack["coverage"]["included_check_ids"] == ["C06", "D01", "S06"]
     assert set(pack["compact_context"]) == {"funnels", "acquisition_economics", "seasonality"}
     assert "metrics" not in pack
     assert "raw" not in json.dumps(pack, ensure_ascii=False)
@@ -135,7 +139,7 @@ def test_build_input_pack_collects_all_sections(tmp_path):
     assert pack["inputs"]["client_answers"]["business"]["avg_check_rub"] == 5000
     assert "comment" not in pack["inputs"]["client_answers"]["business"]
 
-    assert pack["constraints"]["source_cap_by_check"] == {"D01": "HIGH", "A04": "MED"}
+    assert pack["constraints"]["source_cap_by_check"] == {"D01": "HIGH"}
     assert pack["constraints"]["sample_size_rule"]["min_sample_visits"] == 500
     assert pack["constraints"]["money_categories"] == dict(schemas.MONEY_CATEGORIES)
     assert pack["audit"]["input_pack_bytes"] < pack["audit"]["byte_cap"]
@@ -221,29 +225,55 @@ def test_build_input_pack_prioritizes_candidates_over_optional_context(tmp_path)
     assert "S06" in first["coverage"]["included_check_ids"]
 
 
-def test_real_p10_stress_pack_keeps_638_candidates_under_final_cap(tmp_path):
-    paths = _Paths(tmp_path)
-    candidate_columns = [
+def _union_schema_candidate_rows() -> tuple[list[str], list[list]]:
+    """638 кандидатов в union-схеме ~200 колонок, ~10 заполненных на строку.
+
+    Так выглядит реальный analysis_candidates.json (P06): колонки — объединение
+    полей ВСЕХ типов проверок методологии, поэтому в каждой конкретной строке
+    заполнены единицы полей, а остальные несут null. Прежняя фикстура строила
+    8 плотных колонок и потому не воспроизводила основной вклад в размер
+    пакета — null-overhead union-схемы (ломающее изменение фикстуры, PACK-1).
+    """
+    base_columns = [
         *CANDIDATE_COLUMNS, "candidate_reason", "segment", "row_ref", "context_refs",
     ]
-    candidate_rows = []
+    # +190 полей чужих типов проверок — в строках C06/S06 они всегда null
+    filler_columns = [f"metric_{index:03d}" for index in range(190)]
+    columns = [*base_columns, *filler_columns]
+    assert len(columns) >= 200
+
+    rows = []
     for index in range(319):
-        candidate_rows.append([
-            "C06", "candidate", True, "ok", "HIGH", True,
-            {"rate": 0.45, "gap_visits": 60, "metric": "open_to_submit"},
-            "funnel_gap", f"landing_page=/cars/{index}", f"c06-{index}", [],
-        ])
-        candidate_rows.append([
-            "S06", "candidate", True, "ok", "MED", True,
-            {"trend": "down", "demand_index": 0.82, "metric": "seasonality"},
-            "seasonality_conflict", f"month=2026-{index % 12 + 1:02d}",
-            f"s06-{index}", [],
-        ])
-    assert len(candidate_rows) == 638
+        c06 = {
+            "check_id": "C06", "row_role": "candidate", "candidate": True,
+            "status": "ok", "confidence": "HIGH", "significant": True,
+            "payload": {"rate": 0.45, "gap_visits": 60, "metric": "open_to_submit"},
+            "candidate_reason": "funnel_gap",
+            "segment": f"landing_page=/cars/{index}",
+            "row_ref": f"c06-{index}", "context_refs": [],
+        }
+        s06 = {
+            "check_id": "S06", "row_role": "candidate", "candidate": True,
+            "status": "ok", "confidence": "MED", "significant": True,
+            "payload": {"trend": "down", "demand_index": 0.82, "metric": "seasonality"},
+            "candidate_reason": "seasonality_conflict",
+            "segment": f"month=2026-{index % 12 + 1:02d}",
+            "row_ref": f"s06-{index}", "context_refs": [],
+        }
+        for decoded in (c06, s06):
+            rows.append([decoded.get(column) for column in columns])
+    assert len(rows) == 638
+    assert all(sum(1 for v in row if v is not None) <= 11 for row in rows)
+    return columns, rows
+
+
+def test_real_p10_stress_pack_keeps_638_candidates_under_final_cap(tmp_path):
+    paths = _Paths(tmp_path)
+    candidate_columns, candidate_rows = _union_schema_candidate_rows()
     _write_json(paths.metrics, "analysis_candidates", {
         "columns": candidate_columns,
         "rows": candidate_rows,
-        "coverage": {"checks_calculated": 2},
+        "coverage": {"checks_calculated": 2, "artifacts": [{"raw": "x" * 5_000}]},
     })
     funnels = {
         "funnels": [{
@@ -278,6 +308,11 @@ def test_real_p10_stress_pack_keeps_638_candidates_under_final_cap(tmp_path):
     ]
     assert sum(row[2] for row in candidate_projection["rows"]) == 638
     assert all(row[4]["columns"] and row[4]["rows"] for row in candidate_projection["rows"])
+    # 190 полей чужих типов проверок не доехали до модели как null-балласт
+    assert all(row[3] and not any(v is None for v in row[3].values())
+               for row in candidate_projection["rows"])
+    assert all("metric_000" not in row[3] and "metric_000" not in row[4]["columns"]
+               for row in candidate_projection["rows"])
 
     system_prompt = draft_findings.build_system_prompt(DEFAULTS)
     final_size = len(json.dumps(
@@ -635,3 +670,163 @@ def test_pack_over_warn_bytes_logs_warning_without_raising(tmp_path):
         draft_findings.orchestrator_mod.load_defaults = original
 
     assert any("WARNING" in message for message in messages)
+
+
+# ── 8. PACK-1: сжатие пакета без потери значимых значений ──────────────────
+# Пакет уменьшается только за счёт того, что не несёт данных: null-полей
+# union-схемы, задвоенного coverage, телеметрии сканирования, реестров по
+# незадействованным проверкам и стоп-слов стадии extract.
+
+_WIDE_COLUMNS = [
+    *CANDIDATE_COLUMNS, "candidate_reason", "segment", "row_ref", "context_refs",
+    *(f"metric_{index:03d}" for index in range(190)),
+]
+
+
+def _wide_row(**values) -> list:
+    """Строка union-схемы: заданные поля заполнены, остальные — null."""
+    return [values.get(column) for column in _WIDE_COLUMNS]
+
+
+def _write_wide_candidates(paths: _Paths, coverage: dict | None = None) -> None:
+    """Кандидат + строка контекста по нему в широкой union-схеме."""
+    rows = [
+        _wide_row(
+            check_id="C06", row_role="candidate", candidate=True, status="ok",
+            confidence="HIGH", significant=True, candidate_reason="funnel_gap",
+            segment="landing_page=/cars/1", row_ref="c06-1",
+            context_refs=["ctx-1"], metric_000=0.45, metric_001="", metric_002=0,
+            metric_003=False,
+        ),
+        _wide_row(
+            check_id="C06", row_role="context", candidate=False, status="ok",
+            row_ref="ctx-1", metric_010=1234, metric_011="форма брони",
+        ),
+    ]
+    _write_json(paths.metrics, "analysis_candidates", {
+        "columns": _WIDE_COLUMNS,
+        "rows": rows,
+        "coverage": coverage or {
+            "rows_total": 2,
+            "contract_coverage": 1.0,
+            "artifacts": [{"artifact": f"a{i}", "state": "complete"} for i in range(200)],
+        },
+    })
+
+
+def _count_key(value, name: str) -> int:
+    if isinstance(value, dict):
+        return (1 if name in value else 0) + sum(
+            _count_key(item, name) for item in value.values()
+        )
+    if isinstance(value, list):
+        return sum(_count_key(item, name) for item in value)
+    return 0
+
+
+def test_pack_carries_no_null_values_in_candidates_and_context(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_wide_candidates(paths)
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+
+    candidates = pack["analysis_candidates"]
+    common = candidates["rows"][0][3]
+    assert not any(value is None for value in common.values())
+    # пустая строка, 0 и false — значимые значения, они остаются
+    assert common["metric_001"] == "" and common["metric_002"] == 0
+    assert common["metric_003"] is False
+    assert common["metric_000"] == 0.45
+    assert "metric_050" not in common
+
+    context_rows = candidates["context"]["rows"]
+    assert context_rows and all(isinstance(row, dict) for row in context_rows)
+    assert "columns" not in candidates["context"]
+    for row in context_rows:
+        assert not any(value is None for value in row.values())
+    assert context_rows[0]["metric_010"] == 1234
+    assert context_rows[0]["metric_011"] == "форма брони"
+    assert "metric_050" not in context_rows[0]
+
+
+def test_coverage_appears_once_and_carries_no_scan_telemetry(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_wide_candidates(paths)
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+
+    assert _count_key(pack, "coverage") == 1
+    assert "coverage" not in pack["analysis_candidates"]
+    assert "artifacts" not in pack["coverage"]
+    assert "artifacts" not in json.dumps(pack, ensure_ascii=False)
+    # содержательные поля источника при этом сохранены
+    assert pack["coverage"]["contract_coverage"] == 1.0
+    assert pack["coverage"]["included_check_ids"] == ["C06"]
+
+
+def _registry_methodology() -> dict:
+    """Реестр из 100 проверок с реальными размерами блоков (D12/A26/T10/C25/S27)."""
+    blocks = {"D": 12, "A": 26, "T": 10, "C": 25, "S": 27}
+    checks = [
+        {"id": f"{letter}{number:02d}", "name": f"Проверка {letter}{number:02d}"}
+        for letter, count in blocks.items()
+        for number in range(1, count + 1)
+    ]
+    assert len(checks) == 100
+    return {"checks": checks}
+
+
+def test_registries_are_narrowed_to_used_check_ids_only(tmp_path):
+    paths = _Paths(tmp_path)
+    methodology = _registry_methodology()
+    _write_degradation(paths, [
+        {"check_id": c["id"], "runnable": c["id"] not in {"S27", "T10"},
+         "confidence_cap": "MED", "type_effective": "A"}
+        for c in methodology["checks"]
+    ])
+    _write_candidates(paths, [
+        ["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}],
+        ["D01", "candidate", True, "ok", "HIGH", True, {"repeats": 3}],
+    ])
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, methodology, DEFAULTS)
+
+    used = {"C06", "D01"}
+    assert set(pack["check_names"]) == used
+    assert set(pack["known_check_ids"]) <= used
+    assert set(pack["known_check_ids"]) == used
+    assert pack["known_check_ids"] == sorted(pack["known_check_ids"])
+    assert set(pack["constraints"]["source_cap_by_check"]) == used
+    degradation_ids = {row[0] for row in pack["degradation"]["rows"]}
+    assert degradation_ids == used
+
+    # компенсация сужения: охват реестра виден скалярами, а не умолчанием
+    assert pack["client_context"]["checks_total"] == 100
+    assert pack["client_context"]["checks_not_runnable"] == 2
+
+    # сужение детерминировано
+    assert draft_findings.build_input_pack(paths, CONFIG, methodology, DEFAULTS) == pack
+
+
+def test_extract_stage_stopwords_are_not_sent_but_stay_in_validation_corpus(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_candidates(paths, [["C06", "candidate", True, "ok", "HIGH", True, {"r": 1}]])
+    paths.inputs.mkdir(parents=True)
+    (paths.inputs / "wordstat_stopwords.yaml").write_text(
+        "stopwords:\n" + "".join(f"  - слово{i}\n" for i in range(300)), encoding="utf-8"
+    )
+    (paths.inputs / "client_answers.yaml").write_text(
+        "business:\n  avg_check_rub: 5000\n", encoding="utf-8"
+    )
+
+    send_pack, full_pack = draft_findings.build_input_pack(
+        paths, CONFIG, METHODOLOGY, DEFAULTS, return_full=True
+    )
+
+    assert "wordstat_stopwords" not in send_pack["inputs"]
+    assert "слово299" not in json.dumps(send_pack, ensure_ascii=False)
+    assert send_pack["inputs"]["client_answers"]["business"]["avg_check_rub"] == 5000
+    # корпус сверки assumptions (PACK-0) остаётся полным
+    corpus = draft_findings.build_validation_corpus(full_pack)
+    assert "wordstat_stopwords" in corpus
+    assert "слово299" in json.dumps(corpus, ensure_ascii=False)
