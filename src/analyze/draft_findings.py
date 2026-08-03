@@ -50,8 +50,10 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -76,7 +78,14 @@ _FUNNEL_SUMMARY_KEYS = ("totals", "transitions", "gaps", "anomalies")
 _FUNNEL_ID_KEYS = ("id", "funnel_id", "name", "period")
 
 INPUT_PACK_ARTIFACT_NAME = "_analyze_input_pack.json"
-INPUT_PACK_BYTE_CAP = 100_000
+
+# Дефолты на случай, если ключей нет в config/defaults.yaml
+# (analyze_input_pack_byte_cap / analyze_input_pack_warn_bytes) — обоснование
+# величин см. в комментарии к этим ключам в config/defaults.yaml.
+INPUT_PACK_BYTE_CAP = 150_000
+INPUT_PACK_WARN_BYTES = 120_000
+
+_LOGGER = logging.getLogger(__name__)
 
 
 # ── Сбор входного пакета ────────────────────────────────────────────────────
@@ -490,13 +499,35 @@ def _client_context(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def resolve_byte_cap(defaults: dict[str, Any] | None = None) -> int:
+    """Байтовый потолок отправляемого пакета: defaults.yaml, иначе константа."""
+    return int((defaults or {}).get("analyze_input_pack_byte_cap") or INPUT_PACK_BYTE_CAP)
+
+
+def resolve_warn_bytes(defaults: dict[str, Any] | None = None) -> int:
+    """Порог предупреждения о размере пакета: defaults.yaml, иначе константа."""
+    return int((defaults or {}).get("analyze_input_pack_warn_bytes") or INPUT_PACK_WARN_BYTES)
+
+
 def build_input_pack(
     paths: Any,
     config: dict[str, Any],
     methodology: dict[str, Any],
     defaults: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+    *,
+    return_full: bool = False,
+) -> dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]:
     """Собрать компактный пакет P06-кандидатов, контекста и ограничений.
+
+    Возвращает **send_pack** — то, что уходит в модель и пишется как
+    аудиторский артефакт (INPUT_PACK_ARTIFACT_NAME): уже после проекций-сжатий
+    и после применения byte-cap.
+
+    ``return_full=True`` дополнительно отдаёт **full_pack** — те же секции до
+    любых проекций и до byte-cap. Он нужен только как корпус для сверки чисел
+    находки (см. build_validation_corpus): валидация не имеет права зависеть от
+    того, сколько данных поместилось в отправляемый пакет. В модель и в
+    аудиторский артефакт full_pack не попадает.
 
     Пакет должен быть JSON-сериализуем целиком (это и есть будущее тело запроса
     к API) — используются только примитивы, списки и словари, никаких
@@ -504,18 +535,24 @@ def build_input_pack(
     """
     defaults = defaults or {}
     degradation_report = _load_degradation_report(paths)
-    analysis_candidates, excluded_candidates, detected_candidates = _project_analysis_candidates(
-        _load_json_artifact(paths, "analysis_candidates") or {
-            "columns": [], "rows": [], "coverage": {}
-        }
-    )
-    compact_context = {
-        stem: _compact_funnels(payload) if stem == "funnels" else payload
+    raw_candidates = _load_json_artifact(paths, "analysis_candidates") or {
+        "columns": [], "rows": [], "coverage": {}
+    }
+    raw_context = {
+        stem: payload
         for stem in _COMPACT_CONTEXT_ARTIFACTS
         if (payload := _load_json_artifact(paths, stem)) is not None
     }
-    byte_cap = int(defaults.get("analyze_input_pack_byte_cap") or INPUT_PACK_BYTE_CAP)
-    pack = {
+    inputs = _load_inputs(paths)
+    analysis_candidates, excluded_candidates, detected_candidates = _project_analysis_candidates(
+        raw_candidates
+    )
+    compact_context = {
+        stem: _compact_funnels(payload) if stem == "funnels" else payload
+        for stem, payload in raw_context.items()
+    }
+    byte_cap = resolve_byte_cap(defaults)
+    common_sections = {
         "client_context": _client_context(config),
         "check_names": {
             c.get("id"): c.get("name")
@@ -523,10 +560,6 @@ def build_input_pack(
             if c.get("id")
         },
         "known_check_ids": sorted(schemas.known_check_ids(methodology)),
-        "analysis_candidates": analysis_candidates,
-        "compact_context": compact_context,
-        "inputs": _load_inputs(paths),
-        "degradation": _compact_degradation(degradation_report),
         "constraints": {
             "sample_size_rule": {
                 "min_sample_visits": defaults.get("min_sample_visits"),
@@ -537,15 +570,51 @@ def build_input_pack(
             "max_findings_per_run": schemas.MAX_FINDINGS_PER_RUN,
             "currency_round": defaults.get("currency_round", 0),
         },
+    }
+    pack = {
+        **copy.deepcopy(common_sections),
+        "analysis_candidates": analysis_candidates,
+        "compact_context": compact_context,
+        "inputs": inputs,
+        "degradation": _compact_degradation(degradation_report),
         "coverage": {"source": analysis_candidates.get("coverage") or {}},
         "excluded_candidates": excluded_candidates,
-        "audit": {"byte_cap": byte_cap},
+        "audit": {"byte_cap": byte_cap, "warn_bytes": resolve_warn_bytes(defaults)},
     }
+    full_pack = {
+        **common_sections,
+        "analysis_candidates": raw_candidates,
+        "compact_context": raw_context,
+        "inputs": inputs,
+        "degradation": degradation_report,
+    }
+    # send_pack режется byte-cap'ом по месту — у full_pack должны быть свои
+    # копии секций, иначе удаление секции из send_pack «схлопнет» и корпус.
+    full_pack = copy.deepcopy(full_pack)
+
     system_prompt = build_system_prompt(defaults)
     _apply_byte_cap(
         pack, byte_cap, system_prompt, detected=detected_candidates
     )
+    if return_full:
+        return pack, full_pack
     return pack
+
+
+def build_validation_corpus(full_pack: dict[str, Any]) -> dict[str, Any]:
+    """Корпус для validate_finding_evidence(inputs=...) из ПОЛНОГО пакета.
+
+    Числа в evidence и money_amount_rub по-прежнему сверяются с
+    data/metrics/<check_id>.json (см. validate_findings.py); этот корпус
+    подтверждает только числа в assumptions, поэтому он обязан браться из
+    full_pack: иначе любое сжатие отправляемого пакета молча ужесточало бы
+    валидацию и отбраковывало корректные находки.
+    """
+    return {
+        **(full_pack.get("inputs") or {}),
+        "analysis_candidates": full_pack.get("analysis_candidates") or {},
+        "compact_context": full_pack.get("compact_context") or {},
+    }
 
 
 # ── Системный промт ─────────────────────────────────────────────────────────
@@ -809,6 +878,14 @@ def _group_findings(findings: list[schemas.Finding]) -> list[schemas.Finding]:
     return list(grouped.values())
 
 
+def _warn(log: Any, message: str) -> None:
+    """Предупреждение стадии: в лог стадии, если он передан, иначе в logging."""
+    if callable(log):
+        log(f"WARNING: {message}")
+    else:
+        _LOGGER.warning(message)
+
+
 REJECTED_DIRNAME = "rejected"
 
 
@@ -839,6 +916,7 @@ def draft(
     methodology: dict[str, Any],
     *,
     client: Any = None,
+    log: Any = None,
 ) -> list[str]:
     """Собрать входной пакет, вызвать модель и записать находки в findings/draft/.
 
@@ -856,6 +934,8 @@ def draft(
     (для ручного разбора аналитиком, не для повторной генерации).
 
     ``client`` — точка подмены для тестов, см. _call_llm.
+    ``log`` — вызываемый логгер стадии (orchestrator.StageLogger); если не
+    передан, предупреждения уходят в logging этого модуля.
 
     Возвращает список записанных имён файлов в findings/draft/ (не в
     rejected/): аудиторский артефакт + карточки прошедших валидацию находок.
@@ -863,10 +943,14 @@ def draft(
     paths.findings_draft.mkdir(parents=True, exist_ok=True)
     defaults = orchestrator_mod.load_defaults()
 
-    pack = build_input_pack(paths, config, methodology, defaults)
+    pack, full_pack = build_input_pack(
+        paths, config, methodology, defaults, return_full=True
+    )
     system_prompt = build_system_prompt(defaults)
 
     out_path = Path(paths.findings_draft) / INPUT_PACK_ARTIFACT_NAME
+    # Аудиторский артефакт — точный слепок ОТПРАВЛЕННОГО тела (send_pack +
+    # system_prompt). full_pack в него не подмешивается.
     serialized_pack = json.dumps(
         {**pack, "system_prompt": system_prompt},
         ensure_ascii=False,
@@ -877,6 +961,13 @@ def draft(
         raise RuntimeError(
             f"финальный analyze input-pack = {final_size} байт, "
             f"cap = {pack['audit']['byte_cap']} байт"
+        )
+    warn_bytes = pack["audit"].get("warn_bytes") or resolve_warn_bytes(defaults)
+    if final_size >= warn_bytes:
+        _warn(
+            log,
+            f"analyze input-pack = {final_size} байт при пороге предупреждения "
+            f"{warn_bytes} байт (cap = {pack['audit']['byte_cap']} байт)",
         )
     out_path.write_text(serialized_pack, encoding="utf-8")
     written = [out_path.name]
@@ -889,6 +980,7 @@ def draft(
         if isinstance(item, dict) and isinstance(item.get("check_id"), str)
     }
     source_metrics = _load_source_metrics(paths, returned_check_ids)
+    validation_corpus = build_validation_corpus(full_pack)
 
     known_ids = schemas.known_check_ids(methodology)
     degradation_report = _load_degradation_report(paths)
@@ -911,11 +1003,7 @@ def draft(
         errors += validate_findings_mod.validate_finding_evidence(
             finding,
             metrics=source_metrics,
-            inputs={
-                **pack["inputs"],
-                "analysis_candidates": pack["analysis_candidates"],
-                "compact_context": pack["compact_context"],
-            },
+            inputs=validation_corpus,
             degradation_report=degradation_report,
         )
         if errors:

@@ -285,7 +285,7 @@ def test_real_p10_stress_pack_keeps_638_candidates_under_final_cap(tmp_path):
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8"))
-    assert pack["audit"]["byte_cap"] == 100_000
+    assert pack["audit"]["byte_cap"] == draft_findings.INPUT_PACK_BYTE_CAP
     assert final_size == pack["audit"]["final_serialized_bytes"]
     assert final_size < 100_000
     assert pack["coverage"]["included_check_ids"] == ["C06", "S06"]
@@ -444,3 +444,194 @@ def test_batch_within_limit_and_valid_has_no_errors():
         findings, methodology=METHODOLOGY, confidence_caps={"A04": "MED"}
     )
     assert errors == []
+
+
+# ── 7. PACK-0: byte-cap в конфиге + корпус валидации из full_pack ──────────
+# Сжатие/урезание отправляемого пакета не имеет права ужесточать проверку
+# assumptions: числа сверяются с полным собранным пакетом (full_pack), а в
+# модель и в аудиторский артефакт уходит send_pack.
+
+def test_byte_cap_and_warn_bytes_come_from_defaults_with_constant_fallback(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_candidates(paths, [["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}]])
+
+    from_defaults = draft_findings.build_input_pack(
+        paths, CONFIG, METHODOLOGY,
+        {**DEFAULTS, "analyze_input_pack_byte_cap": 77_000,
+         "analyze_input_pack_warn_bytes": 55_000},
+    )
+    assert from_defaults["audit"]["byte_cap"] == 77_000
+    assert from_defaults["audit"]["warn_bytes"] == 55_000
+
+    # DEFAULTS этих ключей не несёт -> константы модуля
+    fallback = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+    assert fallback["audit"]["byte_cap"] == draft_findings.INPUT_PACK_BYTE_CAP
+    assert fallback["audit"]["warn_bytes"] == draft_findings.INPUT_PACK_WARN_BYTES
+    assert draft_findings.resolve_byte_cap({}) == draft_findings.INPUT_PACK_BYTE_CAP
+    assert draft_findings.resolve_warn_bytes(None) == draft_findings.INPUT_PACK_WARN_BYTES
+
+
+def test_project_defaults_yaml_carries_pack_size_keys():
+    from src.pipeline import orchestrator
+
+    defaults = orchestrator.load_defaults()
+    assert defaults["analyze_input_pack_byte_cap"] == 150_000
+    assert defaults["analyze_input_pack_warn_bytes"] == 120_000
+
+
+def _write_oversized_optional_input(paths: _Paths, marker_number: int) -> None:
+    """inputs/optional_context.yaml, который заведомо не влезает в byte-cap."""
+    paths.inputs.mkdir(parents=True, exist_ok=True)
+    (paths.inputs / "optional_context.yaml").write_text(
+        f"contacts_total: {marker_number}\ncomment: '" + "я" * 120_000 + "'\n",
+        encoding="utf-8",
+    )
+
+
+def test_full_pack_keeps_sections_cut_from_send_pack(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_candidates(paths, [["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}]])
+    _write_oversized_optional_input(paths, 123456)
+
+    send_pack, full_pack = draft_findings.build_input_pack(
+        paths, CONFIG, METHODOLOGY, DEFAULTS, return_full=True
+    )
+
+    assert "inputs.optional_context" in send_pack["audit"]["omitted_context"]
+    assert "optional_context" not in send_pack["inputs"]
+    assert full_pack["inputs"]["optional_context"]["contacts_total"] == 123456
+    corpus = draft_findings.build_validation_corpus(full_pack)
+    assert corpus["optional_context"]["contacts_total"] == 123456
+
+
+class _CapturingResponses:
+    def __init__(self, findings_payload, capture):
+        self._payload = findings_payload
+        self.capture = capture
+
+    def create(self, **kwargs):
+        self.capture.append(kwargs)
+        return types.SimpleNamespace(
+            output_text=json.dumps({"findings": self._payload}, ensure_ascii=False)
+        )
+
+
+class _CapturingClient:
+    def __init__(self, findings_payload, capture):
+        self.responses = _CapturingResponses(findings_payload, capture)
+
+
+def _finding_payload(**overrides) -> dict:
+    base = dict(
+        check_id="A04",
+        name="Кампания расходует деньги и не даёт ни одной чистой конверсии",
+        status="подтверждена",
+        confidence="MED",
+        significant=True,
+        period="2025-07..2026-06",
+        segment=None,
+        data_source="Директ + Метрика",
+        evidence="Кампания 'Х' потратила 10 000 ₽, чистых конверсий 0 за 6 месяцев",
+        control_metric=None,
+        what_is_distorted="Бюджет уходит на кампанию без результата",
+        money_category="potentially_excludable_spend",
+        money_amount_rub=10000.0,
+        money_not_assessable=False,
+        assumptions=[],
+        recommended_action="Остановить или пересобрать кампанию",
+        how_to_measure="Сравнить CPA/конверсии после изменения за аналогичный период",
+        what_cannot_be_concluded="Нельзя утверждать, что кампания никогда не сработает",
+        source_check_ids=[],
+    )
+    base.update(overrides)
+    return base
+
+
+def _prepare_a04_client(paths: _Paths) -> None:
+    _write_degradation(paths, [{"check_id": "A04", "runnable": True, "confidence_cap": "MED"}])
+    _write_json(paths.metrics, "a04", [{
+        "check_id": "A04",
+        "cost_normalized_rub": 10000.0,
+        "net_conversions": 0,
+        "period_months": 6,
+        "confidence": "MED",
+    }])
+
+
+def test_assumption_confirmed_only_by_dropped_section_is_not_rejected(tmp_path):
+    paths = _Paths(tmp_path)
+    _prepare_a04_client(paths)
+    _write_oversized_optional_input(paths, 123456)
+    payload = [_finding_payload(assumptions=["Всего обращений за период — 123456"])]
+    capture: list[dict] = []
+
+    names = draft_findings.draft(
+        paths, CONFIG, METHODOLOGY, client=_CapturingClient(payload, capture)
+    )
+
+    sent_pack = json.loads(capture[0]["input"][0]["content"].partition("\n\n")[2])
+    # число подтверждается только секцией, вырезанной byte-cap'ом из send_pack
+    assert "optional_context" not in sent_pack["inputs"]
+    assert "123456" not in json.dumps(sent_pack, ensure_ascii=False)
+    assert names == [draft_findings.INPUT_PACK_ARTIFACT_NAME, "F-A-01.yaml"]
+    assert not (paths.findings_draft / draft_findings.REJECTED_DIRNAME).exists()
+
+
+def test_hallucinated_assumption_still_rejected_after_split(tmp_path):
+    paths = _Paths(tmp_path)
+    _prepare_a04_client(paths)
+    payload = [_finding_payload(assumptions=["Средний чек взят как 987654 ₽"])]
+
+    names = draft_findings.draft(paths, CONFIG, METHODOLOGY, client=_MockClient(payload))
+
+    assert names == [draft_findings.INPUT_PACK_ARTIFACT_NAME]
+    rejected = sorted((paths.findings_draft / draft_findings.REJECTED_DIRNAME).glob("*.yaml"))
+    assert len(rejected) == 1
+
+
+def test_audit_artifact_equals_sent_body(tmp_path):
+    paths = _Paths(tmp_path)
+    _prepare_a04_client(paths)
+    _write_oversized_optional_input(paths, 123456)
+    capture: list[dict] = []
+
+    draft_findings.draft(paths, CONFIG, METHODOLOGY, client=_CapturingClient([], capture))
+
+    artifact = json.loads(
+        (paths.findings_draft / draft_findings.INPUT_PACK_ARTIFACT_NAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    sent_pack = json.loads(capture[0]["input"][0]["content"].partition("\n\n")[2])
+    assert artifact["system_prompt"] == capture[0]["instructions"]
+    assert {k: v for k, v in artifact.items() if k != "system_prompt"} == sent_pack
+
+
+def test_pack_over_warn_bytes_logs_warning_without_raising(tmp_path):
+    paths = _Paths(tmp_path)
+    _prepare_a04_client(paths)
+    messages: list[str] = []
+
+    draft_findings.draft(
+        paths, CONFIG, METHODOLOGY, client=_MockClient([]),
+        log=lambda message="": messages.append(message),
+    )
+    assert not any("WARNING" in message for message in messages)
+
+    # тот же прогон, но с порогом ниже фактического размера пакета
+    import src.pipeline.orchestrator as orchestrator
+
+    real_defaults = orchestrator.load_defaults()
+    original = draft_findings.orchestrator_mod.load_defaults
+    draft_findings.orchestrator_mod.load_defaults = lambda: {
+        **real_defaults, "analyze_input_pack_warn_bytes": 10,
+    }
+    try:
+        draft_findings.draft(
+            paths, CONFIG, METHODOLOGY, client=_MockClient([]),
+            log=lambda message="": messages.append(message),
+        )
+    finally:
+        draft_findings.orchestrator_mod.load_defaults = original
+
+    assert any("WARNING" in message for message in messages)

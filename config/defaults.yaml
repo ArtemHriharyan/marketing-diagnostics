@@ -22,6 +22,21 @@ manual_source_confidence_cap: "MED"   # ни одна проверка, чьи r
                                        # источником с mode=manual, не получает
                                        # confidence=HIGH, даже при значимом p-value
 
+analyze_input_pack_byte_cap: 150000   # жёсткий потолок тела запроса analyze
+                                       # (send_pack + system_prompt, UTF-8).
+                                       # ≈68 тыс. токенов при 2.2 байта/токен —
+                                       # запас к контекстному окну модели с
+                                       # учётом ответа (LLM_MAX_TOKENS).
+                                       # Превышение после урезания контекста —
+                                       # ошибка стадии.
+analyze_input_pack_warn_bytes: 120000  # мягкий порог: пакет ещё отправляется,
+                                       # но в лог стадии пишется WARNING —
+                                       # сигнал, что пора сжимать пакет.
+                                       # На проверку assumptions ни один из
+                                       # порогов не влияет: корпус сверки
+                                       # берётся из полного пакета
+                                       # (draft_findings.build_validation_corpus).
+
 crux_min_field_data: true             # если CrUX не отдал полевые данные —
                                        # находки CWV капаются в MED автоматически
 
