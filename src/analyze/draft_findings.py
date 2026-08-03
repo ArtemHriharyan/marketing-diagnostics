@@ -359,21 +359,43 @@ def _set_pack_size(pack: dict[str, Any], system_prompt: str) -> int:
 
 
 def _refresh_coverage(pack: dict[str, Any], *, detected: int) -> None:
+    """Пересчитать coverage по ФАКТИЧЕСКОМУ состоянию pack (после обрезки).
+
+    Вызывается после `_truncate_candidate_groups` (см. `_apply_byte_cap`):
+    `candidate_count` группы — исходный размер (до обрезки, не меняется),
+    а реально отправленные поимённо кандидаты и свёрнутые в tail_aggregate —
+    читаются из текущего segments каждой группы. Это та же арифметика, что и
+    в `audit.truncated_candidate_groups` (обе секции читают один и тот же
+    tail_aggregate), поэтому расхождения между ними невозможны.
+    """
     coverage = pack["coverage"]
     candidates = pack.get("analysis_candidates") or {}
     columns = candidates.get("columns") or []
     rows = candidates.get("rows") or []
     check_index = columns.index("check_id") if "check_id" in columns else -1
     count_index = columns.index("candidate_count") if "candidate_count" in columns else -1
-    included = sum(
-        int(row[count_index])
-        for row in rows
-        if isinstance(row, list) and count_index >= 0 and len(row) > count_index
-    )
+    segments_index = columns.index("segments") if "segments" in columns else -1
+
+    available_total = 0
+    aggregated_total = 0
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        if count_index >= 0 and len(row) > count_index:
+            available_total += int(row[count_index] or 0)
+        if segments_index >= 0 and len(row) > segments_index:
+            segments = row[segments_index] if isinstance(row[segments_index], dict) else {}
+            tail = segments.get("tail_aggregate") or {}
+            aggregated_total += int(tail.get("truncated_candidates") or 0)
+
     coverage["candidates_detected"] = detected
-    coverage["candidates_included"] = included
-    coverage["candidates_excluded"] = detected - included
-    coverage["candidates_omitted"] = detected - included
+    coverage["candidates_included"] = available_total - aggregated_total
+    coverage["candidates_excluded"] = detected - available_total
+    coverage["candidates_omitted"] = aggregated_total
+    if aggregated_total:
+        coverage["candidates_aggregated"] = aggregated_total
+    else:
+        coverage.pop("candidates_aggregated", None)
     coverage["candidate_groups"] = len(rows)
     check_ids = [
         row[check_index]
@@ -474,36 +496,69 @@ def _truncate_candidate_groups(
     top_n: int,
     impact_keys: list[str],
 ) -> int:
-    """Обрезать самые крупные группы кандидатов до попадания в cap.
+    """Прогрессивная обрезка кандидатов до попадания пакета в cap.
 
     Последний эшелон: вызывается, только когда весь опциональный контекст уже
-    снят, а пакет всё ещё не влезает. Группы обрабатываются по убыванию размера
-    и обрезаются не глубже необходимого — цикл прерывается сразу, как пакет
-    уложился в cap. Каждая обрезка фиксируется в pack["audit"].
+    снят, а пакет всё ещё не влезает.
+
+    Проход 1 — top_n применяется разом ко ВСЕМ группам (не только к тем, что
+    превышают его по отдельности): клиент с сотнями мелких групп, ни одна из
+    которых не превышает top_n, тоже должен пройти через снижение N, а не
+    пропустить обрезку целиком.
+
+    Если после этого пакет всё ещё вне cap, N снижается одинаковыми шагами
+    сразу для ВСЕХ групп (не по одной группе за раз — иначе порядок обработки
+    влиял бы на промежуточный результат при одинаковом финале), пока пакет не
+    уложится либо N не дойдёт до 0 — тогда группа схлопывается целиком в один
+    агрегат (`tail_aggregate` на всю группу, 0 кандидатов в segments.rows).
+
+    Каждый уровень N применяется заново к ИСХОДНОМУ (до обрезки) состоянию
+    группы, а не к уже обрезанному — иначе повторное снижение теряло бы
+    данные для агрегата (сумма/мин/макс отброшенного хвоста).
+
+    Порядок групп стабилен: сортировка по (check_id, candidate_reason).
     """
     rows = (pack.get("analysis_candidates") or {}).get("rows") or []
+    if not rows:
+        return _set_pack_size(pack, system_prompt)
+
     order = sorted(
         range(len(rows)),
-        key=lambda position: (
-            -len((rows[position][4] or {}).get("rows") or []),
-            -_json_size(rows[position]),
-            str(rows[position][0]),
-            str(rows[position][1]),
-        ),
+        key=lambda position: (str(rows[position][0]), str(rows[position][1])),
     )
-    final_size = _set_pack_size(pack, system_prompt)
-    aggregated = 0
-    for position in order:
-        if final_size < byte_cap:
-            break
-        entry = _truncate_group(rows[position], top_n, impact_keys)
-        if entry is None:
-            continue
-        pack["audit"]["truncated_candidate_groups"].append(entry)
-        aggregated += entry["candidates_aggregated"]
-        final_size = _set_pack_size(pack, system_prompt)
-    if aggregated:
-        pack["coverage"]["candidates_aggregated"] = aggregated
+    original_segments = {
+        position: copy.deepcopy(rows[position][4] if isinstance(rows[position][4], dict) else {})
+        for position in order
+    }
+
+    def apply_n(n: int) -> dict[int, dict[str, Any]]:
+        entries: dict[int, dict[str, Any]] = {}
+        for position in order:
+            packed_row = rows[position]
+            packed_row[4] = copy.deepcopy(original_segments[position])
+            entry = _truncate_group(packed_row, n, impact_keys)
+            if entry is not None:
+                entries[position] = entry
+        return entries
+
+    def apply_and_size(n: int) -> int:
+        # audit.truncated_candidate_groups обновляется ДО замера размера —
+        # иначе возвращаемый final_size не учитывал бы вес самого audit-списка
+        # (для сотен групп это не мелочь) и мог соврать о фактической
+        # укладке пакета в cap.
+        entries = apply_n(n)
+        pack["audit"]["truncated_candidate_groups"] = [
+            entries[position] for position in order if position in entries
+        ]
+        return _set_pack_size(pack, system_prompt)
+
+    final_size = apply_and_size(top_n)
+
+    n = top_n
+    while final_size >= byte_cap and n > 0:
+        n = n // 2
+        final_size = apply_and_size(n)
+
     return final_size
 
 
@@ -519,7 +574,6 @@ def _apply_byte_cap(
     pack["audit"]["byte_cap_exceeded"] = False
     pack["audit"]["omitted_context"] = []
     pack["audit"]["truncated_candidate_groups"] = []
-    _refresh_coverage(pack, detected=detected)
     final_size = _set_pack_size(pack, system_prompt)
 
     candidates = pack.get("analysis_candidates") or {}
@@ -549,13 +603,20 @@ def _apply_byte_cap(
             impact_keys=resolve_candidate_impact_keys(defaults),
         )
 
+    # coverage пересчитывается ПОСЛЕ обрезки кандидатных групп — иначе
+    # candidates_included/omitted описывали бы пакет ДО обрезки, хотя в
+    # модель и в аудиторский артефакт уходит уже обрезанное состояние.
+    _refresh_coverage(pack, detected=detected)
+    final_size = _set_pack_size(pack, system_prompt)
+
     pack["audit"]["byte_cap_exceeded"] = final_size >= byte_cap
     final_size = _set_pack_size(pack, system_prompt)
     if final_size >= byte_cap:
         raise ValueError(
-            "конфигурационная ошибка: даже полная обрезка кандидатов до top-N "
-            "не укладывает пакет analyze в byte-cap — поднимите "
-            "analyze_input_pack_byte_cap или снизьте analyze_candidate_top_n"
+            "конфигурационная ошибка: даже полное схлопывание всех групп "
+            "кандидатов в агрегаты (прогрессивное снижение top-N до 0) не "
+            "укладывает пакет analyze в byte-cap — поднимите "
+            "analyze_input_pack_byte_cap"
         )
 
 
@@ -739,9 +800,17 @@ def resolve_warn_bytes(defaults: dict[str, Any] | None = None) -> int:
 
 
 def resolve_candidate_top_n(defaults: dict[str, Any] | None = None) -> int:
-    """Сколько кандидатов группы отправляется поимённо при последней обрезке."""
-    value = (defaults or {}).get("analyze_candidate_top_n")
-    return max(1, int(value)) if value else CANDIDATE_TOP_N
+    """Сколько кандидатов группы отправляется поимённо при последней обрезке.
+
+    Явный `analyze_candidate_top_n: 0` в конфиге — предельное сжатие (группа
+    сразу схлопывается в один агрегат), а не отсутствие настройки: `value or
+    default` не отличает «ключа нет» от «ключ есть и равен 0» (0 — falsy),
+    поэтому наличие ключа проверяется явно, а не через истинность значения.
+    """
+    defaults = defaults or {}
+    if "analyze_candidate_top_n" not in defaults or defaults["analyze_candidate_top_n"] is None:
+        return CANDIDATE_TOP_N
+    return max(0, int(defaults["analyze_candidate_top_n"]))
 
 
 def resolve_candidate_impact_keys(defaults: dict[str, Any] | None = None) -> list[str]:
@@ -921,6 +990,9 @@ def build_system_prompt(defaults: dict[str, Any] | None = None) -> str:
          constraints во входном пакете); исключение — client-HIGH.
       8. check_id — только из known_check_ids входного пакета (новый реестр
          D/A/T/C/S), не из legacy-нумерации.
+      9. Если у группы кандидатов проверки есть tail_aggregate — список по
+         ней неполный: не достраивать и не экстраполировать недостающих
+         кандидатов, не заявлять полноту охвата по этой проверке.
     """
     defaults = defaults or {}
     min_sample = defaults.get("min_sample_visits", 500)
@@ -959,7 +1031,12 @@ def build_system_prompt(defaults: dict[str, Any] | None = None) -> str:
         "источника.\n"
         "8. Придумывать check_id. Используй только ID из known_check_ids входного пакета "
         "(буква блока D/A/T/C/S + номер, напр. A07) — старые числовые ID (0.1, 2.2…) в "
-        "этом слое не используются.\n\n"
+        "этом слое не используются.\n"
+        "9. Если у группы кандидатов проверки в analysis_candidates есть tail_aggregate — "
+        "список кандидатов по ней неполный (обрезан byte-cap'ом). Не достраивай и не "
+        "экстраполируй недостающих кандидатов, не заявляй в находке полный охват по этой "
+        "проверке; если нужна сумма/диапазон по хвосту — используй truncated_sum/"
+        "truncated_min/truncated_max явно как агрегат, а не как полный список.\n\n"
         "Каждая находка заполняется по единой карточке (каталог v2, §12) и обязана нести "
         "money_category (или money_not_assessable=true, если сумму в рублях оценить нельзя)."
     )

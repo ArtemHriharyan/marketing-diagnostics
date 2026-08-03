@@ -475,6 +475,119 @@ def test_impossible_cap_is_a_configuration_error(tmp_path):
         raise AssertionError("ожидался ValueError о конфигурационной ошибке")
 
 
+# ── 2c. PACK-2-FIX-1: прогрессивная обрезка (B1) + согласованный coverage (B2)
+
+def _write_many_small_groups(
+    paths: _Paths, *, num_groups: int, per_group: int, detail_len: int
+) -> int:
+    """Много мелких групп кандидатов, ни одна не превышает top_n=25 сама по
+    себе (кейс из review: 400 групп по 10 — прежний однопроходный алгоритм
+    проходил мимо такого клиента целиком и падал тем же исключением, которое
+    PACK-2 должен был устранять). Возвращает исходное общее число кандидатов.
+    """
+    columns = [*CANDIDATE_COLUMNS, "candidate_reason", "segment", "row_ref", "context_refs"]
+    rows = []
+    for group_index in range(num_groups):
+        reason = f"reason_{group_index:04d}"
+        for item_index in range(per_group):
+            decoded = {
+                "check_id": "C06", "row_role": "candidate", "candidate": True,
+                "status": "ok", "confidence": "HIGH", "significant": True,
+                "payload": {
+                    "gap_visits": item_index + group_index,
+                    "detail": ("x" * detail_len) + str(item_index),
+                },
+                "candidate_reason": reason,
+                "segment": f"landing_page=/cars/{group_index}/{item_index}",
+                "row_ref": f"c06-{group_index}-{item_index}", "context_refs": [],
+            }
+            rows.append([decoded.get(column) for column in columns])
+    _write_json(paths.metrics, "analysis_candidates", {
+        "columns": columns, "rows": rows, "coverage": {"checks_calculated": 1},
+    })
+    return len(rows)
+
+
+def test_many_small_groups_below_top_n_collapse_progressively(tmp_path):
+    paths = _Paths(tmp_path)
+    total = _write_many_small_groups(paths, num_groups=200, per_group=10, detail_len=100)
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+
+    assert pack["audit"]["final_serialized_bytes"] < pack["audit"]["byte_cap"]
+    assert pack["audit"]["byte_cap_exceeded"] is False
+    assert len(pack["analysis_candidates"]["rows"]) == 200
+    assert pack["audit"]["truncated_candidate_groups"]
+
+    top_n = draft_findings.resolve_candidate_top_n(DEFAULTS)
+    for row in pack["analysis_candidates"]["rows"]:
+        # ни одна группа не превышала top_n=25 сама по себе (в ней 10
+        # кандидатов) — обрезка сработала только за счёт снижения N (B1)
+        assert row[2] < top_n
+        assert row[4]["rows"] == []
+        tail = row[4]["tail_aggregate"]
+        assert tail["truncated_candidates"] == row[2]
+
+    assert pack["coverage"]["candidates_included"] == 0
+    assert pack["coverage"]["candidates_omitted"] == total
+    assert pack["coverage"]["candidates_aggregated"] == total
+
+    # детерминизм: повторная сборка даёт байт-в-байт тот же пакет
+    assert draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS) == pack
+
+
+def test_coverage_included_plus_omitted_equals_total_for_any_truncation_case(tmp_path):
+    # (а) обрезки не было
+    paths_a = _Paths(tmp_path / "a")
+    _write_candidates(paths_a, [
+        ["C06", "candidate", True, "ok", "HIGH", True, {"rate": 0.45}],
+        ["D01", "candidate", True, "ok", "HIGH", True, {"repeats": 3}],
+    ])
+    pack_a = draft_findings.build_input_pack(paths_a, CONFIG, METHODOLOGY, DEFAULTS)
+    assert pack_a["audit"]["truncated_candidate_groups"] == []
+    assert (
+        pack_a["coverage"]["candidates_included"] + pack_a["coverage"]["candidates_omitted"] == 2
+    )
+
+    # (б) частичная обрезка групп (клиент вдвое крупнее pognali)
+    paths_b = _Paths(tmp_path / "b")
+    _write_oversized_client(paths_b)
+    pack_b = draft_findings.build_input_pack(paths_b, CONFIG, METHODOLOGY, DEFAULTS)
+    assert pack_b["audit"]["truncated_candidate_groups"]
+    assert any(row[4]["rows"] for row in pack_b["analysis_candidates"]["rows"])
+    assert (
+        pack_b["coverage"]["candidates_included"] + pack_b["coverage"]["candidates_omitted"]
+        == 1276
+    )
+
+    # (в) полное схлопывание группы
+    paths_c = _Paths(tmp_path / "c")
+    total_c = _write_many_small_groups(paths_c, num_groups=200, per_group=10, detail_len=100)
+    pack_c = draft_findings.build_input_pack(paths_c, CONFIG, METHODOLOGY, DEFAULTS)
+    assert all(row[4]["rows"] == [] for row in pack_c["analysis_candidates"]["rows"])
+    assert (
+        pack_c["coverage"]["candidates_included"] + pack_c["coverage"]["candidates_omitted"]
+        == total_c
+    )
+
+
+def test_explicit_candidate_top_n_zero_is_not_replaced_by_default(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_oversized_client(paths)
+    defaults = {**DEFAULTS, "analyze_candidate_top_n": 0}
+
+    assert draft_findings.resolve_candidate_top_n(defaults) == 0
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, defaults)
+
+    truncated = {e["check_id"]: e for e in pack["audit"]["truncated_candidate_groups"]}
+    assert truncated
+    for row in pack["analysis_candidates"]["rows"]:
+        if row[0] in truncated:
+            assert row[4]["rows"] == []
+            assert truncated[row[0]]["candidates_sent"] == 0
+
+
 # ── 3. draft(): аудиторский артефакт всегда пишется первым ─────────────────
 # Задача 6B подключила вызов модели (см. tests/test_analyze_draft_findings_llm.py
 # для сценариев с находками) — здесь только проверяем, что при пустом ответе
@@ -523,6 +636,7 @@ def test_system_prompt_contains_all_required_bans():
     assert "обвин" in lowered  # "обвинять"
     assert "confidence_cap" in prompt or "потолок" in lowered
     assert "check_id" in prompt
+    assert "tail_aggregate" in prompt
     for category in schemas.MONEY_CATEGORIES:
         assert category in prompt
 
