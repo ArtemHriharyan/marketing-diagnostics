@@ -1039,6 +1039,22 @@ def _resolve_int_default(defaults: dict[str, Any] | None, key: str, fallback: in
     return int(defaults[key])
 
 
+def _resolve_list_default(
+    defaults: dict[str, Any] | None, key: str, fallback: list[str]
+) -> list[str]:
+    """Списочный ключ defaults.yaml с отличением «ключа нет» от «пустой список».
+
+    Аналог `_resolve_int_default` для списков: `value or default` спутал бы
+    явный `[]` (falsy) с отсутствием настройки, а это разные решения —
+    пустой список означает осознанный отказ от ранжирования по влиянию.
+    """
+    defaults = defaults or {}
+    value = defaults.get(key)
+    if key not in defaults or value is None or not isinstance(value, list):
+        return list(fallback)
+    return [str(item) for item in value]
+
+
 def resolve_byte_cap(defaults: dict[str, Any] | None = None) -> int:
     """Байтовый потолок отправляемого пакета: defaults.yaml, иначе константа."""
     return _resolve_int_default(defaults, "analyze_input_pack_byte_cap", INPUT_PACK_BYTE_CAP)
@@ -1055,20 +1071,23 @@ def resolve_candidate_top_n(defaults: dict[str, Any] | None = None) -> int:
     Явный `analyze_candidate_top_n: 0` в конфиге — предельное сжатие (группа
     сразу схлопывается в один агрегат), а не отсутствие настройки: `value or
     default` не отличает «ключа нет» от «ключ есть и равен 0» (0 — falsy),
-    поэтому наличие ключа проверяется явно, а не через истинность значения.
+    поэтому наличие ключа проверяется явно, а не через истинность значения
+    (см. `_resolve_int_default`).
     """
-    defaults = defaults or {}
-    if "analyze_candidate_top_n" not in defaults or defaults["analyze_candidate_top_n"] is None:
-        return CANDIDATE_TOP_N
-    return max(0, int(defaults["analyze_candidate_top_n"]))
+    return max(0, _resolve_int_default(defaults, "analyze_candidate_top_n", CANDIDATE_TOP_N))
 
 
 def resolve_candidate_impact_keys(defaults: dict[str, Any] | None = None) -> list[str]:
-    """Приоритет полей влияния, по которым выбирается top-N кандидатов группы."""
-    value = (defaults or {}).get("analyze_candidate_impact_keys")
-    if isinstance(value, list) and value:
-        return [str(item) for item in value]
-    return list(CANDIDATE_IMPACT_KEYS)
+    """Приоритет полей влияния, по которым выбирается top-N кандидатов группы.
+
+    Тот же список задаёт и порядок объединения полностью схлопнутых групп на
+    втором эшелоне (`_collapsed_group_impact`) — критерий один на оба эшелона.
+    Явный пустой список — осознанный отказ от ранжирования (фолбэк
+    `row_order`), а не отсутствие настройки, см. `_resolve_list_default`.
+    """
+    return _resolve_list_default(
+        defaults, "analyze_candidate_impact_keys", list(CANDIDATE_IMPACT_KEYS)
+    )
 
 
 def build_input_pack(
@@ -1242,7 +1261,10 @@ def build_system_prompt(defaults: dict[str, Any] | None = None) -> str:
          D/A/T/C/S), не из legacy-нумерации.
       9. Если у группы кандидатов проверки есть tail_aggregate — список по
          ней неполный: не достраивать и не экстраполировать недостающих
-         кандидатов, не заявлять полноту охвата по этой проверке.
+         кандидатов, не заявлять полноту охвата по этой проверке. То же
+         касается check_id, оставшихся только в tail_aggregate.
+         merged_check_ids (второй эшелон byte-cap): ни одной строки по такой
+         проверке модель не видела, поимённое evidence по ней запрещено.
     """
     defaults = defaults or {}
     min_sample = defaults.get("min_sample_visits", 500)
@@ -1286,7 +1308,12 @@ def build_system_prompt(defaults: dict[str, Any] | None = None) -> str:
         "список кандидатов по ней неполный (обрезан byte-cap'ом). Не достраивай и не "
         "экстраполируй недостающих кандидатов, не заявляй в находке полный охват по этой "
         "проверке; если нужна сумма/диапазон по хвосту — используй truncated_sum/"
-        "truncated_min/truncated_max явно как агрегат, а не как полный список.\n\n"
+        "truncated_min/truncated_max явно как агрегат, а не как полный список. "
+        "То же правило действует и для check_id, которые перечислены только в "
+        "tail_aggregate.merged_check_ids: ни одного кандидата по такой проверке "
+        "в пакете нет вообще. По ней запрещено формулировать находку с поимённым "
+        "evidence — допустима только ссылка на объединённые агрегированные "
+        "показатели с явной пометкой неполноты данных.\n\n"
         "Каждая находка заполняется по единой карточке (каталог v2, §12) и обязана нести "
         "money_category (или money_not_assessable=true, если сумму в рублях оценить нельзя)."
     )
@@ -1573,7 +1600,12 @@ def draft(
             f"финальный analyze input-pack = {final_size} байт, "
             f"cap = {pack['audit']['byte_cap']} байт"
         )
-    warn_bytes = pack["audit"].get("warn_bytes") or resolve_warn_bytes(defaults)
+    # Читается напрямую, без or-фолбэка: значение уже прошло через
+    # resolve_warn_bytes при сборке пакета, и `or` подменял бы честно
+    # доехавший сюда явный 0 обратно на константу (четвёртый экземпляр
+    # falsy-паттерна, PACK-2-FIX-2). Отсутствие ключа — баг резолвера выше
+    # по коду, и KeyError об этом честнее молчаливой подстановки дефолта.
+    warn_bytes = pack["audit"]["warn_bytes"]
     if final_size >= warn_bytes:
         _warn(
             log,

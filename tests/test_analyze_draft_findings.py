@@ -339,11 +339,14 @@ def test_real_p10_stress_pack_keeps_638_candidates_under_final_cap(tmp_path):
 # ── 2b. PACK-2: последний эшелон byte-cap вместо исключения ────────────────
 
 def _oversized_candidate_rows() -> tuple[list[str], list[list]]:
-    """Синтетический клиент вдвое крупнее pognali: 1276 кандидатов, длинные URL.
+    """Клиент, заведомо не влезающий в byte-cap: 1276 кандидатов, длинные URL.
 
-    Отличие от _union_schema_candidate_rows — вдвое больше строк и реалистично
-    длинные сегменты (URL с ЧПУ), из-за чего одно только кандидатное ядро уже
-    не влезает в byte-cap. До PACK-2 такой клиент ронял стадию ValueError'ом.
+    Отличие от _union_schema_candidate_rows — вдвое больше строк, реалистично
+    длинные сегменты (URL с ЧПУ) и лишнее поле в каждой строке, из-за чего
+    одно только кандидатное ядро уже не влезает в byte-cap. Это НЕ «удвоенный
+    pognali»: дублирование строк реального клиента даёт ~46 800 байт и обрезку
+    не запускает вовсе — здесь нагрузка создаётся длиной строк, а не только их
+    числом. До PACK-2 такой клиент ронял стадию ValueError'ом.
     """
     base_columns = [
         *CANDIDATE_COLUMNS, "candidate_reason", "segment", "row_ref", "context_refs",
@@ -402,7 +405,14 @@ def _write_oversized_client(paths: _Paths) -> None:
     })
 
 
-def test_client_twice_the_size_of_pognali_truncates_instead_of_raising(tmp_path):
+def test_oversized_client_truncates_instead_of_raising(tmp_path):
+    """Клиент, заведомо не влезающий в cap, обрезается, а не роняет стадию.
+
+    Фикстура (_oversized_candidate_rows) — 1276 кандидатов с удлинёнными URL в
+    сегментах и лишним полем в строке; нагружает byte-cap длиной строк, а не
+    только их числом. Удвоенный по строкам pognali таким клиентом не является
+    (~46 800 байт, обрезка не срабатывает ни разу).
+    """
     paths = _Paths(tmp_path)
     _write_oversized_client(paths)
 
@@ -593,7 +603,7 @@ def test_coverage_included_plus_omitted_equals_total_for_any_truncation_case(tmp
         pack_a["coverage"]["candidates_included"] + pack_a["coverage"]["candidates_omitted"] == 2
     )
 
-    # (б) частичная обрезка групп (клиент вдвое крупнее pognali)
+    # (б) частичная обрезка групп (клиент, заведомо не влезающий в cap)
     paths_b = _Paths(tmp_path / "b")
     _write_oversized_client(paths_b)
     pack_b = draft_findings.build_input_pack(paths_b, CONFIG, METHODOLOGY, DEFAULTS)
@@ -858,6 +868,29 @@ def test_explicit_candidate_top_n_zero_is_not_replaced_by_default(tmp_path):
             assert truncated[row[0]]["candidates_sent"] == 0
 
 
+def test_explicit_empty_impact_keys_fall_back_to_row_order(tmp_path):
+    """Явный пустой список полей влияния — отказ от ранжирования, не «ключа нет».
+
+    `value or default` не отличил бы `[]` от отсутствия настройки; при явном
+    пустом списке критерием обязан стать детерминированный row_order.
+    """
+    paths = _Paths(tmp_path)
+    _write_oversized_client(paths)
+
+    assert draft_findings.resolve_candidate_impact_keys(
+        {**DEFAULTS, "analyze_candidate_impact_keys": []}
+    ) == []
+    assert draft_findings.resolve_candidate_impact_keys({}) == \
+        list(draft_findings.CANDIDATE_IMPACT_KEYS)
+
+    pack = draft_findings.build_input_pack(
+        paths, CONFIG, METHODOLOGY, {**DEFAULTS, "analyze_candidate_impact_keys": []},
+    )
+    entries = pack["audit"]["truncated_candidate_groups"]
+    assert entries
+    assert all(entry["criterion"] == "row_order" for entry in entries)
+
+
 # ── 3. draft(): аудиторский артефакт всегда пишется первым ─────────────────
 # Задача 6B подключила вызов модели (см. tests/test_analyze_draft_findings_llm.py
 # для сценариев с находками) — здесь только проверяем, что при пустом ответе
@@ -909,6 +942,32 @@ def test_system_prompt_contains_all_required_bans():
     assert "tail_aggregate" in prompt
     for category in schemas.MONEY_CATEGORIES:
         assert category in prompt
+
+
+def test_system_prompt_covers_fully_merged_check_ids(tmp_path):
+    """Правило №9 покрывает check_id, оставшиеся только в merged_check_ids.
+
+    После второго эшелона такая проверка не имеет в пакете ни одной строки, но
+    остаётся в known_check_ids и check_names (они считаются до byte-cap).
+    Модель обязана получить и правило, и данные, чтобы его применить: правило
+    в system_prompt, merged_check_ids — в самом пакете.
+    """
+    paths = _Paths(tmp_path)
+    _write_many_small_groups(paths, num_groups=400, per_group=10, detail_len=100)
+
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, DEFAULTS)
+    prompt = draft_findings.build_system_prompt(DEFAULTS)
+
+    merged_ids = [
+        check_id
+        for row in pack["analysis_candidates"]["rows"]
+        for check_id in ((row[4].get("tail_aggregate") or {}).get("merged_check_ids") or [])
+    ]
+    assert merged_ids, "ожидалось сработавшее объединение групп второго эшелона"
+    assert "merged_check_ids" in prompt
+    assert "поимённым evidence" in prompt or "поимённое evidence" in prompt
+    # проверки объединённого элемента по-прежнему видны модели в реестрах
+    assert set(merged_ids) <= set(pack["known_check_ids"])
 
 
 # ── 5. schemas.Finding / validate_finding ────────────────────────────────────
@@ -1042,6 +1101,25 @@ def test_project_defaults_yaml_carries_pack_size_keys():
     defaults = orchestrator.load_defaults()
     assert defaults["analyze_input_pack_byte_cap"] == 150_000
     assert defaults["analyze_input_pack_warn_bytes"] == 120_000
+
+
+def test_project_defaults_yaml_carries_candidate_truncation_keys():
+    """Параметры обоих эшелонов обрезки настраиваются конфигом, а не кодом (B3).
+
+    load_defaults() отдаёт их наравне с остальными ключами — отдельного
+    проброса в draft()/build_input_pack не требуется.
+    """
+    from src.pipeline import orchestrator
+
+    defaults = orchestrator.load_defaults()
+    assert defaults["analyze_candidate_top_n"] == 25
+    assert defaults["analyze_candidate_impact_keys"] == list(
+        draft_findings.CANDIDATE_IMPACT_KEYS
+    )
+    assert draft_findings.resolve_candidate_top_n(defaults) == 25
+    assert draft_findings.resolve_candidate_impact_keys(defaults) == list(
+        draft_findings.CANDIDATE_IMPACT_KEYS
+    )
 
 
 def _write_oversized_optional_input(paths: _Paths, marker_number: int) -> None:
@@ -1200,6 +1278,43 @@ def test_pack_over_warn_bytes_logs_warning_without_raising(tmp_path):
         draft_findings.orchestrator_mod.load_defaults = original
 
     assert any("WARNING" in message for message in messages)
+
+
+def test_explicit_warn_bytes_zero_warns_on_any_pack_size(tmp_path):
+    """Интеграционный тест четвёртого falsy-экземпляра (PACK-2-FIX-2).
+
+    Тест на выход резолвера этот баг по построению не ловит: явный 0 честно
+    доезжал до pack["audit"]["warn_bytes"], а подменялся на константу уже
+    ВТОРОЙ точкой потребления — `... or resolve_warn_bytes(defaults)` в
+    draft(). Поэтому проверяется факт записи WARNING в лог стадии на заведомо
+    МАЛЕНЬКОМ пакете: при пороге 0 предупреждение обязано быть при любом
+    размере.
+    """
+    paths = _Paths(tmp_path)
+    _prepare_a04_client(paths)
+    messages: list[str] = []
+
+    import src.pipeline.orchestrator as orchestrator
+
+    real_defaults = orchestrator.load_defaults()
+    original = draft_findings.orchestrator_mod.load_defaults
+    draft_findings.orchestrator_mod.load_defaults = lambda: {
+        **real_defaults, "analyze_input_pack_warn_bytes": 0,
+    }
+    try:
+        draft_findings.draft(
+            paths, CONFIG, METHODOLOGY, client=_MockClient([]),
+            log=lambda message="": messages.append(message),
+        )
+    finally:
+        draft_findings.orchestrator_mod.load_defaults = original
+
+    artifact = (paths.findings_draft / draft_findings.INPUT_PACK_ARTIFACT_NAME)
+    pack_size = len(artifact.read_text(encoding="utf-8").encode("utf-8"))
+    assert pack_size < draft_findings.INPUT_PACK_WARN_BYTES, "пакет должен быть мал"
+    warnings = [message for message in messages if "WARNING" in message]
+    assert warnings, "при warn_bytes=0 WARNING обязан быть при любом размере пакета"
+    assert "пороге предупреждения 0 байт" in warnings[0]
 
 
 # ── 8. PACK-1: сжатие пакета без потери значимых значений ──────────────────
