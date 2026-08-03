@@ -381,6 +381,20 @@ def _oversized_candidate_rows() -> tuple[list[str], list[list]]:
     return columns, rows
 
 
+def _audit_by_check_id(entries: list[dict]) -> dict[str, dict]:
+    """Индекс записей audit.truncated_candidate_groups по check_id.
+
+    Записи двух форм (обычная — `check_id`, объединённая второго эшелона —
+    `merged_check_ids`), поэтому ключи читаются через
+    `draft_findings.audit_entry_check_ids`, а не из `entry["check_id"]`.
+    """
+    return {
+        check_id: entry
+        for entry in entries
+        for check_id in draft_findings.audit_entry_check_ids(entry)
+    }
+
+
 def _write_oversized_client(paths: _Paths) -> None:
     columns, rows = _oversized_candidate_rows()
     _write_json(paths.metrics, "analysis_candidates", {
@@ -401,15 +415,19 @@ def test_client_twice_the_size_of_pognali_truncates_instead_of_raising(tmp_path)
 
     # Обрезка видна модели: и в audit, и в самой группе кандидатов
     top_n = draft_findings.resolve_candidate_top_n(DEFAULTS)
+    # записи audit гетерогенны (check_id либо merged_check_ids) — читаются
+    # только через аксессор, он возвращает список в обеих формах
     for entry in truncations:
-        assert entry["check_id"] in {"C06", "S06"}
+        assert set(draft_findings.audit_entry_check_ids(entry)) <= {"C06", "S06"}
         assert entry["candidates_sent"] == top_n
         assert entry["candidates_aggregated"] > 0
         assert entry["criterion"] in {"payload.gap_visits", "payload.visits"}
     aggregated_total = sum(e["candidates_aggregated"] for e in truncations)
     assert pack["coverage"]["candidates_aggregated"] == aggregated_total
 
-    truncated_ids = {e["check_id"] for e in truncations}
+    truncated_ids = {
+        check_id for entry in truncations for check_id in draft_findings.audit_entry_check_ids(entry)
+    }
     for row in pack["analysis_candidates"]["rows"]:
         if row[0] not in truncated_ids:
             continue
@@ -448,7 +466,7 @@ def test_candidate_top_n_and_impact_keys_come_from_defaults(tmp_path):
          "analyze_candidate_impact_keys": ["payload.rate", "payload.gap_visits"]},
     )
 
-    entries = {e["check_id"]: e for e in pack["audit"]["truncated_candidate_groups"]}
+    entries = _audit_by_check_id(pack["audit"]["truncated_candidate_groups"])
     assert entries
     assert all(e["candidates_sent"] == 5 for e in entries.values())
     # payload.rate одинаков во всех строках C06 -> уезжает в common и критерием
@@ -627,6 +645,188 @@ def test_real_ceiling_still_raises_after_both_echelons(tmp_path):
         raise AssertionError("ожидался ValueError о конфигурационной ошибке")
 
 
+# ── 2d. PACK-2-FIX-1C: матрица «группы × кандидаты × check_id» ─────────────
+# Три раунда подряд фикстура была проще реальности по неучтённой оси, и дефект
+# «размер меряется не над тем объектом, который отправляется» каждый раз
+# воспроизводился в новой секции. Поэтому проверка варьирует ОБЕ оси
+# одновременно, а структурный инвариант меряется на ФИНАЛЬНОМ объекте — после
+# всех дозаписей coverage и audit.
+
+MATRIX_CHECK_IDS = [f"D{index:02d}" for index in range(1, 13)] + [
+    f"A{index:02d}" for index in range(1, 13)
+]
+METHODOLOGY_WIDE = {
+    "checks": [{"id": check_id, "name": f"Проверка {check_id}"} for check_id in MATRIX_CHECK_IDS]
+}
+
+
+def _write_matrix_client(
+    paths: _Paths, *, num_groups: int, per_group: int, num_check_ids: int
+) -> int:
+    """Клиент на `num_groups` групп по `per_group` кандидатов, `num_check_ids`
+    разных check_id, раскиданных по группам по кругу. Возвращает исходное общее
+    число кандидатов.
+    """
+    columns = [*CANDIDATE_COLUMNS, "candidate_reason", "segment", "row_ref", "context_refs"]
+    rows = []
+    for group_index in range(num_groups):
+        check_id = MATRIX_CHECK_IDS[group_index % num_check_ids]
+        reason = f"reason_{group_index:04d}"
+        for item_index in range(per_group):
+            decoded = {
+                "check_id": check_id, "row_role": "candidate", "candidate": True,
+                "status": "ok", "confidence": "HIGH", "significant": True,
+                "payload": {
+                    "gap_visits": item_index + group_index,
+                    "detail": ("x" * 100) + str(item_index),
+                },
+                "candidate_reason": reason,
+                "segment": f"landing_page=/cars/{group_index}/{item_index}",
+                "row_ref": f"{check_id.lower()}-{group_index}-{item_index}", "context_refs": [],
+            }
+            rows.append([decoded.get(column) for column in columns])
+    # фикстура обязана соответствовать докстрингу теста по обеим осям
+    assert len({row[0] for row in rows}) == num_check_ids
+    assert len(rows) == num_groups * per_group
+    _write_json(paths.metrics, "analysis_candidates", {
+        "columns": columns, "rows": rows,
+        "coverage": {"checks_calculated": num_check_ids},
+    })
+    return len(rows)
+
+
+def _assert_matrix_case(
+    paths: _Paths, *, num_groups: int, per_group: int, num_check_ids: int
+) -> dict:
+    """Единая проверка кейса матрицы: структурный инвариант + B2 + детерминизм.
+
+    Структурный инвариант меряется на ФИНАЛЬНОМ объекте (`len(json.dumps(pack))
+    <= cap`), а не на промежуточном состоянии внутри алгоритма — это ровно тот
+    тест, которого не хватало, чтобы поймать BLOCKER 1 раундом раньше.
+    """
+    total = _write_matrix_client(
+        paths, num_groups=num_groups, per_group=per_group, num_check_ids=num_check_ids
+    )
+    pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY_WIDE, DEFAULTS)
+
+    system_prompt = draft_findings.build_system_prompt(DEFAULTS)
+    actual = len(json.dumps(
+        {**pack, "system_prompt": system_prompt}, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8"))
+    cap = pack["audit"]["byte_cap"]
+    assert actual <= cap, f"пакет {actual} б вышел за cap {cap} б"
+    assert actual == pack["audit"]["final_serialized_bytes"]
+    assert pack["audit"]["byte_cap_exceeded"] is False
+
+    # B2: ни один кандидат не потерялся между included и omitted
+    coverage = pack["coverage"]
+    assert coverage["candidates_included"] + coverage["candidates_omitted"] == total
+
+    # audit гетерогенен (check_id / merged_check_ids) — читается через аксессор
+    audit_ids: set[str] = set()
+    for entry in pack["audit"]["truncated_candidate_groups"]:
+        entry_ids = draft_findings.audit_entry_check_ids(entry)
+        assert entry_ids
+        audit_ids.update(entry_ids)
+    assert audit_ids <= set(MATRIX_CHECK_IDS[:num_check_ids])
+    assert set(coverage["included_check_ids"]) == set(MATRIX_CHECK_IDS[:num_check_ids])
+
+    # детерминизм: повторный прогон даёт побайтово равный пакет
+    repeat = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY_WIDE, DEFAULTS)
+    dump = lambda value: json.dumps(  # noqa: E731
+        value, ensure_ascii=False, separators=(",", ":")
+    )
+    assert dump(repeat) == dump(pack)
+    return pack
+
+
+def test_matrix_400_groups_10_candidates_1_check_id(tmp_path):
+    """400 групп × 10 кандидатов × 1 check_id — кейс прошлого раунда."""
+    _assert_matrix_case(_Paths(tmp_path), num_groups=400, per_group=10, num_check_ids=1)
+
+
+def test_matrix_400_groups_10_candidates_4_check_ids(tmp_path):
+    """400 групп × 10 кандидатов × 4 check_id — главный кейс FIX-1C.
+
+    С одним check_id тот же кейс проходил с запасом ~123 байта, с четырьмя —
+    падал: `_refresh_coverage` дописывал в уже «уложившийся» пакет более
+    длинный `included_check_ids`.
+    """
+    _assert_matrix_case(_Paths(tmp_path), num_groups=400, per_group=10, num_check_ids=4)
+
+
+def test_matrix_400_groups_10_candidates_24_check_ids(tmp_path):
+    """400 групп × 10 кандидатов × 24 check_id — реалистично для pognali.rent."""
+    _assert_matrix_case(_Paths(tmp_path), num_groups=400, per_group=10, num_check_ids=24)
+
+
+def test_matrix_1500_groups_3_candidates_4_check_ids(tmp_path):
+    """1500 групп × 3 кандидата × 4 check_id — падал в ревью."""
+    _assert_matrix_case(_Paths(tmp_path), num_groups=1500, per_group=3, num_check_ids=4)
+
+
+def test_matrix_3000_groups_2_candidates_4_check_ids(tmp_path):
+    """3000 групп × 2 кандидата × 4 check_id — падал в ревью."""
+    _assert_matrix_case(_Paths(tmp_path), num_groups=3000, per_group=2, num_check_ids=4)
+
+
+def test_matrix_1000_groups_5_candidates_24_check_ids(tmp_path):
+    """1000 групп × 5 кандидатов × 24 check_id."""
+    _assert_matrix_case(_Paths(tmp_path), num_groups=1000, per_group=5, num_check_ids=24)
+
+
+def test_matrix_600_groups_10_candidates_4_check_ids(tmp_path):
+    """600 групп × 10 кандидатов × 4 check_id."""
+    _assert_matrix_case(_Paths(tmp_path), num_groups=600, per_group=10, num_check_ids=4)
+
+
+def test_matrix_ceiling_5000_groups_1_candidate_24_check_ids_raises(tmp_path):
+    """5000 групп × 1 кандидат × 24 check_id — реальный потолок, ValueError.
+
+    Группа из одного кандидата не имеет отличающихся колонок -> segments пуст,
+    схлопывать и объединять нечего. Числа в сообщении читаются из фактического
+    состояния пакета на момент броска.
+    """
+    paths = _Paths(tmp_path)
+    _write_matrix_client(paths, num_groups=5000, per_group=1, num_check_ids=24)
+
+    try:
+        draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY_WIDE, DEFAULTS)
+    except ValueError as error:
+        message = str(error)
+        assert "конфигурационная ошибка" in message
+        # объединять было нечего, и сообщение это и говорит — оно фактически
+        # верно, а не «исчерпано» при неполном объединении
+        assert "объединено схлопнутых групп: 0" in message
+        assert "5000 групп и 5000 поимённых" in message
+    else:  # pragma: no cover - защита от молчаливого прохода
+        raise AssertionError("ожидался ValueError о конфигурационной ошибке")
+
+
+def test_maximal_merge_is_forced_before_raising(tmp_path):
+    """Схлопнутые группы объединяются максимально до броска ValueError.
+
+    1500 групп × 3 кандидата × 4 check_id при заведомо недостижимом cap: все
+    1500 групп схлопываемы, значит на момент отказа объединены обязаны быть
+    все 1500, а не часть — иначе «оба эшелона исчерпаны» противоречит
+    собственным числам сообщения.
+    """
+    paths = _Paths(tmp_path)
+    _write_matrix_client(paths, num_groups=1500, per_group=3, num_check_ids=4)
+
+    try:
+        draft_findings.build_input_pack(
+            paths, CONFIG, METHODOLOGY_WIDE,
+            {**DEFAULTS, "analyze_input_pack_byte_cap": 2_000},
+        )
+    except ValueError as error:
+        message = str(error)
+        assert "объединено схлопнутых групп: 1500" in message
+        assert "в пакете осталось 1 групп" in message
+    else:  # pragma: no cover - защита от молчаливого прохода
+        raise AssertionError("ожидался ValueError о конфигурационной ошибке")
+
+
 def test_explicit_warn_bytes_zero_is_not_replaced_by_default(tmp_path):
     paths = _Paths(tmp_path)
     _write_candidates(paths, [
@@ -650,7 +850,7 @@ def test_explicit_candidate_top_n_zero_is_not_replaced_by_default(tmp_path):
 
     pack = draft_findings.build_input_pack(paths, CONFIG, METHODOLOGY, defaults)
 
-    truncated = {e["check_id"]: e for e in pack["audit"]["truncated_candidate_groups"]}
+    truncated = _audit_by_check_id(pack["audit"]["truncated_candidate_groups"])
     assert truncated
     for row in pack["analysis_candidates"]["rows"]:
         if row[0] in truncated:

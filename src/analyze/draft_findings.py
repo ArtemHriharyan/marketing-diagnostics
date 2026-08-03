@@ -358,6 +358,29 @@ def _set_pack_size(pack: dict[str, Any], system_prompt: str) -> int:
     return _json_size({**pack, "system_prompt": system_prompt})
 
 
+def _assemble_and_measure(
+    pack: dict[str, Any], system_prompt: str, *, detected: int
+) -> tuple[dict[str, Any], int]:
+    """Единственная точка замера byte-cap: собрать пакет ПОЛНОСТЬЮ и померить.
+
+    «Полностью» — значит вместе со всеми дозаписями, которые попадают в
+    отправляемый объект: `_refresh_coverage` и сходимость `_set_pack_size`
+    (audit.input_pack_bytes / final_serialized_bytes). Возвращается фактический
+    размер именно того объекта, который уйдёт в модель.
+
+    Зачем отдельной функцией: до PACK-2-FIX-1C каждый шаг byte-cap мерил
+    промежуточный результат, а coverage дописывался уже ПОСЛЕ того, как
+    алгоритм решил, что уложился, — и выталкивал пакет за cap. Тот же дефект
+    успел проявиться на `audit.truncated_candidate_groups` (FIX-1) и на
+    coverage (FIX-1B). Лечится он не резервом байт под секцию (резерв подобран
+    под сегодняшний её размер и ломается при добавлении первого же поля), а
+    запретом мерить что-либо кроме собранного целиком пакета: любое решение об
+    обрезке и объединении принимается ТОЛЬКО по возвращённому здесь размеру.
+    """
+    _refresh_coverage(pack, detected=detected)
+    return pack, _set_pack_size(pack, system_prompt)
+
+
 def _refresh_coverage(pack: dict[str, Any], *, detected: int) -> None:
     """Пересчитать coverage по ФАКТИЧЕСКОМУ состоянию pack (после обрезки).
 
@@ -413,6 +436,21 @@ def _refresh_coverage(pack: dict[str, Any], *, detected: int) -> None:
         check_ids.extend(str(item) for item in merged)
     coverage["included_check_ids"] = sorted(set(check_ids))
     coverage["included_blocks"] = sorted({check_id[0] for check_id in check_ids if check_id})
+
+
+def audit_entry_check_ids(entry: dict[str, Any]) -> list[str]:
+    """check_id записи `audit.truncated_candidate_groups` — всегда списком.
+
+    Записи двух форм: обычная обрезанная группа несёт `check_id`, а
+    объединённый элемент второго эшелона (см. `_merge_collapsed_groups`)
+    собственного check_id не имеет и несёт `merged_check_ids`. Читатели этой
+    секции обязаны ходить через этот аксессор, а не через `entry["check_id"]`
+    напрямую: иначе объединённая запись роняет читателя по KeyError. Форму
+    самих записей аксессор не меняет.
+    """
+    if entry.get("check_id") not in (None, ""):
+        return [str(entry["check_id"])]
+    return [str(item) for item in entry.get("merged_check_ids") or []]
 
 
 def _numeric(value: Any) -> float | None:
@@ -588,6 +626,7 @@ def _truncate_candidate_groups(
     *,
     top_n: int,
     impact_keys: list[str],
+    detected: int,
 ) -> int:
     """Прогрессивная обрезка кандидатов до попадания пакета в cap.
 
@@ -614,11 +653,15 @@ def _truncate_candidate_groups(
     Он режет ось «число групп», по которой снижение N бессильно.
 
     Порядок групп стабилен: сортировка по (check_id, candidate_reason).
+
+    Все без исключения замеры идут через `_assemble_and_measure`: решение об
+    очередном снижении N и об объединении принимается по размеру собранного
+    целиком пакета, а не промежуточного состояния (PACK-2-FIX-1C).
     """
     candidates = pack.get("analysis_candidates") or {}
     rows = candidates.get("rows") or []
     if not rows:
-        return _set_pack_size(pack, system_prompt)
+        return _assemble_and_measure(pack, system_prompt, detected=detected)[1]
 
     order = sorted(
         range(len(rows)),
@@ -639,11 +682,15 @@ def _truncate_candidate_groups(
                 entries[position] = entry
         return entries
 
-    def apply_and_size(n: int, merged_count: int = 0) -> int:
-        # audit.truncated_candidate_groups обновляется ДО замера размера —
-        # иначе возвращаемый final_size не учитывал бы вес самого audit-списка
-        # (для сотен групп это не мелочь) и мог соврать о фактической
-        # укладке пакета в cap.
+    def assemble_and_measure(n: int, merged_count: int = 0) -> tuple[dict[str, Any], int]:
+        """Собрать пакет при (n, merged_count) и вернуть его фактический размер.
+
+        Сборка полная: обрезка групп, объединение схлопнутых, запись
+        `audit.truncated_candidate_groups` и — через `_assemble_and_measure` —
+        дозапись coverage и сходимость размеров audit. Никакого «померим
+        сейчас, допишем потом»: возвращённое число описывает объект, который
+        уйдёт в модель, поэтому по нему одному и принимаются решения.
+        """
         entries = apply_n(n)
         merged_positions = merge_order[:merged_count] if merged_count else []
         merged_set = set(merged_positions)
@@ -661,15 +708,15 @@ def _truncate_candidate_groups(
             audit_entries.append(merged_entry)
         candidates["rows"] = packed_rows
         pack["audit"]["truncated_candidate_groups"] = audit_entries
-        return _set_pack_size(pack, system_prompt)
+        return _assemble_and_measure(pack, system_prompt, detected=detected)
 
     merge_order: list[int] = []
-    final_size = apply_and_size(top_n)
+    _, final_size = assemble_and_measure(top_n)
 
     n = top_n
     while final_size >= byte_cap and n > 0:
         n = n // 2
-        final_size = apply_and_size(n)
+        _, final_size = assemble_and_measure(n)
 
     if final_size < byte_cap:
         return final_size
@@ -697,19 +744,37 @@ def _truncate_candidate_groups(
         # Объединять нечего: одна группа «сама с собой» только добавила бы байт.
         return final_size
 
-    # Размер монотонно убывает с числом объединённых групп, поэтому минимальное
-    # достаточное k ищется бинарно: это тот же результат, что и пошаговое
-    # объединение, но без O(N) полных сериализаций пакета.
+    # Бинарный поиск минимального достаточного k — только способ быстро
+    # нащупать кандидата, а не доказательство. Монотонность размера по k не
+    # доказана (объединение двух групп может и добавить байт), поэтому
+    # результат поиска ниже обязательно проверяется контрольным замером и при
+    # промахе добирается линейно — на допущение о монотонности алгоритм не
+    # опирается нигде.
     low, high = 2, len(merge_order)
     best: int | None = None
     while low <= high:
         middle = (low + high) // 2
-        size = apply_and_size(n, middle)
+        _, size = assemble_and_measure(n, middle)
         if size < byte_cap:
             best, high = middle, middle - 1
         else:
             low = middle + 1
-    return apply_and_size(n, best if best is not None else len(merge_order))
+
+    if best is not None:
+        merged_count = best
+        _, final_size = assemble_and_measure(n, merged_count)
+        while final_size >= byte_cap and merged_count < len(merge_order):
+            merged_count += 1
+            _, final_size = assemble_and_measure(n, merged_count)
+        if final_size < byte_cap:
+            return final_size
+
+    # Перед отказом объединение доводится до максимума принудительно: иначе
+    # ValueError печатал бы «оба эшелона исчерпаны» в состоянии, где часть
+    # схлопнутых групп ещё не объединена, и сообщение противоречило бы
+    # собственным числам.
+    _, final_size = assemble_and_measure(n, len(merge_order))
+    return final_size
 
 
 def _apply_byte_cap(
@@ -720,16 +785,24 @@ def _apply_byte_cap(
     detected: int,
     defaults: dict[str, Any] | None = None,
 ) -> None:
-    """Сначала зарезервировать всех кандидатов, затем урезать только контекст."""
+    """Сначала зарезервировать всех кандидатов, затем урезать только контекст.
+
+    Каждый замер здесь — через `_assemble_and_measure`, включая самый первый:
+    coverage дописывается в пакет в любом случае, поэтому решение «снимать ли
+    опциональный контекст» тоже обязано приниматься по полному размеру.
+    """
     pack["audit"]["byte_cap_exceeded"] = False
     pack["audit"]["omitted_context"] = []
     pack["audit"]["truncated_candidate_groups"] = []
-    final_size = _set_pack_size(pack, system_prompt)
+    measure = lambda: _assemble_and_measure(  # noqa: E731
+        pack, system_prompt, detected=detected
+    )[1]
+    final_size = measure()
 
     candidates = pack.get("analysis_candidates") or {}
     if final_size >= byte_cap and candidates.pop("context", None) is not None:
         pack["audit"]["omitted_context"].append("analysis_candidates.context")
-        final_size = _set_pack_size(pack, system_prompt)
+        final_size = measure()
 
     optional_sections: list[tuple[int, str, dict[str, Any]]] = []
     for name, value in (pack.get("compact_context") or {}).items():
@@ -742,7 +815,7 @@ def _apply_byte_cap(
         key = dotted_name.rsplit(".", 1)[1]
         if container.pop(key, None) is not None:
             pack["audit"]["omitted_context"].append(dotted_name)
-            final_size = _set_pack_size(pack, system_prompt)
+            final_size = measure()
 
     if final_size >= byte_cap:
         final_size = _truncate_candidate_groups(
@@ -751,20 +824,24 @@ def _apply_byte_cap(
             system_prompt,
             top_n=resolve_candidate_top_n(defaults),
             impact_keys=resolve_candidate_impact_keys(defaults),
+            detected=detected,
         )
 
-    # coverage пересчитывается ПОСЛЕ обрезки кандидатных групп — иначе
-    # candidates_included/omitted описывали бы пакет ДО обрезки, хотя в
-    # модель и в аудиторский артефакт уходит уже обрезанное состояние.
-    _refresh_coverage(pack, detected=detected)
-    final_size = _set_pack_size(pack, system_prompt)
+    # Замер контрольный, а не дозапись: coverage уже пересчитан внутри
+    # `_assemble_and_measure` на каждом шаге, здесь он обязан сойтись в то же
+    # значение и не изменить размер (см. тест структурного инварианта).
+    final_size = measure()
 
     pack["audit"]["byte_cap_exceeded"] = final_size >= byte_cap
-    final_size = _set_pack_size(pack, system_prompt)
+    final_size = measure()
     if final_size >= byte_cap:
         # Формулировка описывает ФАКТИЧЕСКОЕ состояние на момент отказа: оба
-        # эшелона исчерпаны, но необрезаемый остаток (группы без свёрнутого
-        # хвоста — например, по одному кандидату в каждой) в cap не влезает.
+        # эшелона исчерпаны — top-N доведён до 0, а объединение схлопнутых
+        # групп принудительно доведено до максимума в
+        # `_truncate_candidate_groups`, поэтому `merged` ниже — действительно
+        # всё, что подлежало объединению. Необрезаемый остаток (группы без
+        # свёрнутого хвоста — например, по одному кандидату в каждой) в cap
+        # не влезает. Все числа читаются из фактического состояния пакета.
         merged = sum(
             int(entry.get("merged_groups") or 0)
             for entry in pack["audit"].get("truncated_candidate_groups") or []
