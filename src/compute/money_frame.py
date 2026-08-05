@@ -46,6 +46,11 @@ money_frame проверяет это явно (см. _seo_ready) и, если �
 несёт данных, добавляет отдельную запись-оговорку "SEO не учтён: источник
 не готов" — рамка никогда не выглядит молча полной.
 
+Уровень ключа атрибуции (задача 7G): отдельная строка `kind="attribution"`
+в money_frame.json — L0/L1/L2/L_UNKNOWN, посчитанные по фактической
+заполненности колонок canonical (crm/visits) и фактическому JOIN, вместе с
+доказательством по каждой проверенной колонке. Report это поле только читает.
+
 findings_registry.csv — skeleton единой карточки находки (каталог v2 §12):
 плоские деньги/подытоги в regestry не попадают (kind != category_item и
 != scenario пропускается), для находок и сценариев заполняются только
@@ -85,6 +90,27 @@ MONEY_CATEGORIES: dict[str, str] = {
 
 SCENARIO_LABEL = "сценарий, не прогноз"
 SEO_NOT_READY_NOTE = "SEO не учтён: источник не готов"
+
+
+# ── Уровень ключа атрибуции (задача 7G) ─────────────────────────────────────
+# Считается из фактической canonical-схемы клиента, не из документации и не
+# из константы: L2 — есть рабочий ключ склейки CRM с визитами (client_id/
+# yclid/gclid либо контакт+таймстамп), дающий фактический JOIN выше порога
+# успешности; L1 — есть заполненное поле источника/utm; L0 — CRM-таблица есть,
+# ни одно из условий не выполнено; L_UNKNOWN — CRM-источника нет вообще.
+# Пороги и имена колонок — только в config/defaults.yaml (принцип 1).
+ATTRIBUTION_L0 = "L0"
+ATTRIBUTION_L1 = "L1"
+ATTRIBUTION_L2 = "L2"
+ATTRIBUTION_L_UNKNOWN = "L_UNKNOWN"
+
+# Различаем постоянное ограничение источника и ещё не посчитанную величину.
+STATUS_AVAILABLE = "available"
+STATUS_NOT_COMPUTABLE = "not_computable"      # источник принципиально не несёт ключа
+STATUS_NOT_COMPUTED_YET = "not_computed_yet"  # источника нет — величина не считалась
+
+NO_REPEAT_KEY_REASON = "нет ключа склейки повторных обращений"
+NO_CRM_SOURCE_REASON = "CRM-источника нет: ключ склейки повторных обращений не проверялся"
 
 
 # ── Плоские "главные величины" — сумма уже посчитанного поля, взятая только
@@ -441,6 +467,238 @@ def _findings_registry_rows(
     return out
 
 
+# ── Уровень ключа атрибуции: детерминированный расчёт по canonical ──────────
+def _attribution_config(defaults: dict[str, Any]) -> dict[str, Any] | None:
+    """Секция ``attribution`` из config/defaults.yaml; её отсутствие -> None.
+
+    Без порогов и списков колонок уровень не считается вовсе: подставлять их
+    в код запрещено (принцип 1), а писать уровень без доказательства — нельзя.
+    """
+    config = (defaults or {}).get("attribution")
+    return config if isinstance(config, dict) else None
+
+
+def _table_columns(con: Any, table: str) -> set[str]:
+    try:
+        return {str(row[0]) for row in con.execute(f"DESCRIBE {table}").fetchall()}
+    except Exception:  # noqa: BLE001 - отсутствие optional canonical таблицы
+        return set()
+
+
+def _quote(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _non_empty_sql(alias: str, column: str, placeholders: list[str]) -> str:
+    """SQL-условие «значение фактически заполнено».
+
+    NULL, пустая строка и значения-заглушки (``unknown``, ``не определено``…)
+    заполненностью не считаются — иначе колонка, которую transform забил
+    ``"unknown"`` на 100% строк, выглядела бы рабочим ключом.
+    """
+    expr = f"lower(trim(CAST({alias}.{_quote(column)} AS VARCHAR)))"
+    condition = f"{alias}.{_quote(column)} IS NOT NULL AND {expr} <> ''"
+    if placeholders:
+        values = ", ".join(_sql_literal(p) for p in placeholders)
+        condition += f" AND {expr} NOT IN ({values})"
+    return condition
+
+
+def _sql_literal(text: Any) -> str:
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def _fill_evidence(
+    con: Any, *, role: str, column: str, columns: set[str], rows: int,
+    placeholders: list[str], threshold: float,
+) -> dict[str, Any]:
+    """Доказательство по одной колонке: имя + фактическая доля непустых значений."""
+    evidence: dict[str, Any] = {
+        "role": role, "table": "crm", "column": column,
+        "present": column in columns, "rows": rows,
+        "non_empty": 0, "non_empty_share": 0.0,
+        "threshold": threshold, "passes": False,
+    }
+    if column not in columns or rows <= 0:
+        return evidence
+    condition = _non_empty_sql("c", column, placeholders)
+    non_empty = int(
+        con.execute(f"SELECT COUNT(*) FROM crm c WHERE {condition}").fetchone()[0]
+    )
+    evidence["non_empty"] = non_empty
+    evidence["non_empty_share"] = round(non_empty / rows, 4)
+    evidence["passes"] = evidence["non_empty_share"] >= threshold
+    return evidence
+
+
+def _join_evidence(
+    con: Any, *, role: str, pair: dict[str, Any], crm_columns: set[str],
+    visits_columns: set[str], visits_present: bool, rows: int,
+    placeholders: list[str], fill_threshold: float, join_threshold: float,
+) -> dict[str, Any]:
+    """Доказательство по ключу склейки: заполненность + фактический JOIN с visits."""
+    crm_column = str(pair.get("crm_column") or "")
+    visits_column = str(pair.get("visits_column") or "")
+    evidence = _fill_evidence(
+        con, role=role, column=crm_column, columns=crm_columns, rows=rows,
+        placeholders=placeholders, threshold=fill_threshold,
+    )
+    evidence["joined_with"] = f"visits.{visits_column}"
+    evidence["join_possible"] = bool(
+        visits_present and visits_column in visits_columns and evidence["present"]
+    )
+    evidence["join_matched"] = 0
+    evidence["join_success_rate"] = 0.0
+    evidence["join_threshold"] = join_threshold
+    evidence["join_passes"] = False
+    if not evidence["join_possible"] or rows <= 0 or not evidence["passes"]:
+        return evidence
+
+    condition = _non_empty_sql("c", crm_column, placeholders)
+    matched = int(con.execute(
+        f"SELECT COUNT(*) FROM crm c WHERE {condition} AND EXISTS ("
+        f"SELECT 1 FROM visits v WHERE CAST(v.{_quote(visits_column)} AS VARCHAR) "
+        f"= CAST(c.{_quote(crm_column)} AS VARCHAR))"
+    ).fetchone()[0])
+    evidence["join_matched"] = matched
+    evidence["join_success_rate"] = round(matched / rows, 4)
+    evidence["join_passes"] = evidence["join_success_rate"] >= join_threshold
+    return evidence
+
+
+def compute_attribution(paths: Any, defaults: dict[str, Any]) -> dict[str, Any] | None:
+    """Уровень ключа атрибуции + доказательство по каждой проверенной колонке.
+
+    Возвращает None только если секция ``attribution`` не задана в defaults —
+    тогда уровень не пишется вовсе (уровень без доказательства запрещён).
+    """
+    config = _attribution_config(defaults)
+    if config is None:
+        return None
+
+    placeholders = [str(v).strip().lower() for v in (config.get("placeholder_values") or [])]
+    fill_threshold = float(config.get("min_join_key_fill_rate", 1.0))
+    join_threshold = float(config.get("min_join_success_rate", 1.0))
+    source_threshold = float(config.get("min_source_fill_rate", 1.0))
+    repeat_threshold = float(config.get("min_repeat_key_fill_rate", 1.0))
+
+    canonical = common.load_canonical(paths)
+    crm_present = "crm" in canonical
+    evidence: list[dict[str, Any]] = [
+        {"role": "table", "table": "crm", "present": crm_present}
+    ]
+    if not crm_present:
+        return {
+            "level": ATTRIBUTION_L_UNKNOWN,
+            "evidence": evidence,
+            "unique_customers_available": False,
+            "unique_customers_status": STATUS_NOT_COMPUTED_YET,
+            "unique_customers_reason": NO_CRM_SOURCE_REASON,
+        }
+
+    visits_present = "visits" in canonical
+    con = common.open_duckdb(paths)
+    try:
+        crm_columns = _table_columns(con, "crm")
+        visits_columns = _table_columns(con, "visits") if visits_present else set()
+        rows = int(con.execute("SELECT COUNT(*) FROM crm").fetchone()[0])
+        evidence[0]["rows"] = rows
+        evidence.append({"role": "table", "table": "visits", "present": visits_present})
+
+        join_evidence = [
+            _join_evidence(
+                con, role="join_key", pair=pair, crm_columns=crm_columns,
+                visits_columns=visits_columns, visits_present=visits_present, rows=rows,
+                placeholders=placeholders, fill_threshold=fill_threshold,
+                join_threshold=join_threshold,
+            )
+            for pair in (config.get("join_keys") or [])
+        ]
+        contact_evidence = [
+            _join_evidence(
+                con, role="contact_key", pair=pair, crm_columns=crm_columns,
+                visits_columns=visits_columns, visits_present=visits_present, rows=rows,
+                placeholders=placeholders, fill_threshold=fill_threshold,
+                join_threshold=join_threshold,
+            )
+            for pair in (config.get("contact_keys") or [])
+        ]
+        timestamp_evidence = [
+            _fill_evidence(
+                con, role="timestamp", column=str(column), columns=crm_columns, rows=rows,
+                placeholders=placeholders, threshold=fill_threshold,
+            )
+            for column in (config.get("timestamp_columns") or [])
+        ]
+        source_evidence = [
+            _fill_evidence(
+                con, role="source", column=str(column), columns=crm_columns, rows=rows,
+                placeholders=placeholders, threshold=source_threshold,
+            )
+            for column in (config.get("source_columns") or [])
+        ]
+        repeat_evidence = [
+            _fill_evidence(
+                con, role="repeat_key", column=str(column), columns=crm_columns, rows=rows,
+                placeholders=placeholders, threshold=repeat_threshold,
+            )
+            for column in (config.get("repeat_columns") or [])
+        ]
+    finally:
+        con.close()
+
+    evidence.extend(
+        join_evidence + contact_evidence + timestamp_evidence
+        + source_evidence + repeat_evidence
+    )
+
+    has_timestamp = any(e["passes"] for e in timestamp_evidence)
+    l2 = any(e["join_passes"] for e in join_evidence) or (
+        has_timestamp and any(e["join_passes"] for e in contact_evidence)
+    )
+    if l2:
+        level = ATTRIBUTION_L2
+    elif any(e["passes"] for e in source_evidence):
+        level = ATTRIBUTION_L1
+    else:
+        level = ATTRIBUTION_L0
+
+    repeat_key_available = (
+        any(e["passes"] for e in repeat_evidence)
+        or any(e["passes"] for e in contact_evidence)
+    )
+    return {
+        "level": level,
+        "evidence": evidence,
+        "unique_customers_available": repeat_key_available,
+        "unique_customers_status": (
+            STATUS_AVAILABLE if repeat_key_available else STATUS_NOT_COMPUTABLE
+        ),
+        "unique_customers_reason": None if repeat_key_available else NO_REPEAT_KEY_REASON,
+    }
+
+
+def _attribution_row(attribution: dict[str, Any]) -> dict[str, Any]:
+    """Строка money_frame.json с уровнем и его доказательством (только добавление)."""
+    level = attribution["level"]
+    return {
+        "check_id": "M", "kind": "attribution", "money_category": None,
+        "amount_rub": None, "unit": None,
+        "metric": "attribution_level", "value": level,
+        "attribution_level": level,
+        "attribution_evidence": attribution["evidence"],
+        "unique_customers_available": attribution["unique_customers_available"],
+        "unique_customers_status": attribution["unique_customers_status"],
+        "unique_customers_reason": attribution["unique_customers_reason"],
+        "confidence": None, "confidence_cap": None, "segment": None,
+        "description": (
+            f"Уровень ключа атрибуции {level} — посчитан по фактической "
+            "заполненности колонок canonical (см. attribution_evidence)"
+        ),
+        "source_check_ids": [], "scenario": False,
+    }
+
+
 # ── Точка входа блока (контракт common.dispatch_blocks) ────────────────────
 def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[str]:
     """Собрать money_frame.csv/json + findings_registry.csv/json из A/C."""
@@ -509,6 +767,13 @@ def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[st
         row["kind"] = "scenario" if item.get("scenario") else "category_item"
         row["scenario_label"] = SCENARIO_LABEL if item.get("scenario") else None
         rows_out.append(row)
+
+    # Уровень ключа атрибуции — факт из данных, а не константа. Пишется только
+    # вместе с доказательством (см. compute_attribution); без секции
+    # attribution в defaults не пишется вовсе.
+    attribution = compute_attribution(paths, defaults)
+    if attribution is not None:
+        rows_out.append(_attribution_row(attribution))
 
     seo_ready = _seo_ready(metrics_dir)
     if not seo_ready:

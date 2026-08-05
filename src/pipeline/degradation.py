@@ -64,6 +64,132 @@ def _label(table: str) -> str:
     return _SOURCE_LABELS.get(table, table)
 
 
+# ── Зависимости окружения (requirements.txt) ────────────────────────────────
+# Отсутствие пакета — такая же управляемая деградация, как отсутствие источника
+# (принцип 4): затронутый блок пропускается, соседние считаются. Карта нужна,
+# чтобы сказать об этом на intake (первая секунда прогона), а не на импорте
+# блока в середине compute. ``module`` — имя импорта, ``package`` — имя в
+# requirements.txt, ``affects`` — что именно перестаёт работать.
+DEPENDENCIES: tuple[dict[str, Any], ...] = (
+    {"module": "pandas", "package": "pandas",
+     "affects": ("transform", "compute")},
+    {"module": "pyarrow", "package": "pyarrow",
+     "affects": ("transform", "compute")},
+    {"module": "duckdb", "package": "duckdb",
+     "affects": ("compute: все блоки",)},
+    {"module": "yaml", "package": "pyyaml",
+     "affects": ("все стадии",)},
+    {"module": "dotenv", "package": "python-dotenv",
+     "affects": ("extract",)},
+    {"module": "requests", "package": "requests",
+     "affects": ("extract",)},
+    {"module": "scipy", "package": "scipy",
+     "affects": ("compute: block1",)},
+    {"module": "playwright", "package": "playwright",
+     "affects": ("extract: site_crawl",)},
+    {"module": "tapi_yandex_metrika", "package": "tapi-yandex-metrika",
+     "affects": ("extract: metrika",)},
+    {"module": "openai", "package": "openai",
+     "affects": ("analyze",)},
+)
+
+
+def check_dependencies(
+    dependencies: Iterable[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Проверить импортируемость объявленных зависимостей, НЕ импортируя их.
+
+    ``importlib.util.find_spec`` смотрит только наличие модуля в путях поиска —
+    код зависимости не выполняется, поэтому проверка дёшева и безопасна на
+    intake. Возвращает по записи на зависимость:
+    ``{module, package, present, affects}``. Порядок — как в ``DEPENDENCIES``.
+    """
+    import importlib.util
+
+    rows: list[dict[str, Any]] = []
+    for dep in (DEPENDENCIES if dependencies is None else dependencies):
+        module = str(dep.get("module"))
+        try:
+            present = importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            # Битый/отсутствующий родительский пакет — тот же случай «нет».
+            present = False
+        rows.append(
+            {
+                "module": module,
+                "package": dep.get("package") or module,
+                "present": present,
+                "affects": list(dep.get("affects") or []),
+            }
+        )
+    return rows
+
+
+def missing_dependencies(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Оставить из вывода ``check_dependencies`` только отсутствующие."""
+    return [row for row in rows if not row.get("present")]
+
+
+def format_dependency_table(rows: Iterable[dict[str, Any]]) -> str:
+    """Отформатировать таблицу «зависимость -> есть/нет -> затронутые блоки»."""
+    rows = list(rows)
+    lines = [f"{'зависимость':<24}{'есть':<8}затронуто", "-" * 60]
+    for row in rows:
+        mark = "да" if row.get("present") else "НЕТ"
+        affects = ", ".join(row.get("affects") or []) or "-"
+        lines.append(f"{str(row.get('module')):<24}{mark:<8}{affects}")
+    return "\n".join(lines)
+
+
+def missing_dependency_reason(module: str) -> str:
+    """Единая формулировка причины пропуска блока из-за зависимости."""
+    return f"отсутствует зависимость: {module}"
+
+
+def register_missing_dependencies(
+    report: dict[str, Any],
+    missing: dict[str, str],
+) -> dict[str, Any]:
+    """Внести блоки, не импортировавшиеся из-за отсутствующей зависимости.
+
+    Пишет два места отчёта:
+      * ``missing_dependencies`` — машиночитаемый список ``{block, module,
+        reason}`` для аудита прогона;
+      * ``skipped`` — та же запись в формате раздела «Что не удалось проверить»,
+        чтобы ограничение прогона попало в отчёт явно, а не потерялось в логе.
+
+    ``counts`` не трогается: это счётчики реестра проверок, а не блоков (тот же
+    приём, что у report._report_limitations с T09). Повторный вызов
+    идемпотентен — записи дедуплицируются по имени блока.
+    """
+    if not missing:
+        return report
+
+    entries = report.setdefault("missing_dependencies", [])
+    known_blocks = {e.get("block") for e in entries if isinstance(e, dict)}
+    skipped = report.setdefault("skipped", [])
+    known_ids = {s.get("id") for s in skipped if isinstance(s, dict)}
+
+    for block, module in sorted(missing.items()):
+        reason = missing_dependency_reason(module)
+        if block not in known_blocks:
+            entries.append({"block": block, "module": module, "reason": reason})
+        skipped_id = f"блок {block}"
+        if skipped_id not in known_ids:
+            skipped.append(
+                {
+                    "id": skipped_id,
+                    "block": None,
+                    "name": f"блок {block} не выполнен",
+                    "requires": [],
+                    "missing": [module],
+                    "reason": reason,
+                    "degrades_to": None,
+                }
+            )
+    return report
+
+
 # Режим (api|manual) каждой канонической таблицы.
 #   * ``_API_TABLES``      — всегда api (машинная выгрузка систем).
 #   * ``_MANUAL_TABLES``   — всегда manual (ручной ввод/обход/анкета): их данные
@@ -328,6 +454,10 @@ def build_degradation_report(
         "runnable_check_ids": [c.get("id") for c in runnable],
         "skipped": skipped,
         "checks": detailed,
+        # Состояние окружения на момент прогона: отсутствующая зависимость —
+        # такое же ограничение прогона, как отсутствующий источник, и должна
+        # быть видна в отчёте, а не только в логе (см. check_dependencies).
+        "dependencies": {"missing": missing_dependencies(check_dependencies())},
         "counts": {
             "total": len(checks),
             "runnable": len(runnable),

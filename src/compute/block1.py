@@ -363,14 +363,17 @@ def _analysis_role(row: dict[str, Any], signal: str | None) -> str:
 def _annotate_analysis_rows(name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Добавить единый аналитический контракт, не меняя значения метрик."""
     annotated: list[dict[str, Any]] = []
-    for index, source_row in enumerate(rows):
+    evidence_ids = common.assign_evidence_ids(name, [dict(row) for row in rows])
+    for source_row, evidence_id in zip(rows, evidence_ids):
         row = dict(source_row)
         check_id = str(row.get("check_id") or name).lower()
         signal = _analysis_signal(row)
         role = _analysis_role(row, signal)
         reason_token = signal or row.get("finding") or row.get("status") or role
         row.update({
-            "row_ref": f"{name}:{index}",
+            "evidence_id": evidence_id,
+            "evidence_label": common.evidence_label(row),
+            "row_ref": evidence_id,
             "candidate": signal is not None,
             "row_role": role,
             "candidate_reason": f"{check_id}_{reason_token}",
@@ -385,8 +388,8 @@ def _annotate_analysis_rows(name: str, rows: list[dict[str, Any]]) -> list[dict[
     )
     if context_row is not None:
         for row in annotated:
-            if row["candidate"] and row["row_ref"] != context_row["row_ref"]:
-                row["context_refs"] = [context_row["row_ref"]]
+            if row["candidate"] and row["evidence_id"] != context_row["evidence_id"]:
+                row["context_refs"] = [context_row["evidence_id"]]
     return annotated
 
 
@@ -600,7 +603,7 @@ def _campaign_costs(con: Any) -> dict[str, dict[str, Any]]:
         "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
         "COUNT(*) FILTER (WHERE cost_normalized IS NULL) "
         "FROM costs WHERE source_tag = 'direct' AND campaign_id IS NOT NULL "
-        "GROUP BY campaign_id"
+        "GROUP BY campaign_id ORDER BY campaign_id"
     ).fetchall()
     return {
         campaign_id: {
@@ -625,7 +628,7 @@ def _campaign_net_conversions(
         return None
     rows = con.execute(
         f"SELECT campaign_id, SUM({expr}) FROM direct_campaigns "
-        "WHERE campaign_id IS NOT NULL GROUP BY campaign_id"
+        "WHERE campaign_id IS NOT NULL GROUP BY campaign_id ORDER BY campaign_id"
     ).fetchall()
     return {campaign_id: int(conv or 0) for campaign_id, conv in rows}
 
@@ -1083,7 +1086,7 @@ def _run_a09(
             f"SUM({expr}), SUM(clicks) "
             "FROM direct_queries "
             f"WHERE match_type IN ({phrase_types_sql}) "
-            "GROUP BY query, match_type"
+            "GROUP BY query, match_type ORDER BY query, match_type"
         ).fetchall()
 
         none_summary = con.execute(
@@ -1161,7 +1164,7 @@ def _run_a10(
             f"SUM({expr}) "
             "FROM direct_queries "
             f"WHERE match_type IN ({phrase_types_sql}) "
-            "GROUP BY query, match_type, month"
+            "GROUP BY query, match_type, month ORDER BY query, match_type, month"
         ).fetchall()
     finally:
         con.close()
@@ -1230,7 +1233,7 @@ def _run_a11(
             f"SUM({expr}), SUM(clicks) "
             "FROM direct_queries "
             f"WHERE match_type IN ({match_types_sql}) "
-            "GROUP BY match_type"
+            "GROUP BY match_type ORDER BY match_type"
         ).fetchall()
 
         total_visits, total_submit = con.execute(
@@ -1335,7 +1338,7 @@ def _run_a12(
             "COUNT(*) FILTER (WHERE cost_normalized IS NULL), "
             f"SUM({expr}), SUM(clicks) "
             "FROM direct_geo WHERE location_of_presence_name IS NOT NULL "
-            "GROUP BY location_of_presence_name"
+            "GROUP BY location_of_presence_name ORDER BY location_of_presence_name"
         ).fetchall()
     finally:
         con.close()
@@ -1427,7 +1430,7 @@ def _run_a13(
             "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
             "COUNT(*) FILTER (WHERE cost_normalized IS NULL), "
             f"SUM({expr}) "
-            "FROM direct_campaigns WHERE date IS NOT NULL GROUP BY date"
+            "FROM direct_campaigns WHERE date IS NOT NULL GROUP BY date ORDER BY date"
         ).fetchall()
     finally:
         con.close()
@@ -1509,7 +1512,7 @@ def _run_a14(
     try:
         device_rows = con.execute(
             "SELECT device, COUNT(*), SUM(CASE WHEN form_submit THEN 1 ELSE 0 END) "
-            "FROM visits WHERE source_group = 'ad' AND device IS NOT NULL GROUP BY device"
+            "FROM visits WHERE source_group = 'ad' AND device IS NOT NULL GROUP BY device ORDER BY device"
         ).fetchall()
         total_ad_visits, total_ad_submit = con.execute(
             "SELECT COUNT(*), SUM(CASE WHEN form_submit THEN 1 ELSE 0 END) "
@@ -1526,7 +1529,7 @@ def _run_a14(
                     "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
                     "COUNT(*) FILTER (WHERE cost_normalized IS NULL), "
                     f"SUM({expr}), SUM(clicks) "
-                    "FROM direct_campaigns WHERE device IS NOT NULL GROUP BY device"
+                    "FROM direct_campaigns WHERE device IS NOT NULL GROUP BY device ORDER BY device"
                 ).fetchall()
     finally:
         con.close()
@@ -1630,7 +1633,7 @@ def _run_a15(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
             "COUNT(*) FILTER (WHERE cost_normalized IS NULL), SUM(clicks) "
             "FROM direct_placements WHERE placement IS NOT NULL "
-            "GROUP BY placement, ad_network_type"
+            "GROUP BY placement, ad_network_type ORDER BY placement, ad_network_type"
         ).fetchall()
         total_cost_sum, total_null_rows = con.execute(
             "SELECT SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
@@ -1710,7 +1713,7 @@ def _run_a17(
             "SELECT query, "
             "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
             "COUNT(*) FILTER (WHERE cost_normalized IS NULL), SUM(clicks) "
-            f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) GROUP BY query"
+            f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) GROUP BY query ORDER BY query"
         ).fetchall()
 
         net_conv_by_query: dict[str, int] = {}
@@ -1718,7 +1721,7 @@ def _run_a17(
         if expr is not None:
             conv_rows = con.execute(
                 f"SELECT query, SUM({expr}) FROM direct_queries "
-                f"WHERE match_type IN ({phrase_types_sql}) GROUP BY query"
+                f"WHERE match_type IN ({phrase_types_sql}) GROUP BY query ORDER BY query"
             ).fetchall()
             net_conv_by_query = {q: int(v or 0) for q, v in conv_rows}
 
@@ -1728,7 +1731,7 @@ def _run_a17(
                 "SELECT query, "
                 "SUM(total_shows * avg_show_position) / NULLIF(SUM(total_shows), 0), "
                 "SUM(total_clicks), SUM(total_shows) "
-                "FROM seo_queries WHERE is_brand = true GROUP BY query"
+                "FROM seo_queries WHERE is_brand = true GROUP BY query ORDER BY query"
             ).fetchall()
     finally:
         con.close()
@@ -1799,7 +1802,7 @@ def _run_a18(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
             "COUNT(*) FILTER (WHERE cost_normalized IS NULL), SUM(clicks) "
             "FROM direct_queries WHERE campaign_id IS NOT NULL "
-            "GROUP BY query, campaign_id"
+            "GROUP BY query, campaign_id ORDER BY query, campaign_id"
         ).fetchall()
     finally:
         con.close()
@@ -1843,7 +1846,7 @@ def _run_a19(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
             "COUNT(*) FILTER (WHERE cost_normalized IS NULL), SUM(clicks) "
             f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) "
-            "GROUP BY query, match_type"
+            "GROUP BY query, match_type ORDER BY query, match_type"
         ).fetchall()
     finally:
         con.close()
@@ -1889,7 +1892,7 @@ def _run_a20(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
         rows = con.execute(
             "SELECT query, match_type, SUM(clicks), SUM(impressions) "
             f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) "
-            "GROUP BY query, match_type"
+            "GROUP BY query, match_type ORDER BY query, match_type"
         ).fetchall()
     finally:
         con.close()
@@ -1951,7 +1954,7 @@ def _run_a21(
             "SELECT query, match_type, SUM(clicks), SUM(impressions), "
             f"SUM({expr}) "
             f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) "
-            "GROUP BY query, match_type"
+            "GROUP BY query, match_type ORDER BY query, match_type"
         ).fetchall()
         total_visits, total_submit = con.execute(
             "SELECT COUNT(*), SUM(CASE WHEN form_submit THEN 1 ELSE 0 END) FROM visits"
@@ -2033,7 +2036,7 @@ def _run_a22(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
         query_rows = con.execute(
             "SELECT campaign_id, ad_group_id, query, SUM(clicks) "
             f"FROM direct_queries WHERE match_type IN ({phrase_types_sql}) "
-            "AND ad_group_id IS NOT NULL GROUP BY campaign_id, ad_group_id, query"
+            "AND ad_group_id IS NOT NULL GROUP BY campaign_id, ad_group_id, query ORDER BY campaign_id, ad_group_id, query"
         ).fetchall()
     finally:
         con.close()
@@ -2095,7 +2098,7 @@ def _run_a23(
     try:
         rows = con.execute(
             "SELECT entry_page, COUNT(*), SUM(CASE WHEN form_submit THEN 1 ELSE 0 END) "
-            "FROM visits WHERE source_group = 'ad' AND entry_page IS NOT NULL GROUP BY entry_page"
+            "FROM visits WHERE source_group = 'ad' AND entry_page IS NOT NULL GROUP BY entry_page ORDER BY entry_page"
         ).fetchall()
     finally:
         con.close()
@@ -2246,7 +2249,7 @@ def _run_a26(
             "SELECT campaign_id, MAX(campaign_name), strftime(date, '%Y-%m'), "
             f"SUM({expr}) "
             "FROM direct_campaigns WHERE campaign_id IS NOT NULL "
-            "GROUP BY campaign_id, strftime(date, '%Y-%m')"
+            "GROUP BY campaign_id, strftime(date, '%Y-%m') ORDER BY campaign_id, strftime(date, '%Y-%m')"
         ).fetchall()
     finally:
         con.close()

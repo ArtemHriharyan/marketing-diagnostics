@@ -159,14 +159,17 @@ def _analysis_role(row: dict[str, Any], signal: str | None) -> str:
 def _annotate_analysis_rows(name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Добавить единый аналитический контракт, не меняя значения метрик."""
     annotated: list[dict[str, Any]] = []
-    for index, source_row in enumerate(rows):
+    evidence_ids = common.assign_evidence_ids(name, [dict(row) for row in rows])
+    for source_row, evidence_id in zip(rows, evidence_ids):
         row = dict(source_row)
         check_id = str(row.get("check_id") or name).lower()
         signal = _analysis_signal(row)
         role = _analysis_role(row, signal)
         reason_token = signal or row.get("finding") or row.get("status") or role
         row.update({
-            "row_ref": f"{name}:{index}",
+            "evidence_id": evidence_id,
+            "evidence_label": common.evidence_label(row),
+            "row_ref": evidence_id,
             "candidate": signal is not None,
             "row_role": role,
             "candidate_reason": f"{check_id}_{reason_token}",
@@ -181,8 +184,8 @@ def _annotate_analysis_rows(name: str, rows: list[dict[str, Any]]) -> list[dict[
     )
     if context_row is not None:
         for row in annotated:
-            if row["candidate"] and row["row_ref"] != context_row["row_ref"]:
-                row["context_refs"] = [context_row["row_ref"]]
+            if row["candidate"] and row["evidence_id"] != context_row["evidence_id"]:
+                row["context_refs"] = [context_row["evidence_id"]]
     return annotated
 
 
@@ -377,7 +380,7 @@ def _run_d04(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
             'SELECT device, COUNT(*), '
             'SUM(CASE WHEN form_open OR form_submit OR call_click OR messenger_click '
             'THEN 1 ELSE 0 END) '
-            "FROM visits GROUP BY device"
+            "FROM visits GROUP BY device ORDER BY device"
         ).fetchall()
     finally:
         con.close()
@@ -467,7 +470,7 @@ def _run_d06(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     try:
         result = con.execute(
             "SELECT source_tag, cost_status, COUNT(*) FROM costs "
-            "GROUP BY source_tag, cost_status"
+            "GROUP BY source_tag, cost_status ORDER BY source_tag, cost_status"
         ).fetchall()
     finally:
         con.close()
@@ -647,7 +650,7 @@ def _run_d07(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     con = common.open_duckdb(paths)
     try:
         by_source = dict(
-            con.execute("SELECT source_tag, SUM(cost_raw) FROM costs GROUP BY source_tag").fetchall()
+            con.execute("SELECT source_tag, SUM(cost_raw) FROM costs GROUP BY source_tag ORDER BY source_tag").fetchall()
         )
         date_min, date_max = con.execute("SELECT MIN(date), MAX(date) FROM costs").fetchone()
         direct_total, yb_total = con.execute(
@@ -716,7 +719,7 @@ def _run_d08(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
             "MAX(date) FILTER (WHERE cost_raw > 0), "
             "SUM(cost_raw) "
             "FROM costs WHERE source_tag = 'direct' AND campaign_id IS NOT NULL "
-            "GROUP BY campaign_id"
+            "GROUP BY campaign_id ORDER BY campaign_id"
         ).fetchall()
         period_end = con.execute(
             "SELECT MAX(date) FROM costs WHERE source_tag = 'direct'"
@@ -1265,7 +1268,10 @@ def _run_d11(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
             "SELECT COUNT(*), COUNT(DISTINCT client_id) FROM visits"
         ).fetchone()
         by_client = con.execute(
-            "SELECT client_id, COUNT(*) AS c FROM visits GROUP BY client_id ORDER BY c DESC"
+            # тай-брейк по client_id: сортировка только по метрике неустойчива
+            # при равных значениях (DET-1)
+            "SELECT client_id, COUNT(*) AS c FROM visits "
+            "GROUP BY client_id ORDER BY c DESC, client_id"
         ).fetchall()
         marker_filter = " OR ".join(
             "lower(coalesce(utm_source_raw, '')) LIKE '%' || ? || '%'"

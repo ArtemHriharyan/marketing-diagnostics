@@ -67,8 +67,10 @@ def test_collects_candidates_referenced_context_and_all_limitations(tmp_path):
     result = candidates.build_analysis_candidates(tmp_path)
     rows = _decoded(result)
 
-    assert result["columns"][:6] == [
+    assert result["columns"][:8] == [
         "artifact",
+        "evidence_id",
+        "evidence_label",
         "row_ref",
         "candidate",
         "row_role",

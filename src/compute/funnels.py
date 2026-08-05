@@ -19,6 +19,20 @@ _SEGMENT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("entry_page", "entry_page"),
 )
 
+# PERF-1A. Значение разреза, не прошедшее отбор, не считается отдельной строкой:
+# по методологии сегмент ниже min_sample_visits не может стать находкой ни при
+# каком confidence, поэтому его расчёт — заведомо выброшенная работа, а объём
+# артефакта при этом ломает байт-кап стадии analyze. Все непрошедшие значения
+# схлопываются в одну строку, чтобы сумма по разрезу сходилась с итогом.
+_OTHER_VALUE = "__other__"
+
+# Величины схлопнутой строки, которые нельзя получить сложением непрошедших
+# значений (доли, а не счётчики). Пишем null, сумму не подставляем.
+_NON_ADDITIVE_TRANSITION_KEY = "transition_rate"
+_NON_ADDITIVE_FIRST_TO_LAST_KEY = "conversion_rate"
+
+_DEFAULTS_FILE = Path(__file__).resolve().parents[2] / "config" / "defaults.yaml"
+
 
 def _load_config(paths: Any) -> dict[str, Any]:
     config_file = Path(paths.config_file)
@@ -144,6 +158,122 @@ def _load_goal_times(paths: Any) -> dict[str, dict[str, str]]:
     return dict(result)
 
 
+def _load_defaults(defaults: dict[str, Any] | None) -> dict[str, Any]:
+    """Пороги отбора сегментов: из dispatch, иначе прямо из config/defaults.yaml.
+
+    `compute_funnels` вызывается ещё и из block3/seasonality, куда defaults не
+    передаются, — политика разреза должна быть одна на все три вызова.
+    """
+    if isinstance(defaults, dict) and defaults:
+        return defaults
+    if not _DEFAULTS_FILE.exists():
+        return {}
+    with _DEFAULTS_FILE.open(encoding="utf-8") as fh:
+        loaded = yaml.safe_load(fh) or {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _segment_policy(defaults: dict[str, Any] | None) -> dict[str, Any]:
+    """Правило отбора значений разреза (config/defaults.yaml, принцип 1)."""
+    values = _load_defaults(defaults)
+    dimensions = values.get("segment_filtered_dimensions")
+    return {
+        "min_visits": int(
+            values.get("segment_min_visits", values.get("min_sample_visits", 500))
+        ),
+        "max_values": int(values.get("segment_max_values", 300)),
+        "coverage_target": float(values.get("segment_coverage_target", 0.80)),
+        "dimensions": sorted(
+            str(item) for item in dimensions if isinstance(item, (str, int))
+        ) if isinstance(dimensions, list) else [],
+    }
+
+
+def _segment_counts(
+    visits: dict[str, dict[str, Any]], visit_ids: set[str], column: str
+) -> dict[Any, int]:
+    """Визиты на каждое значение разреза одним проходом (вход для отбора)."""
+    counts: dict[Any, int] = defaultdict(int)
+    for visit_id in visit_ids:
+        value = visits[visit_id].get(column)
+        if value is None or value != value:  # None и NaN — «значения нет»
+            continue
+        counts[value] += 1
+    return dict(counts)
+
+
+def _select_segment_values(
+    dimension: str, counts: dict[Any, int], policy: dict[str, Any]
+) -> tuple[list[Any], dict[str, Any]]:
+    """Отобрать значения разреза до входа в цикл; вернуть отбор и его покрытие.
+
+    Значения, прошедшие `segment_min_visits`, сортируются по объёму визитов
+    убыв.; берутся, пока не достигнут `segment_coverage_target` ИЛИ не исчерпан
+    `segment_max_values` — что наступит раньше. Правило применяется только к
+    разрезам из `segment_filtered_dimensions`.
+    """
+    visits_total = sum(counts.values())
+    rule_applied = dimension in policy["dimensions"]
+
+    if not rule_applied:
+        selected = list(counts)
+        visits_selected = visits_total
+    else:
+        eligible = [
+            value for value in sorted(counts, key=lambda item: (-counts[item], str(item)))
+            if counts[value] >= policy["min_visits"]
+        ]
+        selected = []
+        visits_selected = 0
+        for value in eligible:
+            selected.append(value)
+            visits_selected += counts[value]
+            if len(selected) >= policy["max_values"]:
+                break
+            if visits_total and visits_selected / visits_total >= policy["coverage_target"]:
+                break
+
+    return sorted(selected, key=str), {
+        "dimension": dimension,
+        "rule_applied": rule_applied,
+        "values_total": len(counts),
+        "values_selected": len(selected),
+        "values_collapsed": len(counts) - len(selected),
+        "visits_total": visits_total,
+        "visits_selected": visits_selected,
+        "visits_collapsed": visits_total - visits_selected,
+        "coverage_ratio": round(visits_selected / visits_total, 4) if visits_total else None,
+    }
+
+
+def _segment_members(
+    visits: dict[str, dict[str, Any]],
+    visit_ids: set[str],
+    column: str,
+    selected: list[Any],
+) -> tuple[dict[Any, set[str]], set[str]]:
+    """Визиты отобранных значений и общий остаток для строки "__other__"."""
+    members: dict[Any, set[str]] = {value: set() for value in selected}
+    other: set[str] = set()
+    for visit_id in visit_ids:
+        value = visits[visit_id].get(column)
+        if value is None or value != value:
+            continue
+        if value in members:
+            members[value].add(visit_id)
+        else:
+            other.add(visit_id)
+    return members, other
+
+
+def _blank_non_additive(slice_result: dict[str, Any]) -> dict[str, Any]:
+    """Обнулить неаддитивные доли схлопнутой строки: null вместо суммы."""
+    for transition in slice_result["transitions"]:
+        transition[_NON_ADDITIVE_TRANSITION_KEY] = None
+    slice_result["first_to_last"][_NON_ADDITIVE_FIRST_TO_LAST_KEY] = None
+    return slice_result
+
+
 def _stage_visit_ids(
     visit_ids: set[str], stages: list[dict[str, Any]], goals: dict[str, dict[str, int]]
 ) -> list[set[str]]:
@@ -223,7 +353,7 @@ def _funnel_slice(
     }
 
 
-def compute_funnels(paths: Any) -> dict[str, Any]:
+def compute_funnels(paths: Any, defaults: dict[str, Any] | None = None) -> dict[str, Any]:
     """Посчитать все корректно настроенные воронки, не записывая артефакт."""
     funnel_configs = _normalise_funnels(_load_config(paths))
     if not funnel_configs:
@@ -240,6 +370,17 @@ def compute_funnels(paths: Any) -> dict[str, Any]:
     visits, goals = _load_visit_data(paths)
     goal_times = _load_goal_times(paths)
     all_visit_ids = set(visits)
+
+    # Отбор значений разреза не зависит от воронки — считается один раз.
+    policy = _segment_policy(defaults)
+    segment_plan: list[tuple[str, list[Any], dict[Any, set[str]], set[str], dict[str, Any]]] = []
+    for dimension, column in _SEGMENT_COLUMNS:
+        counts = _segment_counts(visits, all_visit_ids, column)
+        selected, coverage = _select_segment_values(dimension, counts, policy)
+        members, other_ids = _segment_members(visits, all_visit_ids, column, selected)
+        segment_plan.append((dimension, selected, members, other_ids, coverage))
+    segment_coverage = [coverage for *_, coverage in segment_plan]
+
     results: list[dict[str, Any]] = []
     for funnel_config in funnel_configs:
         stages = funnel_config["stages"]
@@ -257,20 +398,22 @@ def compute_funnels(paths: Any) -> dict[str, Any]:
             })
 
         segments: list[dict[str, Any]] = []
-        for dimension, column in _SEGMENT_COLUMNS:
-            values = sorted(
-                {visits[visit_id].get(column) for visit_id in all_visit_ids}
-                - {None},
-                key=str,
-            )
+        for dimension, values, members, other_ids, coverage in segment_plan:
             for value in values:
-                segment_visits = {
-                    visit_id for visit_id in all_visit_ids if visits[visit_id].get(column) == value
-                }
                 segments.append({
                     "dimension": dimension,
                     "value": value,
-                    **_funnel_slice(segment_visits, stages, goals, goal_times),
+                    **_funnel_slice(members[value], stages, goals, goal_times),
+                })
+            if other_ids:
+                segments.append({
+                    "dimension": dimension,
+                    "value": _OTHER_VALUE,
+                    "collapsed_values": coverage["values_collapsed"],
+                    "collapsed_visits": coverage["visits_collapsed"],
+                    **_blank_non_additive(
+                        _funnel_slice(other_ids, stages, goals, goal_times)
+                    ),
                 })
 
         results.append({
@@ -278,13 +421,25 @@ def compute_funnels(paths: Any) -> dict[str, Any]:
             "stage_definitions": stages,
             **overall,
             "repeat_achievements": repeat_by_stage,
+            "segment_coverage": [dict(record) for record in segment_coverage],
             "segments": segments,
         })
-    return {"status": "ok", "funnels": results}
+    return {
+        "status": "ok",
+        "funnels": results,
+        # Оговорка о покрытии разреза: сколько значений было, сколько отобрано,
+        # какая доля визитов покрыта отобранными. Должна доехать до отчёта.
+        "segment_selection": {
+            "policy": policy,
+            "dimensions": [dict(record) for record in segment_coverage],
+        },
+    }
 
 
 def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[str]:
-    """Записать компактный funnels.json; параметры dispatch здесь не нужны."""
-    del defaults, runnable_ids
-    common.write_json_atomic(Path(paths.metrics) / "funnels.json", compute_funnels(paths))
+    """Записать компактный funnels.json; runnable_ids здесь не нужны."""
+    del runnable_ids
+    common.write_json_atomic(
+        Path(paths.metrics) / "funnels.json", compute_funnels(paths, defaults)
+    )
     return ["funnels"]

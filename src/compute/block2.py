@@ -183,14 +183,17 @@ def _analysis_role(row: dict[str, Any], signal: str | None) -> str:
 def _annotate_analysis_rows(name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Добавить единый аналитический контракт, не меняя значения метрик."""
     annotated: list[dict[str, Any]] = []
-    for index, source_row in enumerate(rows):
+    evidence_ids = common.assign_evidence_ids(name, [dict(row) for row in rows])
+    for source_row, evidence_id in zip(rows, evidence_ids):
         row = dict(source_row)
         check_id = str(row.get("check_id") or name).lower()
         signal = _analysis_signal(row)
         role = _analysis_role(row, signal)
         reason_token = signal or row.get("finding") or row.get("status") or role
         row.update({
-            "row_ref": f"{name}:{index}",
+            "evidence_id": evidence_id,
+            "evidence_label": common.evidence_label(row),
+            "row_ref": evidence_id,
             "candidate": signal is not None,
             "row_role": role,
             "candidate_reason": f"{check_id}_{reason_token}",
@@ -205,8 +208,8 @@ def _annotate_analysis_rows(name: str, rows: list[dict[str, Any]]) -> list[dict[
     )
     if context_row is not None:
         for row in annotated:
-            if row["candidate"] and row["row_ref"] != context_row["row_ref"]:
-                row["context_refs"] = [context_row["row_ref"]]
+            if row["candidate"] and row["evidence_id"] != context_row["evidence_id"]:
+                row["context_refs"] = [context_row["evidence_id"]]
     return annotated
 
 
@@ -352,12 +355,12 @@ def _run_t01(
         by_group = con.execute(
             "SELECT source_group, COUNT(*), "
             "COUNT(*) FILTER (WHERE utm_source_raw IS NOT NULL AND utm_source_raw != '') "
-            "FROM visits GROUP BY source_group"
+            "FROM visits GROUP BY source_group ORDER BY source_group"
         ).fetchall()
         variants = con.execute(
             "SELECT lower(trim(utm_source_raw)) AS norm, utm_source_raw, COUNT(*) "
             "FROM visits WHERE utm_source_raw IS NOT NULL AND utm_source_raw != '' "
-            "GROUP BY norm, utm_source_raw"
+            "GROUP BY norm, utm_source_raw ORDER BY norm, utm_source_raw"
         ).fetchall()
     finally:
         con.close()
@@ -541,7 +544,7 @@ def _run_t05(
     try:
         seo_rows = con.execute(
             "SELECT is_brand, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
-            "GROUP BY is_brand"
+            "GROUP BY is_brand ORDER BY is_brand"
         ).fetchall()
 
         direct_rows: list[tuple[Any, ...]] = []
@@ -550,7 +553,7 @@ def _run_t05(
                 "SELECT query, "
                 "SUM(cost_normalized) FILTER (WHERE cost_normalized IS NOT NULL), "
                 "COUNT(*) FILTER (WHERE cost_normalized IS NULL), SUM(clicks) "
-                "FROM direct_queries GROUP BY query"
+                "FROM direct_queries GROUP BY query ORDER BY query"
             ).fetchall()
     finally:
         con.close()
@@ -769,7 +772,7 @@ def _run_t09(
     con = common.open_duckdb(paths)
     try:
         daily = con.execute(
-            "SELECT source_final, date, COUNT(*) FROM visits GROUP BY source_final, date"
+            "SELECT source_final, date, COUNT(*) FROM visits GROUP BY source_final, date ORDER BY source_final, date"
         ).fetchall()
     finally:
         con.close()

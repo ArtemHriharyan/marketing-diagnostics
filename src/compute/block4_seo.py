@@ -518,7 +518,8 @@ def _seo_candidate(row: dict[str, Any]) -> bool:
 def _annotate_seo_rows(artifact: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Добавить единый candidate-контракт, сохранив смешанные S-артефакты."""
     annotated: list[dict[str, Any]] = []
-    for index, source_row in enumerate(rows):
+    evidence_ids = common.assign_evidence_ids(artifact, [dict(row) for row in rows])
+    for source_row, evidence_id in zip(rows, evidence_ids):
         row = dict(source_row)
         check_id = str(row.get("check_id") or artifact.upper())
         finding = str(row.get("finding") or "")
@@ -554,7 +555,9 @@ def _annotate_seo_rows(artifact: str, rows: list[dict[str, Any]]) -> list[dict[s
             reason = f"{check_id.lower()}_detail"
 
         row.update({
-            "row_ref": f"{artifact}:{index}",
+            "evidence_id": evidence_id,
+            "evidence_label": common.evidence_label(row),
+            "row_ref": evidence_id,
             "candidate": candidate,
             "row_role": role,
             "candidate_reason": reason,
@@ -565,7 +568,7 @@ def _annotate_seo_rows(artifact: str, rows: list[dict[str, Any]]) -> list[dict[s
     context_refs: dict[str, list[str]] = {}
     for row in annotated:
         if row["row_role"] in {"summary", "baseline", "context"}:
-            context_refs.setdefault(str(row["check_id"]), []).append(row["row_ref"])
+            context_refs.setdefault(str(row["check_id"]), []).append(row["evidence_id"])
     for row in annotated:
         if row["candidate"]:
             row["context_refs"] = list(context_refs.get(str(row["check_id"]), []))
@@ -669,7 +672,7 @@ def _aggregate_query_page(con: Any, where_sql: str = "") -> list[dict[str, Any]]
         "bool_or(is_brand) AS is_brand "
         "FROM seo_queries "
         f"{where_sql} "
-        "GROUP BY query, page"
+        "GROUP BY query, page ORDER BY query, page"
     )
     rows = con.execute(sql).fetchall()
     out: list[dict[str, Any]] = []
@@ -695,7 +698,7 @@ def _organic_visits_by_page(con: Any) -> dict[str, tuple[int, int]]:
     rows = con.execute(
         "SELECT entry_page, COUNT(*), "
         "COUNT(*) FILTER (WHERE form_open OR form_submit OR call_click OR messenger_click) "
-        "FROM visits WHERE source_group = 'organic' GROUP BY entry_page"
+        "FROM visits WHERE source_group = 'organic' GROUP BY entry_page ORDER BY entry_page"
     ).fetchall()
     out: dict[str, tuple[int, int]] = {}
     for entry_page, total, engaged in rows:
@@ -710,7 +713,7 @@ def _organic_visits_by_page_device(con: Any) -> dict[tuple[str, str], tuple[int,
     rows = con.execute(
         "SELECT entry_page, device, COUNT(*), "
         "COUNT(*) FILTER (WHERE form_open OR form_submit OR call_click OR messenger_click) "
-        "FROM visits WHERE source_group = 'organic' GROUP BY entry_page, device"
+        "FROM visits WHERE source_group = 'organic' GROUP BY entry_page, device ORDER BY entry_page, device"
     ).fetchall()
     out: dict[tuple[str, str], tuple[int, int]] = {}
     for entry_page, device, total, engaged in rows:
@@ -810,7 +813,7 @@ def _robots_blocks_indexing(directive: str | None) -> bool:
 def _seo_shows_clicks_by_path(con: Any) -> dict[str, tuple[int, int]]:
     """{нормализованный_путь: (total_shows, total_clicks)} по seo_queries."""
     rows = con.execute(
-        "SELECT page, SUM(total_shows), SUM(total_clicks) FROM seo_queries GROUP BY page"
+        "SELECT page, SUM(total_shows), SUM(total_clicks) FROM seo_queries GROUP BY page ORDER BY page"
     ).fetchall()
     out: dict[str, tuple[int, int]] = {}
     for page, shows, clicks in rows:
@@ -923,7 +926,7 @@ def _organic_visit_context_by_device(con: Any) -> dict[str, dict[str, Any]]:
     rows = con.execute(
         "SELECT device, COUNT(*), "
         "COUNT(*) FILTER (WHERE form_open OR form_submit OR call_click OR messenger_click) "
-        "FROM visits WHERE source_group = 'organic' GROUP BY device"
+        "FROM visits WHERE source_group = 'organic' GROUP BY device ORDER BY device"
     ).fetchall()
     out: dict[str, dict[str, Any]] = {}
     for device, total, engaged in rows:
@@ -943,11 +946,11 @@ def _run_s01(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
     try:
         by_brand = con.execute(
             "SELECT is_brand, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
-            "GROUP BY is_brand"
+            "GROUP BY is_brand ORDER BY is_brand"
         ).fetchall()
         by_source = con.execute(
             "SELECT source, is_brand, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
-            "GROUP BY source, is_brand"
+            "GROUP BY source, is_brand ORDER BY source, is_brand"
         ).fetchall()
     finally:
         con.close()
@@ -1210,7 +1213,7 @@ def _wordstat_monthly_demand(con: Any) -> dict[str, int]:
     rows = con.execute(
         "SELECT month, SUM(count) FROM wordstat "
         "WHERE purpose LIKE '%seasonality%' AND month IS NOT NULL "
-        "GROUP BY month"
+        "GROUP BY month ORDER BY month"
     ).fetchall()
     return {m: int(c or 0) for m, c in rows if m}
 
@@ -1458,7 +1461,7 @@ def _wordstat_gap_demand(con: Any) -> list[dict[str, Any]]:
     """
     rows = con.execute(
         "SELECT normalized_phrase, MIN(phrase), SUM(count) FROM wordstat "
-        "WHERE scope = 'gap-specific' GROUP BY normalized_phrase"
+        "WHERE scope = 'gap-specific' GROUP BY normalized_phrase ORDER BY normalized_phrase"
     ).fetchall()
     return [
         {"normalized_phrase": np, "phrase": ph, "demand_total": int(dt or 0)}
@@ -1666,11 +1669,11 @@ def _run_s08(
     con = common.open_duckdb(paths)
     try:
         overall = con.execute(
-            "SELECT page, SUM(total_shows), SUM(total_clicks) FROM seo_queries GROUP BY page"
+            "SELECT page, SUM(total_shows), SUM(total_clicks) FROM seo_queries GROUP BY page ORDER BY page"
         ).fetchall()
         by_device = con.execute(
             "SELECT page, device, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
-            f"WHERE {_exclude_unknown_device_sql()} GROUP BY page, device"
+            f"WHERE {_exclude_unknown_device_sql()} GROUP BY page, device ORDER BY page, device"
         ).fetchall()
         organic_by_page = _organic_visits_by_page(con)
         organic_by_page_device = _organic_visits_by_page_device(con)
@@ -1772,12 +1775,12 @@ def _run_s09(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
         overall = con.execute(
             "SELECT query, page, SUM(total_shows) FROM seo_queries "
             "WHERE NULLIF(TRIM(CAST(page AS VARCHAR)), '') IS NOT NULL "
-            "GROUP BY query, page"
+            "GROUP BY query, page ORDER BY query, page"
         ).fetchall()
         by_device = con.execute(
             "SELECT query, device, page, SUM(total_shows) FROM seo_queries "
             "WHERE NULLIF(TRIM(CAST(page AS VARCHAR)), '') IS NOT NULL "
-            f"AND {_exclude_unknown_device_sql()} GROUP BY query, device, page"
+            f"AND {_exclude_unknown_device_sql()} GROUP BY query, device, page ORDER BY query, device, page"
         ).fetchall()
     finally:
         con.close()
@@ -1907,7 +1910,7 @@ def _run_s10(paths: Any, has_visits: bool, confidence_cap: str, metrics_dir: Pat
             "SUM(total_shows) AS shows, "
             "SUM(avg_show_position * total_shows) FILTER (WHERE avg_show_position IS NOT NULL) AS pos_w, "
             "SUM(total_shows) FILTER (WHERE avg_show_position IS NOT NULL) AS shows_pos "
-            "FROM seo_queries GROUP BY query, page"
+            "FROM seo_queries GROUP BY query, page ORDER BY query, page"
         ).fetchall()
         organic_by_page = _organic_visits_by_page(con) if has_visits else {}
     finally:
@@ -2443,7 +2446,7 @@ def _run_s19(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
             organic_rows = con.execute(
                 "SELECT entry_page, COUNT(*), "
                 "COUNT(*) FILTER (WHERE form_open OR form_submit OR call_click OR messenger_click) "
-                "FROM visits WHERE source_group = 'organic' GROUP BY entry_page"
+                "FROM visits WHERE source_group = 'organic' GROUP BY entry_page ORDER BY entry_page"
             ).fetchall()
         finally:
             con.close()
@@ -2634,7 +2637,7 @@ def _run_s21(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
             "SELECT page, source, SUM(total_shows) AS shows, SUM(total_clicks) AS clicks, "
             "SUM(avg_show_position * total_shows) FILTER (WHERE avg_show_position IS NOT NULL) AS pos_w, "
             "SUM(total_shows) FILTER (WHERE avg_show_position IS NOT NULL) AS shows_pos "
-            "FROM seo_queries GROUP BY page, source"
+            "FROM seo_queries GROUP BY page, source ORDER BY page, source"
         ).fetchall()
     finally:
         con.close()
@@ -2719,7 +2722,7 @@ def _run_s22(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
     con = common.open_duckdb(paths)
     try:
         overall = con.execute(
-            "SELECT page, SUM(total_shows), SUM(total_clicks) FROM seo_queries GROUP BY page"
+            "SELECT page, SUM(total_shows), SUM(total_clicks) FROM seo_queries GROUP BY page ORDER BY page"
         ).fetchall()
         total_organic_clicks_row = con.execute(
             "SELECT SUM(total_clicks) FROM seo_queries"
@@ -2797,7 +2800,7 @@ def _organic_vs_other_by_page(con: Any) -> dict[str, tuple[int, int, int, int]]:
         "COUNT(*) FILTER (WHERE source_group != 'organic') AS other_visits, "
         "COUNT(*) FILTER (WHERE source_group != 'organic' AND "
         "(form_open OR form_submit OR call_click OR messenger_click)) AS other_engaged "
-        "FROM visits GROUP BY entry_page"
+        "FROM visits GROUP BY entry_page ORDER BY entry_page"
     ).fetchall()
     out: dict[str, tuple[int, int, int, int]] = {}
     for entry_page, ov, oe, otv, ote in rows:
@@ -2827,7 +2830,7 @@ def _organic_vs_other_by_page_device(con: Any) -> dict[tuple[str, str], tuple[in
         "COUNT(*) FILTER (WHERE source_group != 'organic') AS other_visits, "
         "COUNT(*) FILTER (WHERE source_group != 'organic' AND "
         "(form_open OR form_submit OR call_click OR messenger_click)) AS other_engaged "
-        f"FROM visits WHERE {_exclude_unknown_device_sql()} GROUP BY entry_page, device"
+        f"FROM visits WHERE {_exclude_unknown_device_sql()} GROUP BY entry_page, device ORDER BY entry_page, device"
     ).fetchall()
     out: dict[tuple[str, str], tuple[int, int, int, int]] = {}
     for entry_page, device, ov, oe, otv, ote in rows:
@@ -3005,13 +3008,13 @@ def _run_s24(paths: Any, confidence_cap: str, metrics_dir: Path) -> None:
             "SELECT page, month, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
             "WHERE source = 'gsc' "
             "AND NULLIF(TRIM(CAST(page AS VARCHAR)), '') IS NOT NULL "
-            "GROUP BY page, month"
+            "GROUP BY page, month ORDER BY page, month"
         ).fetchall()
         by_page_device_month = con.execute(
             "SELECT page, device, month, SUM(total_shows), SUM(total_clicks) FROM seo_queries "
             "WHERE source = 'gsc' "
             "AND NULLIF(TRIM(CAST(page AS VARCHAR)), '') IS NOT NULL "
-            f"AND {_exclude_unknown_device_sql()} GROUP BY page, device, month"
+            f"AND {_exclude_unknown_device_sql()} GROUP BY page, device, month ORDER BY page, device, month"
         ).fetchall()
         organic_by_page = _organic_visits_by_page(con)
         organic_by_page_device = _organic_visits_by_page_device(con)

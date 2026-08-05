@@ -258,6 +258,35 @@ def _resolve_data_window(
 
 
 # ── Этапы (каркас; тяжёлая логика — в слоях) ───────────────────────────────
+def _log_dependency_table(log: Any) -> list[dict[str, Any]]:
+    """Напечатать таблицу «зависимость -> есть/нет -> затронутые блоки».
+
+    Отсутствие пакета — предупреждение, а не остановка (принцип 4): затронутые
+    блоки уйдут в деградацию на своём этапе. Смысл таблицы в том, чтобы сказать
+    об этом на первой секунде прогона, а не на импорте блока в середине compute.
+    Возвращает строки статуса (используется тестами).
+    """
+    rows = degradation_mod.check_dependencies()
+    log("зависимости окружения (requirements.txt):")
+    log(degradation_mod.format_dependency_table(rows))
+    missing = degradation_mod.missing_dependencies(rows)
+    log("")
+    if missing:
+        for row in missing:
+            affects = ", ".join(row["affects"]) or "-"
+            log(
+                f"ПРЕДУПРЕЖДЕНИЕ: нет зависимости {row['module']} "
+                f"(pip: {row['package']}) — затронуто: {affects}. "
+                "Установить: pip install -r requirements.txt"
+            )
+        log(
+            "intake: отсутствующие зависимости — предупреждение, не остановка; "
+            "затронутые блоки уйдут в degradation_report."
+        )
+        log("")
+    return rows
+
+
 def run_intake(paths: ClientPaths, log: StageLogger) -> bool:
     """Валидация config.yaml и .env, лёгкий ping заявленных API.
 
@@ -286,6 +315,7 @@ def run_intake(paths: ClientPaths, log: StageLogger) -> bool:
         log(f"{name:<14}{('да' if enabled else 'нет'):<10}{available:<10}")
 
     log("")
+    _log_dependency_table(log)
 
     # ── Валидация data_window ────────────────────────────────────────────────
     data_window = config.get("data_window") or {}
@@ -561,8 +591,12 @@ def run_compute(paths: ClientPaths, log: StageLogger) -> None:
     )
 
     out = paths.metrics / "degradation_report.json"
-    with out.open("w", encoding="utf-8") as fh:
-        json.dump(report, fh, ensure_ascii=False, indent=2)
+
+    def _write_degradation_report() -> None:
+        with out.open("w", encoding="utf-8") as fh:
+            json.dump(report, fh, ensure_ascii=False, indent=2)
+
+    _write_degradation_report()
 
     counts = report["counts"]
     log(
@@ -571,6 +605,20 @@ def run_compute(paths: ClientPaths, log: StageLogger) -> None:
     )
 
     dispatch_result = compute_common.dispatch_blocks(paths, defaults, report)
+
+    # Блок, не импортировавшийся из-за отсутствующего пакета, — ограничение
+    # прогона наравне с отсутствующим источником: пишем его в degradation_report
+    # (и через него в отчёт), а не только в лог.
+    missing_deps = dispatch_result.get("missing_dependencies") or {}
+    if missing_deps:
+        degradation_mod.register_missing_dependencies(report, missing_deps)
+        _write_degradation_report()
+        for block, module in sorted(missing_deps.items()):
+            log(
+                f"compute: блок {block} пропущен — "
+                f"{degradation_mod.missing_dependency_reason(module)}"
+            )
+
     summary = compute_common.build_metrics_summary(report, dispatch_result)
     summary_path = compute_common.write_json_atomic(
         paths.metrics / "metrics_summary.json", summary

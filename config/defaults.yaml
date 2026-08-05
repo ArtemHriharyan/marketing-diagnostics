@@ -13,6 +13,29 @@ significance_alpha: 0.05        # уровень значимости для с�
 min_sample_visits: 500          # ниже этого числа визитов различия помечаются
                                 # "незначимо / мало данных"
 
+# Отбор значений разрезов высокой кардинальности (PERF-1A). Значение сегмента
+# ниже min_sample_visits не может стать находкой ни при каком confidence —
+# считать его бессмысленно, а объём артефакта при 28 тыс. значений (220volt.kz)
+# на два порядка превышает analyze_input_pack_byte_cap, то есть кап срезал бы
+# контекст и находки генерировались бы на обрубке. Непрошедшие значения не
+# выбрасываются: они схлопываются в одну строку "__other__" с суммарными
+# аддитивными счётчиками, поэтому сумма по разрезу сходится с итогом.
+segment_min_visits: 500         # = min_sample_visits: ниже порога сегмент не
+                                # даёт находки, расчёт гарантированно выброшен
+segment_max_values: 300         # жёсткий потолок числа строк одного разреза
+segment_coverage_target: 0.80   # добираем значения по убыванию визитов, пока
+                                # не покрыто столько визитов разреза (или пока
+                                # не исчерпан segment_max_values — что раньше)
+segment_filtered_dimensions:    # разрезы, к которым правило применяется;
+                                # разрезы вне списка считаются целиком
+                                # (month/channel/device — низкая кардинальность,
+                                # month к тому же вход seasonality)
+  - "entry_page"
+  - "search_phrase"
+  - "key_phrase"
+  - "placement"
+  - "region"
+
 goal_inflation_warning: 1.3     # достижения/визиты выше порога ->
                                 # цель, вероятно, переотрабатывает (двойной счёт)
 
@@ -68,6 +91,44 @@ analyze_candidate_impact_keys:         # приоритет полей влия�
   - "payload.visits"
   - "payload.clicks"
   - "payload.shows"
+
+attribution:
+  # Уровень ключа атрибуции (задача 7G) считается детерминированно по
+  # фактической canonical-схеме клиента: L2 — рабочий ключ склейки CRM с
+  # визитами, L1 — заполненное поле источника/utm, L0 — CRM есть, ключа нет,
+  # L_UNKNOWN — CRM-источника нет вовсе. Ни один порог и ни одно имя колонки
+  # НЕ живёт в коде (принцип 1 CLAUDE.md) — только здесь.
+
+  # Доли непустых значений, при которых поле считается фактически заполненным.
+  # Сравнение включительное: ровно порог -> поле проходит.
+  min_join_key_fill_rate: 0.5     # ключ склейки (client_id/yclid/gclid/контакт)
+  min_join_success_rate: 0.5      # доля записей CRM, для которых JOIN с visits
+                                  # дал хотя бы одно совпадение (L2 требует
+                                  # фактического JOIN, а не наличия колонки)
+  min_source_fill_rate: 0.5       # поле источника/utm в CRM (L1)
+  min_repeat_key_fill_rate: 0.5   # ключ склейки повторных обращений
+
+  # Значения-заглушки: формально непустые, фактически «не заполнено».
+  # Сравнение по нижнему регистру после trim.
+  placeholder_values: ["unknown", "не определено", "(not set)", "none", "null", "-", "n/a", "нет"]
+
+  # Пары «колонка CRM -> колонка visits» для фактического JOIN.
+  join_keys:
+    - crm_column: "client_id"
+      visits_column: "client_id"
+    - crm_column: "yclid"
+      visits_column: "click_id"
+    - crm_column: "gclid"
+      visits_column: "click_id"
+    - crm_column: "click_id"
+      visits_column: "click_id"
+  # Контакт: даёт L2 только вместе с непустым таймстампом И фактическим JOIN.
+  contact_keys:
+    - crm_column: "phone_hash"
+      visits_column: "phone_hash"
+  timestamp_columns: ["lead_date"]
+  source_columns: ["source_norm", "utm_source", "utm_campaign", "utm_source_raw"]
+  repeat_columns: ["is_new_client", "is_repeat"]
 
 crux_min_field_data: true             # если CrUX не отдал полевые данные —
                                        # находки CWV капаются в MED автоматически

@@ -303,7 +303,8 @@ def _cro_candidate(row: dict[str, Any]) -> bool:
 def _annotate_cro_rows(artifact: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Добавить единый candidate-контракт, не изменяя расчётные поля."""
     annotated: list[dict[str, Any]] = []
-    for index, source_row in enumerate(rows):
+    evidence_ids = common.assign_evidence_ids(artifact, [dict(row) for row in rows])
+    for source_row, evidence_id in zip(rows, evidence_ids):
         row = dict(source_row)
         check_id = str(row.get("check_id") or artifact.upper())
         finding = str(row.get("finding") or "")
@@ -337,7 +338,9 @@ def _annotate_cro_rows(artifact: str, rows: list[dict[str, Any]]) -> list[dict[s
             reason = f"{check_id.lower()}_detail"
 
         row.update({
-            "row_ref": f"{artifact}:{index}",
+            "evidence_id": evidence_id,
+            "evidence_label": common.evidence_label(row),
+            "row_ref": evidence_id,
             "candidate": candidate,
             "row_role": role,
             "candidate_reason": reason,
@@ -348,7 +351,7 @@ def _annotate_cro_rows(artifact: str, rows: list[dict[str, Any]]) -> list[dict[s
     context_refs: dict[str, list[str]] = {}
     for row in annotated:
         if row["row_role"] in {"summary", "baseline", "context"}:
-            context_refs.setdefault(str(row["check_id"]), []).append(row["row_ref"])
+            context_refs.setdefault(str(row["check_id"]), []).append(row["evidence_id"])
     for row in annotated:
         if row["candidate"]:
             row["context_refs"] = list(context_refs.get(str(row["check_id"]), []))
@@ -745,7 +748,7 @@ def _run_c04(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
     try:
         by_entry = con.execute(
             "SELECT entry_page, COUNT(*), COUNT(*) FILTER (WHERE is_ad) "
-            "FROM visits GROUP BY entry_page"
+            "FROM visits GROUP BY entry_page ORDER BY entry_page"
         ).fetchall()
     finally:
         con.close()
@@ -786,7 +789,7 @@ def _run_c05(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
     con = common.open_duckdb(paths)
     try:
         by_entry = con.execute(
-            "SELECT entry_page, COUNT(*) FROM visits GROUP BY entry_page"
+            "SELECT entry_page, COUNT(*) FROM visits GROUP BY entry_page ORDER BY entry_page"
         ).fetchall()
     finally:
         con.close()
@@ -927,7 +930,7 @@ def _run_c09(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
     try:
         by_device = con.execute(
             "SELECT device, COUNT(*), COUNT(*) FILTER (WHERE form_submit) "
-            "FROM visits GROUP BY device"
+            "FROM visits GROUP BY device ORDER BY device"
         ).fetchall()
     finally:
         con.close()
@@ -1060,7 +1063,7 @@ def _run_c12(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
         by_entry = con.execute(
             "SELECT entry_page, COUNT(*), "
             "COUNT(*) FILTER (WHERE NOT form_open AND NOT call_click AND NOT messenger_click) "
-            "FROM visits GROUP BY entry_page"
+            "FROM visits GROUP BY entry_page ORDER BY entry_page"
         ).fetchall()
     finally:
         con.close()
@@ -1192,7 +1195,7 @@ def _run_c21(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_
         segment_data = {
             dim: con.execute(
                 f'SELECT COALESCE("{dim}", \'unknown\') AS seg, COUNT(*), '
-                f'COUNT(*) FILTER (WHERE form_submit) FROM visits GROUP BY seg'
+                f'COUNT(*) FILTER (WHERE form_submit) FROM visits GROUP BY seg ORDER BY seg'
             ).fetchall()
             for dim in _C21_SEGMENT_DIMENSIONS
         }

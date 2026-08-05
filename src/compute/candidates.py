@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .common import write_json_atomic
+from .common import assign_evidence_ids, evidence_label, write_json_atomic
 
 
 ROW_ROLES: frozenset[str] = frozenset(
@@ -27,6 +27,8 @@ _CONTRACT_FIELDS: frozenset[str] = frozenset(
 )
 _FIXED_COLUMNS: tuple[str, ...] = (
     "artifact",
+    "evidence_id",
+    "evidence_label",
     "row_ref",
     "candidate",
     "row_role",
@@ -90,7 +92,7 @@ def _contract_state(row: dict[str, Any]) -> str:
 
 def _normalise_row(
     artifact: str,
-    index: int,
+    fallback_ref: str,
     row: dict[str, Any],
 ) -> tuple[dict[str, Any], bool]:
     """Нормализовать служебные поля; вернуть строку и признак их противоречия."""
@@ -110,11 +112,13 @@ def _normalise_row(
     elif not candidate and role == "candidate":
         invalid = True
 
-    raw_ref = row.get("row_ref")
+    raw_ref = row.get("evidence_id") or row.get("row_ref")
     if isinstance(raw_ref, str) and raw_ref:
         row_ref = raw_ref
     else:
-        row_ref = f"{artifact}:{index}"
+        # Легаси-артефакт без разметки: ID всё равно считается от содержания
+        # строки (см. common.assign_evidence_ids), а не от её позиции.
+        row_ref = fallback_ref
         if raw_ref is not None:
             invalid = True
 
@@ -129,6 +133,8 @@ def _normalise_row(
     normalised.update(
         {
             "artifact": artifact,
+            "evidence_id": row_ref,
+            "evidence_label": row.get("evidence_label") or evidence_label(row),
             "row_ref": row_ref,
             "candidate": candidate,
             "row_role": role,
@@ -140,7 +146,10 @@ def _normalise_row(
 
 
 def _fingerprint(row: dict[str, Any]) -> str:
-    semantic_row = {key: value for key, value in row.items() if key != "row_ref"}
+    semantic_row = {
+        key: value for key, value in row.items()
+        if key not in ("row_ref", "evidence_id", "evidence_label")
+    }
     return json.dumps(semantic_row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -210,8 +219,9 @@ def build_analysis_candidates(metrics_dir: Path) -> dict[str, Any]:
         else:
             audit["status"] = "partial"
 
-        for index, row in enumerate(rows):
-            normalised, invalid = _normalise_row(path.stem, index, row)
+        fallback_refs = assign_evidence_ids(path.stem, rows)
+        for row, fallback_ref in zip(rows, fallback_refs):
+            normalised, invalid = _normalise_row(path.stem, fallback_ref, row)
             invalid_annotation_rows += int(invalid)
             records.append(normalised)
         artifact_coverage.append(audit)

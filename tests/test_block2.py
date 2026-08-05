@@ -509,13 +509,15 @@ def test_registry_unavailable_overwrites_contract_metric(tmp_path, check_id):
 
     assert check_id.lower() in written
     rows = _read_metric(paths, check_id.lower())
-    assert rows == [{
+    assert len(rows) == 1 and rows[0]["row_ref"] == rows[0]["evidence_id"]
+    assert rows[0]["evidence_id"].startswith(f"{check_id.lower()}:")
+    assert {k: v for k, v in rows[0].items()
+            if k not in ("evidence_id", "evidence_label", "row_ref")} == {
         "check_id": check_id,
         "status": "unavailable",
         "reason": "нет источника: обязательный контракт",
-        "row_ref": f"{check_id.lower()}:0",
         "candidate": False,
         "row_role": "limitation",
         "candidate_reason": f"{check_id.lower()}_unavailable",
         "context_refs": [],
-    }]
+    }

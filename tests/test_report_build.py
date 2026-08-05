@@ -271,9 +271,13 @@ def test_findings_section_no_truncation_note_when_within_limit(tmp_path):
 
 # ── 6. Глоссарий ─────────────────────────────────────────────────────────
 
-def test_glossary_loaded_from_real_config_has_15_to_20_terms():
+def test_glossary_loaded_from_real_config_has_15_to_25_terms():
+    # Верхняя граница поднята с 20 до 25 в задаче 7F: секция «Экономика
+    # привлечения» вводит пять обязательных терминов (веб-конверсия,
+    # стоимость веб-конверсии, сделка, общая стоимость клиента, уровень
+    # атрибуции) — расширение контракта глоссария задано явно.
     glossary = build_report.load_glossary()
-    assert 15 <= len(glossary) <= 20
+    assert 15 <= len(glossary) <= 25
     assert all("term" in entry and "definition" in entry for entry in glossary)
 
 

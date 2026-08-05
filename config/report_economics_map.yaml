@@ -1,0 +1,324 @@
+# Карта «строка отчёта -> ключ в конкретном файле data/metrics/».
+#
+# Задача 7E: единственный контракт, по которому слой report получает уже
+# посчитанную экономику. Здесь НЕТ формул: только адреса ключей. Report
+# ничего не вычисляет (ни делений, ни сумм) — принципы 2 и 7 CLAUDE.md,
+# marketing-diagnostics-methodology-v2.md §8 (сборка уже посчитанного,
+# категории не смешиваются).
+#
+# Все `path` ниже проверены по фактическим файлам клиента pognali.rent
+# (data/metrics/cost_summary.json, acquisition_economics.json,
+# money_frame.json). Единственное исключение помечено явно
+# `source_status: not_emitted_by_compute` — это поле, которого compute пока
+# не отдаёт (cost_per_deal_by_source); оно читается по тому же механизму и
+# при отсутствии даёт «недоступно», а не подставленное значение.
+#
+# Синтаксис `path`: список шагов. Шаг-строка — ключ словаря. Шаг-словарь
+# `{where: {field: <ключ>, equals: <значение>}}` — выбор элемента списка по
+# значению поля (выбор, не вычисление). Пустой список — документ целиком.
+#
+# ВАЛИДАЦИЯ АДРЕСОВ (задача 7H). При загрузке карты каждый адрес обязан
+# либо разрешаться в присутствующем файле metrics, либо нести
+# `source_status: not_emitted_by_compute`. Третьего не дано: неразрешимый
+# непомеченный адрес роняет сборку отчёта с указанием строки этой карты, а
+# не молча превращается в «не посчитано». Шаг `where` — исключение по
+# смыслу: непопадание фильтра в элемент списка есть факт данных клиента
+# (записи такого вида в файле нет), а не ошибка адреса; ошибкой адреса
+# считается только несовпадение структуры — отсутствующий ключ словаря
+# либо контейнер не того типа. `item_fields` валидируются не как единый
+# адрес, а поэлементно: у каждой модели свой набор заполненных полей, их
+# отсутствие уже отражается в `missing_fields` элемента.
+
+version: 1
+
+files:
+  cost_summary:
+    filename: cost_summary.json
+    label: "Расход по данным рекламных кабинетов"
+  acquisition_economics:
+    filename: acquisition_economics.json
+    label: "Экономика привлечения"
+  money_frame:
+    filename: money_frame.json
+    label: "Денежная рамка (блок M)"
+
+# Уровень ключа атрибуции: L0 (только общая стоимость), L1, L2,
+# L_UNKNOWN. Значение берётся из metrics по указанному пути и НЕ
+# хардкодится. Источник — строка `kind: attribution` в money_frame.json
+# (src/compute/money_frame.py, _attribution_row): compute пишет уровень
+# только вместе с доказательством по каждой проверенной колонке
+# (`attribution_evidence`), поэтому доказательство читается тем же
+# адресом. Строки может не быть вовсе (секция `attribution` не задана в
+# config/defaults.yaml) — это факт данных прогона, фильтр `where` просто
+# не находит элемент, и фиксируется fallback.
+attribution_level:
+  allowed: ["L0", "L1", "L2", "L_UNKNOWN"]
+  fallback: "L_UNKNOWN"
+  file: money_frame
+  path: [{where: {field: "kind", equals: "attribution"}}, "attribution_level"]
+  evidence_path: [{where: {field: "kind", equals: "attribution"}}, "attribution_evidence"]
+
+# Склейка повторных обращений: доступна ли она в данных CRM. Нужна пункту
+# 3 секции (стоимость сделки или обращения против стоимости клиента) и
+# пункту 5. `status` различает постоянное ограничение источника
+# (`not_computable`) и временно не посчитанную величину
+# (`not_computed_yet`) — тексты у них разные.
+unique_customers:
+  label: "Склейка повторных обращений"
+  file: money_frame
+  path: [{where: {field: "kind", equals: "attribution"}}, "unique_customers_available"]
+  status_path: [{where: {field: "kind", equals: "attribution"}}, "unique_customers_status"]
+  fallback_status: not_computed_yet
+
+# Стоимость веб-конверсии — есть на любом уровне атрибуции: считается по
+# визитам/целям и доле CRM, источник сделки для неё не нужен.
+# НИКОГДА не подставляется вместо cost_per_deal_by_source.
+cost_per_web_conversion:
+  label: "Стоимость веб-конверсии по моделям привлечения"
+  file: acquisition_economics
+  path: ["models"]
+  item_key: "id"
+  item_fields:
+    id: ["id"]
+    result_name: ["result_name"]
+    mode: ["mode"]
+    basis: ["basis"]
+    status: ["status"]
+    value_rub: ["value_rub"]
+    unit: ["unit"]
+    numerator_amount_rub: ["numerator", "amount_rub"]
+    denominator_value: ["denominator", "value"]
+    formula: ["formula"]
+    assumptions: ["assumptions"]
+    limitations: ["limitations"]
+
+# Стоимость сделки в разрезе источника — доступна ТОЛЬКО при L1/L2.
+# На L0 это не «не посчитано», а принципиально недоступная величина:
+# источник сделки не фиксируется в CRM. Отдельное поле контракта,
+# сливать с cost_per_web_conversion запрещено.
+cost_per_deal_by_source:
+  label: "Стоимость сделки по источникам"
+  requires_attribution_level: ["L1", "L2"]
+  source_status: not_emitted_by_compute
+  file: acquisition_economics
+  path_when_available: ["cost_per_deal_by_source"]
+  unavailable_reason_l0: "недоступно: источник сделки не фиксируется в CRM"
+  unavailable_reason_unknown: "недоступно: уровень атрибуции не определён"
+
+# ── Закрытый словарь клиентских формулировок (задача 7H) ────────────────
+# Секция отчёта рендерит причину «не посчитано» ТОЛЬКО фразой отсюда, по
+# коду причины из контракта. Внутренние строки (адрес ключа, имя файла,
+# check_id, id задачи, названия слоёв и форматов хранения) в клиентский
+# документ не попадают в принципе: их там нечем напечатать. Код без фразы
+# в словаре рендерится как `default` — это защита от утечки, а не
+# отсутствие причины.
+client_reason_phrases:
+  default: "данных источника недостаточно"
+  source_file_missing: "данные этого источника за период не собраны"
+  key_missing: "данных источника недостаточно"
+  value_not_computed: "показатель за период не рассчитан"
+  check_skipped: "проверка, дающая этот показатель, не выполнена при текущих источниках"
+  model_not_computed: "модель привлечения за период не рассчитана"
+  deal_source_not_recorded: "источник сделки не фиксируется в CRM"
+  attribution_level_unknown: "уровень атрибуции не определён"
+
+# Ограничение величины: постоянное (нужно внедрять недостающее) против
+# временно отсутствующего (внедрять нечего, нужна выгрузка). Тексты
+# намеренно разные — это разные для клиента ситуации.
+client_limitation_phrases:
+  not_computable:
+    nature: >-
+      Постоянное ограничение при текущем составе данных CRM: повторные
+      обращения не склеиваются между собой — в записи нет признака, по
+      которому её можно отнести к тому же обратившемуся.
+    remedy: >-
+      Чтобы разделение стало возможным, нужно внедрить в CRM заполняемый
+      признак повторного обращения либо контакт в открытом виде, по
+      которому записи склеиваются между собой.
+  not_computed_yet:
+    nature: >-
+      Временно отсутствует: данные для разделения первичных и повторных
+      обращений за период не собраны, поэтому расчёт не выполнялся.
+    remedy: >-
+      Внедрять ничего не нужно — показатель считается сразу, как только
+      данные за период будут собраны.
+  default:
+    nature: "Показатель за период не рассчитан."
+    remedy: "Что именно для этого нужно — определяется после разбора данных источника."
+
+rows:
+  # ── Расход (cost_summary.json) ──────────────────────────────────────
+  - id: spend_money_basis
+    label: "База денег расхода"
+    group: spend
+    file: cost_summary
+    path: ["money_basis"]
+    unit: enum
+  - id: spend_total_rub
+    label: "Общий расход за период"
+    group: spend
+    file: cost_summary
+    path: ["total_rub"]
+    unit: rub
+  - id: spend_by_channel_columns
+    label: "Расход по каналам — колонки"
+    group: spend
+    file: cost_summary
+    path: ["channel_total_columns"]
+    unit: columns
+  - id: spend_by_channel_rows
+    label: "Расход по каналам — строки"
+    group: spend
+    file: cost_summary
+    path: ["channel_total_rows"]
+    unit: table
+  - id: spend_by_component_columns
+    label: "Расход по компонентам — колонки"
+    group: spend
+    file: cost_summary
+    path: ["component_total_columns"]
+    unit: columns
+  - id: spend_by_component_rows
+    label: "Расход по компонентам — строки"
+    group: spend
+    file: cost_summary
+    path: ["component_total_rows"]
+    unit: table
+  - id: spend_by_month_columns
+    label: "Расход по месяцам — колонки"
+    group: spend
+    file: cost_summary
+    path: ["monthly_total_columns"]
+    unit: columns
+  - id: spend_by_month_rows
+    label: "Расход по месяцам — строки"
+    group: spend
+    file: cost_summary
+    path: ["monthly_total_rows"]
+    unit: table
+  - id: spend_limitations
+    label: "Оговорки к расходу"
+    group: spend
+    file: cost_summary
+    path: ["limitations"]
+    unit: list
+
+  # ── CRM (acquisition_economics.json -> crm) ─────────────────────────
+  - id: crm_record_unit
+    label: "Единица записи CRM"
+    group: crm
+    file: acquisition_economics
+    path: ["crm", "record_unit"]
+    unit: enum
+  - id: crm_record_count
+    label: "Число записей CRM за период"
+    group: crm
+    file: acquisition_economics
+    path: ["crm", "record_count"]
+    unit: count
+  - id: crm_total_revenue_rub
+    label: "Выручка по данным CRM за период"
+    group: crm
+    file: acquisition_economics
+    path: ["crm", "total_revenue_rub"]
+    unit: rub
+  - id: crm_average_revenue_rub
+    label: "Средний чек записи CRM"
+    group: crm
+    file: acquisition_economics
+    path: ["crm", "average_revenue_rub"]
+    unit: rub
+  - id: crm_median_revenue_rub
+    label: "Медианный чек записи CRM"
+    group: crm
+    file: acquisition_economics
+    path: ["crm", "median_revenue_rub"]
+    unit: rub
+  - id: crm_unique_customers
+    label: "Уникальных клиентов в CRM"
+    group: crm
+    file: acquisition_economics
+    path: ["crm", "unique_customers"]
+    unit: count
+  - id: crm_average_revenue_per_customer_rub
+    label: "Средняя выручка на клиента"
+    group: crm
+    file: acquisition_economics
+    path: ["crm", "average_revenue_per_customer_rub"]
+    unit: rub
+  - id: crm_status
+    label: "Статус блока CRM"
+    group: crm
+    file: acquisition_economics
+    path: ["crm", "status"]
+    unit: enum
+  - id: crm_limitations
+    label: "Оговорки к данным CRM"
+    group: crm
+    file: acquisition_economics
+    path: ["crm", "limitations"]
+    unit: list
+
+  # ── Модели привлечения (acquisition_economics.json -> models) ───────
+  - id: acquisition_money_basis
+    label: "База денег экономики привлечения"
+    group: acquisition
+    file: acquisition_economics
+    path: ["money_basis"]
+    unit: enum
+  - id: acq_estimated_site_booking_value_rub
+    label: "Оценочная стоимость сайт-брони"
+    group: acquisition
+    file: acquisition_economics
+    path: ["models", {where: {field: "id", equals: "estimated_site_booking"}}, "value_rub"]
+    unit: rub
+  - id: acq_estimated_site_booking_unit
+    label: "Единица оценочной стоимости сайт-брони"
+    group: acquisition
+    file: acquisition_economics
+    path: ["models", {where: {field: "id", equals: "estimated_site_booking"}}, "unit"]
+    unit: enum
+  - id: acq_estimated_site_booking_denominator_value
+    label: "Знаменатель оценочной модели"
+    group: acquisition
+    file: acquisition_economics
+    path: ["models", {where: {field: "id", equals: "estimated_site_booking"}}, "denominator", "value"]
+    unit: count
+  - id: acq_estimated_site_booking_numerator_amount_rub
+    label: "Числитель оценочной модели"
+    group: acquisition
+    file: acquisition_economics
+    path: ["models", {where: {field: "id", equals: "estimated_site_booking"}}, "numerator", "amount_rub"]
+    unit: rub
+  - id: acq_tracked_direct_booking_value_rub
+    label: "Стоимость отслеживаемой конверсии Директа"
+    group: acquisition
+    file: acquisition_economics
+    path: ["models", {where: {field: "id", equals: "tracked_direct_booking"}}, "value_rub"]
+    unit: rub
+  - id: acq_tracked_direct_booking_unit
+    label: "Единица отслеживаемой конверсии Директа"
+    group: acquisition
+    file: acquisition_economics
+    path: ["models", {where: {field: "id", equals: "tracked_direct_booking"}}, "unit"]
+    unit: enum
+  - id: acq_tracked_direct_booking_denominator_value
+    label: "Знаменатель отслеживаемой модели"
+    group: acquisition
+    file: acquisition_economics
+    path: ["models", {where: {field: "id", equals: "tracked_direct_booking"}}, "denominator", "value"]
+    unit: count
+  - id: acq_tracked_direct_booking_numerator_amount_rub
+    label: "Числитель отслеживаемой модели"
+    group: acquisition
+    file: acquisition_economics
+    path: ["models", {where: {field: "id", equals: "tracked_direct_booking"}}, "numerator", "amount_rub"]
+    unit: rub
+
+  # ── Денежная рамка (money_frame.json — список записей) ──────────────
+  - id: money_frame_items
+    label: "Записи денежной рамки (категории и подытоги)"
+    group: money_frame
+    file: money_frame
+    path: []
+    unit: list

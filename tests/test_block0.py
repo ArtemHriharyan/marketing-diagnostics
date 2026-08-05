@@ -666,11 +666,18 @@ def test_d08_missing_campaign_status_writes_unavailable(tmp_path):
 
     artifacts = block0.run(paths, DEFAULTS, {"D08"})
     assert artifacts == ["d08"]
-    assert _read_metric(paths, "d08") == [{
+    rows = _read_metric(paths, "d08")
+    # evidence_id/evidence_label — детерминированный хеш содержания строки
+    # (DET-1), позиционного "d08:0" больше нет; см. common.assign_evidence_ids.
+    assert len(rows) == 1
+    assert rows[0]["row_ref"] == rows[0]["evidence_id"]
+    assert rows[0]["evidence_id"].startswith("d08:")
+    assert rows[0]["evidence_label"].startswith("D08 · status=unavailable")
+    assert {k: v for k, v in rows[0].items() if k not in ("evidence_id", "evidence_label", "row_ref")} == {
         "check_id": "D08", "status": "unavailable", "reason": "нет источника: статусы кампаний Директа",
-        "row_ref": "d08:0", "candidate": False, "row_role": "limitation",
+        "candidate": False, "row_role": "limitation",
         "candidate_reason": "d08_unavailable", "context_refs": [],
-    }]
+    }
 
 
 def test_d08_confidence_capped_by_degradation_report(tmp_path):
@@ -1106,10 +1113,14 @@ def _run_d12(paths: _Paths, records: list[dict]) -> list[dict]:
 def test_d12_accepts_correct_one_to_one_join(tmp_path):
     paths = _Paths(tmp_path)
     rows = _run_d12(paths, [_join_record()])
-    assert rows == [{"check_id": "D12", "join_id": "test_join", "status": "pass",
-                     "violations": [], "has_problem": False, "confidence": "HIGH",
-                     "row_ref": "d12:0", "candidate": False, "row_role": "baseline",
-                     "candidate_reason": "d12_pass", "context_refs": []}]
+    assert len(rows) == 1 and rows[0]["row_ref"] == rows[0]["evidence_id"]
+    assert rows[0]["evidence_id"].startswith("d12:")
+    assert {k: v for k, v in rows[0].items()
+            if k not in ("evidence_id", "evidence_label", "row_ref")} == {
+        "check_id": "D12", "join_id": "test_join", "status": "pass",
+        "violations": [], "has_problem": False, "confidence": "HIGH",
+        "candidate": False, "row_role": "baseline",
+        "candidate_reason": "d12_pass", "context_refs": []}
 
 
 def test_d_candidate_contract_coverage_is_complete(tmp_path):

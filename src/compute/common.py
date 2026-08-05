@@ -11,6 +11,7 @@ src/compute/__init__.py и CLAUDE.md, раздел «Слои конвейера
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
@@ -147,6 +148,120 @@ def assert_confidence_within_cap(confidence: str, confidence_cap: str) -> None:
         )
 
 
+# ── evidence_id / evidence_label ────────────────────────────────────────────
+# Идентификатор строки-доказательства НЕ зависит от её позиции в артефакте.
+# Позиционный ID (`d08:0`) ломался дважды: между прогонами (DuckDB возвращает
+# группы в произвольном порядке) и между периодами одного клиента (новая
+# кампания сдвигала все последующие номера, и context_refs молча начинали
+# указывать на другую сущность). Новый ID — короткий хеш от измерений строки.
+EVIDENCE_ID_EXCLUDED_FIELDS: frozenset[str] = frozenset({
+    # служебный контракт слоя analyze — не часть тождества строки
+    "row_ref", "evidence_id", "evidence_label", "artifact",
+    "candidate", "row_role", "candidate_reason", "context_refs",
+    # производные от деградации, а не от самой строки
+    "confidence", "confidence_cap",
+    # отметки времени прогона (время прогона живёт только в manifest)
+    "generated_at", "computed_at", "run_started_at",
+})
+
+_EVIDENCE_LABEL_PRIORITY: tuple[str, ...] = (
+    "check_id", "finding", "status",
+    "campaign_name", "campaign_id", "ad_group_id", "ad_id",
+    "goal_name", "goal_id", "goal_group",
+    "query", "phrase", "normalized_phrase", "match_type",
+    "page", "entry_page", "href",
+    "funnel_id", "first_stage", "last_stage",
+    "segment_dimension", "segment_value", "segment",
+    "source", "source_group", "source_tag", "channel", "device",
+    "placement", "ad_network_type", "position_band", "month", "date",
+)
+_EVIDENCE_LABEL_MAX_FIELDS = 5
+_EVIDENCE_LABEL_MAX_VALUE = 60
+
+
+def _evidence_dimension_items(
+    row: dict[str, Any], *, include_bools: bool
+) -> list[list[Any]]:
+    """Измерения строки: строковые (и опционально булевы) поля, кроме служебных.
+
+    Числа сознательно не входят в тождество строки: это метрики, и они меняются
+    от периода к периоду и от появления соседних строк (медианы, доли), тогда
+    как ID обязан оставаться прежним у той же сущности.
+    """
+    items: list[list[Any]] = []
+    for key in sorted(row):
+        if key in EVIDENCE_ID_EXCLUDED_FIELDS:
+            continue
+        value = row[key]
+        if isinstance(value, bool):
+            if include_bools:
+                items.append([key, value])
+        elif isinstance(value, str):
+            items.append([key, value])
+    return items
+
+
+def _evidence_hash(artifact: str, level: int, items: list[list[Any]], ordinal: int) -> str:
+    payload = json.dumps(
+        [artifact, level, items, ordinal], ensure_ascii=False, separators=(",", ":")
+    )
+    digest = hashlib.blake2s(payload.encode("utf-8"), digest_size=5).hexdigest()
+    return f"{artifact}:{digest}"
+
+
+def evidence_label(row: dict[str, Any]) -> str:
+    """Человекочитаемое описание строки для аналитика.
+
+    Только для чтения глазами: ссылки (context_refs и любые перекрёстные)
+    строятся ТОЛЬКО по evidence_id, никогда по label.
+    """
+    items = dict(_evidence_dimension_items(row, include_bools=False))
+    ordered = [key for key in _EVIDENCE_LABEL_PRIORITY if key in items]
+    ordered += [key for key in sorted(items) if key not in _EVIDENCE_LABEL_PRIORITY]
+    parts = []
+    for key in ordered[:_EVIDENCE_LABEL_MAX_FIELDS]:
+        value = items[key]
+        if len(value) > _EVIDENCE_LABEL_MAX_VALUE:
+            value = value[: _EVIDENCE_LABEL_MAX_VALUE - 1] + "…"
+        parts.append(f"{key}={value}" if key != "check_id" else value)
+    return " · ".join(parts)
+
+
+def assign_evidence_ids(artifact: str, rows: list[dict[str, Any]]) -> list[str]:
+    """Вернуть evidence_id для каждой строки rows (в том же порядке).
+
+    Три уровня, каждый следующий применяется только к строкам, которые
+    предыдущий не различил:
+      1) строковые измерения строки;
+      2) + булевы измерения (``is_brand`` и подобные настоящие разрезы);
+      3) + порядковый номер внутри группы неразличимых строк — последнее
+         средство, когда строки совпадают по всем измерениям.
+    """
+    level1 = [_evidence_dimension_items(row, include_bools=False) for row in rows]
+    groups: dict[str, list[int]] = {}
+    for index, items in enumerate(level1):
+        groups.setdefault(json.dumps(items, ensure_ascii=False), []).append(index)
+
+    ids: list[str | None] = [None] * len(rows)
+    for indexes in groups.values():
+        if len(indexes) == 1:
+            index = indexes[0]
+            ids[index] = _evidence_hash(artifact, 1, level1[index], 0)
+            continue
+        subgroups: dict[str, list[int]] = {}
+        for index in indexes:
+            items = _evidence_dimension_items(rows[index], include_bools=True)
+            subgroups.setdefault(json.dumps(items, ensure_ascii=False), []).append(index)
+        for sub_indexes in subgroups.values():
+            unique = len(sub_indexes) == 1
+            for ordinal, index in enumerate(sub_indexes):
+                items = _evidence_dimension_items(rows[index], include_bools=True)
+                ids[index] = _evidence_hash(
+                    artifact, 2 if unique else 3, items, 0 if unique else ordinal
+                )
+    return [str(evidence_id) for evidence_id in ids]
+
+
 # ── Атомарная запись csv/json ───────────────────────────────────────────────
 def _atomic_write_text(path: Path, text: str) -> None:
     """Записать текст в path атомарно: временный файл в той же папке + os.replace."""
@@ -166,10 +281,37 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def canonical_float(value: float) -> float:
+    """Обрезать float до 12 значащих цифр — снять шум порядка суммирования.
+
+    DuckDB суммирует double параллельно, и порядок слагаемых между прогонами
+    может отличаться последними битами мантиссы. 12 значащих цифр заведомо
+    шире любого делового округления (блоки округляют до 2-4 знаков), поэтому
+    ни одно опубликованное число не меняется, а побайтовое сравнение файлов
+    перестаёт ловить нули в 16-м знаке.
+    """
+    if not math.isfinite(value):
+        return value
+    return float(f"{value:.12g}")
+
+
+def canonicalize(data: Any) -> Any:
+    """Рекурсивно применить canonical_float ко всем числам структуры."""
+    if isinstance(data, bool):
+        return data
+    if isinstance(data, float):
+        return canonical_float(data)
+    if isinstance(data, dict):
+        return {key: canonicalize(value) for key, value in data.items()}
+    if isinstance(data, (list, tuple)):
+        return [canonicalize(item) for item in data]
+    return data
+
+
 def write_json_atomic(path: Path, data: Any) -> Path:
     """Атомарно записать data как JSON (UTF-8, без ASCII-экранирования) в path."""
     path = Path(path)
-    _atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+    _atomic_write_text(path, json.dumps(canonicalize(data), ensure_ascii=False, indent=2))
     return path
 
 
@@ -209,10 +351,18 @@ def write_metric_artifact(
     json_path = metrics_dir / f"{name}.json"
     csv_path = metrics_dir / f"{name}.csv"
 
+    # Единый порядок ключей для json и csv: объединение колонок в порядке
+    # появления. Порядок строк задан блоком (ORDER BY по измерениям), поэтому
+    # он воспроизводим между прогонами.
+    fieldnames = _csv_fieldnames(rows)
+    rows = [
+        canonicalize({key: row[key] for key in fieldnames if key in row})
+        for row in rows
+    ]
+
     write_json_atomic(json_path, rows)
 
     if rows:
-        fieldnames = _csv_fieldnames(rows)
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=fieldnames, restval="")
         writer.writeheader()
@@ -238,10 +388,47 @@ BLOCK_MODULE_NAMES: tuple[str, ...] = (
 )
 
 
-def _import_block(name: str) -> Any:
+BLOCK_PACKAGE = "src.compute"
+
+
+def _import_block(name: str, package: str = BLOCK_PACKAGE) -> Any:
     import importlib
 
-    return importlib.import_module(f"src.compute.{name}")
+    return importlib.import_module(f"{package}.{name}")
+
+
+def _missing_module_name(exc: ImportError, block: str) -> str:
+    """Имя ненайденного модуля из ImportError (fallback — текст/имя блока)."""
+    return getattr(exc, "name", None) or str(exc) or block
+
+
+def _import_named_blocks(
+    block_names: Iterable[str],
+    package: str = BLOCK_PACKAGE,
+) -> tuple[list[tuple[str, Any]], dict[str, str]]:
+    """Импортировать модули блоков; вернуть (named_modules, missing_dependencies).
+
+    В try обёрнута ТОЛЬКО строка импорта и ловится ТОЛЬКО ImportError — блок,
+    которому не хватает пакета из requirements.txt, уходит в деградацию с
+    причиной "отсутствует зависимость: <модуль>", остальные блоки считаются
+    (принцип 4). Любое другое исключение на уровне модуля (ошибка в коде
+    блока, падение при инициализации) намеренно НЕ перехватывается и роняет
+    прогон: иначе баг маскируется под деградацию источника.
+
+    У модуля с отсутствующей зависимостью в named_modules стоит ``None`` —
+    порядок блоков сохраняется, чтобы block_status читался в порядке реестра.
+    """
+    named_modules: list[tuple[str, Any]] = []
+    missing: dict[str, str] = {}
+    for name in block_names:
+        try:
+            module = _import_block(name, package)
+        except ImportError as exc:
+            missing[name] = _missing_module_name(exc, name)
+            named_modules.append((name, None))
+        else:
+            named_modules.append((name, module))
+    return named_modules, missing
 
 
 def _remove_skipped_metric_artifacts(paths: Any, degradation_report: dict[str, Any]) -> None:
@@ -269,6 +456,7 @@ def dispatch_blocks(
     *,
     block_names: Iterable[str] = BLOCK_MODULE_NAMES,
     modules: Iterable[Any] | None = None,
+    block_package: str = BLOCK_PACKAGE,
 ) -> dict[str, Any]:
     """Вызвать run(paths, defaults, runnable_ids) каждого блока compute.
 
@@ -283,6 +471,11 @@ def dispatch_blocks(
     остановки остальных блоков (принцип 4). Любая другая ошибка блока также не
     должна ронять весь compute — соседние блоки обязаны отработать.
 
+    То же на границе импорта: ImportError (нет пакета из requirements.txt)
+    даёт статус "missing_dependency" и запись в ``missing_dependencies``
+    результата; прочие исключения на уровне модуля роняют прогон намеренно
+    (см. _import_named_blocks).
+
     ``modules`` — явный список объектов с методом ``run`` вместо импорта по
     block_names; используется тестами для проверки dispatch-логики без
     реальных (пока нереализованных) block0..block6.
@@ -290,8 +483,11 @@ def dispatch_blocks(
     runnable_ids = set(degradation_report.get("runnable_check_ids") or [])
     _remove_skipped_metric_artifacts(paths, degradation_report)
 
+    missing_dependencies: dict[str, str] = {}
     if modules is None:
-        named_modules = [(name, _import_block(name)) for name in block_names]
+        named_modules, missing_dependencies = _import_named_blocks(
+            block_names, block_package
+        )
     else:
         named_modules = [(getattr(m, "__name__", str(i)), m) for i, m in enumerate(modules)]
 
@@ -300,6 +496,12 @@ def dispatch_blocks(
     block_errors: dict[str, str] = {}
 
     for name, module in named_modules:
+        if module is None:
+            from ..pipeline.degradation import missing_dependency_reason
+
+            block_status[name] = "missing_dependency"
+            block_errors[name] = missing_dependency_reason(missing_dependencies[name])
+            continue
         try:
             produced = module.run(paths, defaults, runnable_ids)
             artifacts.extend(produced or [])
@@ -317,6 +519,8 @@ def dispatch_blocks(
     }
     if block_errors:
         result["block_errors"] = block_errors
+    if missing_dependencies:
+        result["missing_dependencies"] = missing_dependencies
     return result
 
 
@@ -368,4 +572,6 @@ def build_metrics_summary(
     }
     if dispatch_result.get("block_errors"):
         summary["block_errors"] = dispatch_result["block_errors"]
+    if dispatch_result.get("missing_dependencies"):
+        summary["missing_dependencies"] = dispatch_result["missing_dependencies"]
     return summary
