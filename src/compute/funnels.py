@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
@@ -13,18 +14,33 @@ import yaml
 from . import common
 
 
+# page_type — производное измерение: тип страницы входа по правилам клиента
+# (config.yaml: page_types). Стоит рядом с entry_page, а не вместо него:
+# entry_page отвечает на вопрос «какая страница», page_type — «какой класс
+# страниц», и только второй вопрос имеет ответ при 28 тыс. сырых URL.
+_PAGE_TYPE_DIMENSION = "page_type"
+_ENTRY_PAGE_DIMENSION = "entry_page"
+
 _SEGMENT_COLUMNS: tuple[tuple[str, str], ...] = (
     ("month", "date"),
     ("channel", "source_group"),
     ("device", "device"),
-    ("entry_page", "entry_page"),
+    (_PAGE_TYPE_DIMENSION, _PAGE_TYPE_DIMENSION),
+    (_ENTRY_PAGE_DIMENSION, _ENTRY_PAGE_DIMENSION),
 )
 
+# Значение page_type для URL, не попавшего ни под одно правило клиента.
+# Это НЕ пропуск: строка "other" присутствует в разрезе всегда, её доля —
+# прямой измеритель полноты правил (высокая доля = правила неполны).
+_PAGE_TYPE_OTHER = "other"
+
 # PERF-1A. Значение разреза, не прошедшее отбор, не считается отдельной строкой:
-# по методологии сегмент ниже min_sample_visits не может стать находкой ни при
-# каком confidence, поэтому его расчёт — заведомо выброшенная работа, а объём
-# артефакта при этом ломает байт-кап стадии analyze. Все непрошедшие значения
-# схлопываются в одну строку, чтобы сумма по разрезу сходилась с итогом.
+# расчёт значения с единичными визитами не окупается, а объём артефакта при
+# этом ломает байт-кап стадии analyze. Все непрошедшие значения схлопываются в
+# одну строку, чтобы сумма по разрезу сходилась с итогом.
+# SEG-FIX: порог отбора здесь — segment_compute_min_visits (порог РАСЧЁТА),
+# а не min_sample_visits (порог достаточности выборки). Достаточность выборки
+# проверяется позже, там, где сегмент становится кандидатом в находку.
 _OTHER_VALUE = "__other__"
 
 # Величины схлопнутой строки, которые нельзя получить сложением непрошедших
@@ -79,6 +95,60 @@ def _normalise_funnels(config: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def _normalise_page_types(config: dict[str, Any]) -> list[tuple[str, list[re.Pattern[str]]]]:
+    """Правила page_type из конфига клиента: [(id, [скомпилированные regex])].
+
+    Список УПОРЯДОЧЕН, выигрывает первое совпадение — порядок значим и живёт
+    в конфиге клиента, а не в коде (принцип 1). Записи без id или без единого
+    валидного шаблона пропускаются: битое правило не должно ронять расчёт
+    (принцип 4), оно просто не участвует в классификации.
+    """
+    raw = config.get("page_types")
+    if not isinstance(raw, list):
+        return []
+
+    rules: list[tuple[str, list[re.Pattern[str]]]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        page_type = item.get("id")
+        patterns = item.get("match")
+        if not isinstance(page_type, str) or not page_type:
+            continue
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        if not isinstance(patterns, list):
+            continue
+        compiled: list[re.Pattern[str]] = []
+        for pattern in patterns:
+            if not isinstance(pattern, str) or not pattern:
+                continue
+            try:
+                compiled.append(re.compile(pattern))
+            except re.error:
+                continue
+        if compiled:
+            rules.append((page_type, compiled))
+    return rules
+
+
+def _classify_page_type(
+    value: Any, rules: list[tuple[str, list[re.Pattern[str]]]]
+) -> str | None:
+    """Тип страницы входа по правилам клиента; None — самой страницы нет.
+
+    Непопавший под правила URL получает "other", а не пропуск: разрез обязан
+    покрывать все визиты с известной страницей входа.
+    """
+    if value is None or value != value:  # None и NaN — «страницы входа нет»
+        return None
+    text = str(value)
+    for page_type, patterns in rules:
+        if any(pattern.search(text) for pattern in patterns):
+            return page_type
+    return _PAGE_TYPE_OTHER
+
+
 def _month(value: Any) -> str | None:
     if value is None:
         return None
@@ -92,7 +162,9 @@ def _table_columns(con: Any, table: str) -> set[str]:
     return {str(row[0]) for row in con.execute(f"DESCRIBE {table}").fetchall()}
 
 
-def _load_visit_data(paths: Any) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, int]]]:
+def _load_visit_data(
+    paths: Any, page_type_rules: list[tuple[str, list[re.Pattern[str]]]] | None = None
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, int]]]:
     con = common.open_duckdb(paths)
     try:
         visit_columns = _table_columns(con, "visits")
@@ -101,11 +173,23 @@ def _load_visit_data(paths: Any) -> tuple[dict[str, dict[str, Any]], dict[str, d
         selected = [column for _, column in _SEGMENT_COLUMNS if column in visit_columns]
         select_sql = ", ".join(["visit_id", *(f'"{column}"' for column in selected)])
         visit_rows = con.execute(f"SELECT {select_sql} FROM visits").fetchall()
+        # page_type считается из entry_page по правилам конфига — отдельной
+        # колонки в canonical нет и не должно быть (это разрез слоя compute).
+        # Без правил в config.yaml разреза page_type у клиента просто нет:
+        # классифицировать URL в коде нечем (принцип 1).
+        rules = page_type_rules or []
+        derive_page_type = bool(rules) and (
+            _ENTRY_PAGE_DIMENSION in selected and _PAGE_TYPE_DIMENSION not in selected
+        )
         visits: dict[str, dict[str, Any]] = {}
         for row in visit_rows:
             visit_id = str(row[0])
             values = dict(zip(selected, row[1:]))
             values["date"] = _month(values.get("date"))
+            if derive_page_type:
+                values[_PAGE_TYPE_DIMENSION] = _classify_page_type(
+                    values.get(_ENTRY_PAGE_DIMENSION), rules
+                )
             visits.setdefault(visit_id, values)
 
         goal_columns = _table_columns(con, "visit_goals")
@@ -181,15 +265,21 @@ def _load_defaults(defaults: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _segment_policy(defaults: dict[str, Any] | None) -> dict[str, Any]:
-    """Правило отбора значений разреза (config/defaults.yaml, принцип 1)."""
+    """Правило отбора значений разреза (config/defaults.yaml, принцип 1).
+
+    `min_visits` — порог РАСЧЁТА (`segment_compute_min_visits`), не порог
+    достаточности выборки (`min_sample_visits`): см. комментарий в
+    config/defaults.yaml. Старый ключ `segment_min_visits` не читается.
+    """
     values = _load_defaults(defaults)
     dimensions = values.get("segment_filtered_dimensions")
     return {
-        "min_visits": int(
-            values.get("segment_min_visits", values.get("min_sample_visits", 500))
-        ),
-        "max_values": int(values.get("segment_max_values", 300)),
+        "min_visits": int(values.get("segment_compute_min_visits", 30)),
+        "max_values": int(values.get("segment_max_values", 2000)),
         "coverage_target": float(values.get("segment_coverage_target", 0.80)),
+        "entry_page_top_per_type": int(
+            values.get("segment_entry_page_top_per_type", 1500)
+        ),
         "dimensions": sorted(
             str(item) for item in dimensions if isinstance(item, (str, int))
         ) if isinstance(dimensions, list) else [],
@@ -210,14 +300,28 @@ def _segment_counts(
 
 
 def _select_segment_values(
-    dimension: str, counts: dict[Any, int], policy: dict[str, Any]
+    dimension: str,
+    counts: dict[Any, int],
+    policy: dict[str, Any],
+    groups: dict[Any, str] | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
     """Отобрать значения разреза до входа в цикл; вернуть отбор и его покрытие.
 
-    Значения, прошедшие `segment_min_visits`, сортируются по объёму визитов
-    убыв.; берутся, пока не достигнут `segment_coverage_target` ИЛИ не исчерпан
-    `segment_max_values` — что наступит раньше. Правило применяется только к
-    разрезам из `segment_filtered_dimensions`.
+    Берутся все значения от `segment_compute_min_visits` визитов и выше, по
+    убыванию визитов, пока не исчерпан `segment_max_values`. Значения ниже
+    порога расчёта схлопываются в `__other__`.
+
+    `segment_coverage_target` — ЦЕЛЬ, а не правило остановки: раньше отбор
+    прекращался при её достижении, и разрез с одной доминирующей страницей
+    (pognali.rent: "/" даёт 61% визитов) сводился к двум строкам. Теперь
+    достижение цели только фиксируется в манифесте (`coverage_target_met`).
+
+    `groups` — принадлежность значения к производному классу (для entry_page —
+    page_type). При заданном groups внутри каждого класса остаются только
+    топ-`segment_entry_page_top_per_type` значений по визитам, чтобы один класс
+    страниц не выбрал весь бюджет строк и не вытеснил остальные.
+
+    Правило применяется только к разрезам из `segment_filtered_dimensions`.
     """
     visits_total = sum(counts.values())
     rule_applied = dimension in policy["dimensions"]
@@ -225,31 +329,47 @@ def _select_segment_values(
     if not rule_applied:
         selected = list(counts)
         visits_selected = visits_total
+        values_below_threshold = 0
+        values_dropped_by_group_cap = 0
     else:
-        eligible = [
+        ordered = [
             value for value in sorted(counts, key=lambda item: (-counts[item], str(item)))
             if counts[value] >= policy["min_visits"]
         ]
-        selected = []
-        visits_selected = 0
-        for value in eligible:
-            selected.append(value)
-            visits_selected += counts[value]
-            if len(selected) >= policy["max_values"]:
-                break
-            if visits_total and visits_selected / visits_total >= policy["coverage_target"]:
-                break
+        values_below_threshold = len(counts) - len(ordered)
+        if groups:
+            per_type_cap = policy["entry_page_top_per_type"]
+            taken_per_group: dict[str, int] = defaultdict(int)
+            capped: list[Any] = []
+            for value in ordered:
+                group = groups.get(value, _PAGE_TYPE_OTHER)
+                if taken_per_group[group] >= per_type_cap:
+                    continue
+                taken_per_group[group] += 1
+                capped.append(value)
+            values_dropped_by_group_cap = len(ordered) - len(capped)
+            ordered = capped
+        else:
+            values_dropped_by_group_cap = 0
+        selected = ordered[: policy["max_values"]]
+        visits_selected = sum(counts[value] for value in selected)
 
+    coverage_ratio = round(visits_selected / visits_total, 4) if visits_total else None
     return sorted(selected, key=str), {
         "dimension": dimension,
         "rule_applied": rule_applied,
         "values_total": len(counts),
         "values_selected": len(selected),
         "values_collapsed": len(counts) - len(selected),
+        "values_below_compute_threshold": values_below_threshold,
+        "values_dropped_by_group_cap": values_dropped_by_group_cap,
         "visits_total": visits_total,
         "visits_selected": visits_selected,
         "visits_collapsed": visits_total - visits_selected,
-        "coverage_ratio": round(visits_selected / visits_total, 4) if visits_total else None,
+        "coverage_ratio": coverage_ratio,
+        "coverage_target_met": (
+            coverage_ratio >= policy["coverage_target"] if coverage_ratio is not None else None
+        ),
     }
 
 
@@ -362,7 +482,8 @@ def _funnel_slice(
 
 def compute_funnels(paths: Any, defaults: dict[str, Any] | None = None) -> dict[str, Any]:
     """Посчитать все корректно настроенные воронки, не записывая артефакт."""
-    funnel_configs = _normalise_funnels(_load_config(paths))
+    client_config = _load_config(paths)
+    funnel_configs = _normalise_funnels(client_config)
     if not funnel_configs:
         return {"status": "unavailable", "reason": "funnels не настроены", "funnels": []}
 
@@ -374,7 +495,8 @@ def compute_funnels(paths: Any, defaults: dict[str, Any] | None = None) -> dict[
             "funnels": [],
         }
 
-    visits, goals = _load_visit_data(paths)
+    page_type_rules = _normalise_page_types(client_config)
+    visits, goals = _load_visit_data(paths, page_type_rules)
     goal_times = _load_goal_times(paths)
     all_visit_ids = set(visits)
 
@@ -383,7 +505,20 @@ def compute_funnels(paths: Any, defaults: dict[str, Any] | None = None) -> dict[
     segment_plan: list[tuple[str, list[Any], dict[Any, set[str]], set[str], dict[str, Any]]] = []
     for dimension, column in _SEGMENT_COLUMNS:
         counts = _segment_counts(visits, all_visit_ids, column)
-        selected, coverage = _select_segment_values(dimension, counts, policy)
+        if dimension == _PAGE_TYPE_DIMENSION and page_type_rules:
+            # Строка "other" присутствует в разрезе всегда, даже нулевая: её
+            # доля — измеритель полноты правил клиента, и отсутствие строки
+            # нельзя отличить от «правила не проверялись».
+            counts.setdefault(_PAGE_TYPE_OTHER, 0)
+        groups = None
+        if dimension == _ENTRY_PAGE_DIMENSION and page_type_rules:
+            # entry_page — drill-down внутри page_type: бюджет строк делится
+            # между типами страниц, а не достаётся самому крупному из них.
+            groups = {
+                value: _classify_page_type(value, page_type_rules) or _PAGE_TYPE_OTHER
+                for value in counts
+            }
+        selected, coverage = _select_segment_values(dimension, counts, policy, groups)
         members, other_ids = _segment_members(visits, all_visit_ids, column, selected)
         segment_plan.append((dimension, selected, members, other_ids, coverage))
     segment_coverage = [coverage for *_, coverage in segment_plan]

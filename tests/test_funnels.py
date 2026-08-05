@@ -26,9 +26,14 @@ def _write_parquet(paths: _Paths, name: str, rows: list[dict]) -> None:
     pd.DataFrame(rows).to_parquet(paths.canonical / f"{name}.parquet")
 
 
-def _write_config(paths: _Paths, funnels_config: dict) -> None:
+def _write_config(
+    paths: _Paths, funnels_config: dict, page_types: list[dict] | None = None
+) -> None:
+    config: dict = {"funnels": funnels_config}
+    if page_types is not None:
+        config["page_types"] = page_types
     paths.config_file.write_text(
-        yaml.safe_dump({"funnels": funnels_config}, sort_keys=False), encoding="utf-8"
+        yaml.safe_dump(config, sort_keys=False), encoding="utf-8"
     )
 
 
@@ -113,13 +118,15 @@ def _segment_rows(funnel: dict, dimension: str) -> list[dict]:
     return [item for item in funnel["segments"] if item["dimension"] == dimension]
 
 
-def _high_cardinality_client(tmp_path, values: int, visits_per_value: int) -> _Paths:
+def _high_cardinality_client(
+    tmp_path, values: int, visits_per_value: int, page_types: list[dict] | None = None
+) -> _Paths:
     """Клиент с одним разрезом entry_page на `values` значений."""
     paths = _Paths(tmp_path)
     _write_config(paths, {"booking": [
         {"stage": "open", "goal_ids": [1]},
         {"stage": "submit", "goal_ids": [2]},
-    ]})
+    ]}, page_types)
     visit_rows = []
     goal_rows = []
     for index in range(values):
@@ -141,11 +148,11 @@ def _high_cardinality_client(tmp_path, values: int, visits_per_value: int) -> _P
 
 
 def test_high_cardinality_dimension_is_capped_and_sums_converge(tmp_path):
-    # 30 000 значений по 1 визиту: ни одно не проходит segment_min_visits,
+    # 30 000 значений по 1 визиту: ни одно не проходит порог расчёта,
     # но итог разреза обязан сойтись с итогом до фильтрации.
     paths = _high_cardinality_client(tmp_path, values=30_000, visits_per_value=1)
 
-    defaults = {"segment_min_visits": 2, "segment_max_values": 300,
+    defaults = {"segment_compute_min_visits": 2, "segment_max_values": 300,
                 "segment_coverage_target": 0.80,
                 "segment_filtered_dimensions": ["entry_page"]}
     result = funnels.compute_funnels(paths, defaults)
@@ -167,7 +174,7 @@ def test_high_cardinality_dimension_is_capped_and_sums_converge(tmp_path):
 def test_collapsed_row_reports_null_for_non_additive_values(tmp_path):
     paths = _high_cardinality_client(tmp_path, values=40, visits_per_value=3)
 
-    defaults = {"segment_min_visits": 3, "segment_max_values": 5,
+    defaults = {"segment_compute_min_visits": 3, "segment_max_values": 5,
                 "segment_coverage_target": 0.80,
                 "segment_filtered_dimensions": ["entry_page"]}
     booking = funnels.compute_funnels(paths, defaults)["funnels"][0]
@@ -186,7 +193,7 @@ def test_collapsed_row_reports_null_for_non_additive_values(tmp_path):
 def test_segment_coverage_is_reported_in_manifest(tmp_path):
     paths = _high_cardinality_client(tmp_path, values=40, visits_per_value=3)
 
-    defaults = {"segment_min_visits": 3, "segment_max_values": 5,
+    defaults = {"segment_compute_min_visits": 3, "segment_max_values": 5,
                 "segment_coverage_target": 0.80,
                 "segment_filtered_dimensions": ["entry_page"]}
     result = funnels.compute_funnels(paths, defaults)
@@ -211,7 +218,7 @@ def test_segment_coverage_is_reported_in_manifest(tmp_path):
 def test_low_cardinality_dimensions_keep_every_value(tmp_path):
     paths = _high_cardinality_client(tmp_path, values=40, visits_per_value=3)
 
-    defaults = {"segment_min_visits": 500, "segment_max_values": 300,
+    defaults = {"segment_compute_min_visits": 500, "segment_max_values": 300,
                 "segment_coverage_target": 0.80,
                 "segment_filtered_dimensions": ["entry_page"]}
     booking = funnels.compute_funnels(paths, defaults)["funnels"][0]
@@ -221,6 +228,172 @@ def test_low_cardinality_dimensions_keep_every_value(tmp_path):
         assert len(rows) == 1
         assert [row["value"] for row in rows] != ["__other__"]
         assert rows[0]["first_to_last"]["conversion_rate"] is not None
+
+
+_PAGE_TYPES = [
+    {"id": "home", "match": [r"^/$"]},
+    {"id": "category", "match": [r"^/c\d+$"]},
+    {"id": "product", "match": [r"^/p\d+"]},
+]
+
+
+def _typed_client(tmp_path, spec: list[tuple[str, int]]) -> _Paths:
+    """Клиент с явным списком (entry_page, число визитов) и правилами page_type."""
+    paths = _Paths(tmp_path)
+    _write_config(paths, {"booking": [
+        {"stage": "open", "goal_ids": [1]},
+        {"stage": "submit", "goal_ids": [2]},
+    ]}, _PAGE_TYPES)
+    visit_rows, goal_rows = [], []
+    for page, count in spec:
+        for repeat in range(count):
+            visit_id = f"{page}_{repeat}"
+            visit_rows.append({
+                "visit_id": visit_id, "date": "2026-01-10", "source_group": "ad",
+                "device": "mobile", "entry_page": page,
+            })
+            goal_rows.append({"visit_id": visit_id, "goal_id": 1, "achievement_count": 1})
+    _write_parquet(paths, "visits", visit_rows)
+    _write_parquet(paths, "visit_goals", goal_rows)
+    return paths
+
+
+def test_dominant_value_no_longer_stops_selection_at_coverage_target(tmp_path):
+    """SEG-FIX: coverage_target — цель, а не правило остановки.
+
+    Раньше "/" (61% визитов) + одна категория закрывали 0.80, и разрез
+    схлопывался в две строки — сегментный анализ точки входа исчезал.
+    """
+    spec = [("/", 600), ("/c1", 200)] + [(f"/p{index:03d}", 40) for index in range(20)]
+    paths = _typed_client(tmp_path, spec)
+    defaults = {"segment_compute_min_visits": 30, "segment_max_values": 2000,
+                "segment_coverage_target": 0.80,
+                "segment_entry_page_top_per_type": 1500,
+                "segment_filtered_dimensions": ["entry_page"]}
+
+    booking = funnels.compute_funnels(paths, defaults)["funnels"][0]
+    rows = _segment_rows(booking, "entry_page")
+
+    assert [row["value"] for row in rows] == sorted(page for page, _ in spec)
+    assert len(rows) == 22
+
+
+def test_values_below_compute_threshold_collapse_but_sums_converge(tmp_path):
+    spec = [("/", 100)] + [(f"/p{index:03d}", 5) for index in range(50)]
+    paths = _typed_client(tmp_path, spec)
+    defaults = {"segment_compute_min_visits": 30, "segment_max_values": 2000,
+                "segment_coverage_target": 0.80,
+                "segment_entry_page_top_per_type": 1500,
+                "segment_filtered_dimensions": ["entry_page"]}
+
+    result = funnels.compute_funnels(paths, defaults)
+    booking = result["funnels"][0]
+    rows = _segment_rows(booking, "entry_page")
+
+    assert [row["value"] for row in rows] == ["/", "__other__"]
+    assert sum(row["stages"][0]["visits"] for row in rows) == booking["stages"][0]["visits"]
+    coverage = next(
+        item for item in result["segment_selection"]["dimensions"]
+        if item["dimension"] == "entry_page"
+    )
+    assert coverage["values_below_compute_threshold"] == 50
+    assert coverage["coverage_ratio"] == 0.2857
+    assert coverage["coverage_target_met"] is False
+
+
+def test_entry_page_budget_is_split_between_page_types(tmp_path):
+    """Топ-N на тип: один тип страниц не выбирает весь бюджет строк."""
+    spec = [(f"/p{index:03d}", 100) for index in range(10)]
+    spec += [(f"/c{index:03d}", 50) for index in range(5)]
+    paths = _typed_client(tmp_path, spec)
+    defaults = {"segment_compute_min_visits": 30, "segment_max_values": 2000,
+                "segment_coverage_target": 0.80,
+                "segment_entry_page_top_per_type": 3,
+                "segment_filtered_dimensions": ["entry_page"]}
+
+    result = funnels.compute_funnels(paths, defaults)
+    booking = result["funnels"][0]
+    values = [row["value"] for row in _segment_rows(booking, "entry_page")]
+
+    # По 3 значения каждого типа плюс схлопнутый остаток.
+    assert sum(1 for value in values if value.startswith("/p")) == 3
+    assert sum(1 for value in values if value.startswith("/c")) == 3
+    assert "__other__" in values
+    coverage = next(
+        item for item in result["segment_selection"]["dimensions"]
+        if item["dimension"] == "entry_page"
+    )
+    assert coverage["values_dropped_by_group_cap"] == 9
+
+
+def test_page_type_dimension_covers_every_visit_and_always_has_other(tmp_path):
+    spec = [("/", 100), ("/c1", 40), ("/p1", 40), ("/unmatched-page", 20)]
+    paths = _typed_client(tmp_path, spec)
+    defaults = {"segment_compute_min_visits": 30, "segment_max_values": 2000,
+                "segment_coverage_target": 0.80,
+                "segment_entry_page_top_per_type": 1500,
+                "segment_filtered_dimensions": ["entry_page"]}
+
+    result = funnels.compute_funnels(paths, defaults)
+    booking = result["funnels"][0]
+    rows = _segment_rows(booking, "page_type")
+
+    assert [row["value"] for row in rows] == ["category", "home", "other", "product"]
+    # Разрез не режется порогами: покрыты все визиты, "__other__" не появляется.
+    assert sum(row["stages"][0]["visits"] for row in rows) == booking["stages"][0]["visits"]
+    coverage = next(
+        item for item in result["segment_selection"]["dimensions"]
+        if item["dimension"] == "page_type"
+    )
+    assert coverage["rule_applied"] is False
+    assert coverage["coverage_ratio"] == 1.0
+    other = next(row for row in rows if row["value"] == "other")
+    assert other["stages"][0]["visits"] == 20
+
+
+def test_page_type_other_row_present_even_when_empty(tmp_path):
+    paths = _typed_client(tmp_path, [("/", 100), ("/p1", 40)])
+    defaults = {"segment_compute_min_visits": 30, "segment_max_values": 2000,
+                "segment_coverage_target": 0.80,
+                "segment_entry_page_top_per_type": 1500,
+                "segment_filtered_dimensions": ["entry_page"]}
+
+    booking = funnels.compute_funnels(paths, defaults)["funnels"][0]
+    rows = _segment_rows(booking, "page_type")
+
+    other = next(row for row in rows if row["value"] == "other")
+    assert other["stages"][0]["visits"] == 0
+
+
+def test_page_type_rules_are_ordered_first_match_wins(tmp_path):
+    paths = _Paths(tmp_path)
+    _write_config(paths, {"booking": [
+        {"stage": "open", "goal_ids": [1]},
+        {"stage": "submit", "goal_ids": [2]},
+    ]}, [
+        {"id": "promo", "match": [r"^/p100$"]},
+        {"id": "product", "match": [r"^/p\d+"]},
+    ])
+    _write_parquet(paths, "visits", [
+        {"visit_id": "v1", "date": "2026-01-10", "source_group": "ad",
+         "device": "mobile", "entry_page": "/p100"},
+    ])
+    _write_parquet(paths, "visit_goals", [
+        {"visit_id": "v1", "goal_id": 1, "achievement_count": 1},
+    ])
+
+    booking = funnels.compute_funnels(paths, {})["funnels"][0]
+    values = [row["value"] for row in _segment_rows(booking, "page_type")]
+
+    assert values == ["other", "promo"]
+
+
+def test_page_type_dimension_absent_without_client_rules(tmp_path):
+    paths = _high_cardinality_client(tmp_path, values=4, visits_per_value=3)
+
+    booking = funnels.compute_funnels(paths, {})["funnels"][0]
+
+    assert _segment_rows(booking, "page_type") == []
 
 
 def test_funnels_precede_block3_in_compute_order():
