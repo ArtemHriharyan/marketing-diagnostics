@@ -148,7 +148,8 @@ def _visits_series(con: Any, canonical: dict[str, Path]) -> dict[str, Any]:
 
 
 def _funnel_series(paths: Any) -> dict[str, Any]:
-    result = funnels.compute_funnels(paths)
+    # PERF-1B: воронки уже посчитаны блоком funnels — читаем его артефакт.
+    result = funnels.load_funnels(paths)
     if result.get("status") != "ok" or not result.get("funnels"):
         return _unavailable(str(result.get("reason") or "выбранная воронка недоступна"))
 

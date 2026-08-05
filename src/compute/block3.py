@@ -819,7 +819,8 @@ def _run_c05(paths: Any, canonical: dict[str, Path], confidence_cap: str, metric
 def _run_c06(paths: Any, defaults: dict[str, Any], confidence_cap: str, metrics_dir: Path) -> None:
     min_sample = int(defaults.get("min_sample_visits", 500))
 
-    funnel_metrics = funnels.compute_funnels(paths)
+    # PERF-1B: воронки уже посчитаны блоком funnels — читаем его артефакт.
+    funnel_metrics = funnels.load_funnels(paths)
     if funnel_metrics["status"] != "ok":
         common.write_metric_artifact(metrics_dir, "c06", [{
             "check_id": "C06",

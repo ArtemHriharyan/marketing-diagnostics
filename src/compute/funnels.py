@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
@@ -32,6 +33,11 @@ _NON_ADDITIVE_TRANSITION_KEY = "transition_rate"
 _NON_ADDITIVE_FIRST_TO_LAST_KEY = "conversion_rate"
 
 _DEFAULTS_FILE = Path(__file__).resolve().parents[2] / "config" / "defaults.yaml"
+
+# PERF-1B. Артефакт слоя metrics: пишется один раз в `run()`, читается
+# потребителями (block3 C06, seasonality, acquisition_economics) вместо
+# повторного расчёта.
+_ARTIFACT_NAME = "funnels.json"
 
 
 def _load_config(paths: Any) -> dict[str, Any]:
@@ -161,8 +167,9 @@ def _load_goal_times(paths: Any) -> dict[str, dict[str, str]]:
 def _load_defaults(defaults: dict[str, Any] | None) -> dict[str, Any]:
     """Пороги отбора сегментов: из dispatch, иначе прямо из config/defaults.yaml.
 
-    `compute_funnels` вызывается ещё и из block3/seasonality, куда defaults не
-    передаются, — политика разреза должна быть одна на все три вызова.
+    В обычном прогоне расчёт один (PERF-1B), но запасной путь `load_funnels`
+    вызывает `compute_funnels` без defaults — политика разреза при этом обязана
+    совпасть с той, что применил бы dispatch.
     """
     if isinstance(defaults, dict) and defaults:
         return defaults
@@ -436,10 +443,33 @@ def compute_funnels(paths: Any, defaults: dict[str, Any] | None = None) -> dict[
     }
 
 
+def load_funnels(paths: Any, defaults: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Вернуть воронки прогона: артефакт `funnels.json`, иначе расчёт.
+
+    Единственная точка входа для потребителей внутри compute (block3 C06,
+    seasonality). Воронки считает `run()` — он идёт в dispatch раньше своих
+    потребителей, поэтому в обычном прогоне здесь только чтение готового
+    артефакта своего же слоя, без второго и третьего `compute_funnels`
+    (PERF-1B: три вызова были идентичны по параметрам, ≈4.1 с чистого дубля).
+
+    Расчёт остаётся запасным путём для случаев, когда артефакта нет: блок
+    `funnels` упал или модуль вызван вне dispatch (тесты, отладка). Принцип 4 —
+    отсутствие артефакта не роняет потребителя.
+    """
+    artifact = Path(paths.metrics) / _ARTIFACT_NAME
+    try:
+        loaded = json.loads(artifact.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        loaded = None
+    if isinstance(loaded, dict) and isinstance(loaded.get("status"), str):
+        return loaded
+    return compute_funnels(paths, defaults)
+
+
 def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[str]:
     """Записать компактный funnels.json; runnable_ids здесь не нужны."""
     del runnable_ids
     common.write_json_atomic(
-        Path(paths.metrics) / "funnels.json", compute_funnels(paths, defaults)
+        Path(paths.metrics) / _ARTIFACT_NAME, compute_funnels(paths, defaults)
     )
     return ["funnels"]

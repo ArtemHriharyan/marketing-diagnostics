@@ -225,3 +225,47 @@ def test_low_cardinality_dimensions_keep_every_value(tmp_path):
 
 def test_funnels_precede_block3_in_compute_order():
     assert common.BLOCK_MODULE_NAMES.index("funnels") < common.BLOCK_MODULE_NAMES.index("block3")
+
+
+def test_funnels_are_computed_once_per_run(tmp_path, monkeypatch):
+    """PERF-1B: за прогон ровно один compute_funnels, потребители читают артефакт."""
+    from src.compute import block3, seasonality
+
+    paths = _high_cardinality_client(tmp_path, values=4, visits_per_value=3)
+    calls: list[int] = []
+    original = funnels.compute_funnels
+
+    def _counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(funnels, "compute_funnels", _counted)
+
+    # Порядок как в dispatch: funnels -> seasonality -> block3.
+    funnels.run(paths, {}, set())
+    series = seasonality._funnel_series(paths)
+    block3._run_c06(paths, {"min_sample_visits": 3}, "HIGH", paths.metrics)
+
+    assert len(calls) == 1
+    artifact = json.loads((paths.metrics / "funnels.json").read_text(encoding="utf-8"))
+    assert series["status"] == "ok"
+    assert series["funnel_id"] == artifact["funnels"][0]["funnel_id"]
+    c06 = json.loads((paths.metrics / "c06.json").read_text(encoding="utf-8"))
+    summary = next(row for row in c06 if row["finding"] == "funnel_summary")
+    assert summary["completed_visits"] == artifact["funnels"][0]["first_to_last"]["completed_visits"]
+
+
+def test_consumers_fall_back_to_computing_when_artifact_absent(tmp_path):
+    """Без артефакта (блок funnels упал / вызов вне dispatch) потребитель считает сам."""
+    paths = _high_cardinality_client(tmp_path, values=4, visits_per_value=3)
+
+    assert not (paths.metrics / "funnels.json").exists()
+    assert funnels.load_funnels(paths)["status"] == "ok"
+
+
+def test_damaged_artifact_is_not_used(tmp_path):
+    paths = _high_cardinality_client(tmp_path, values=4, visits_per_value=3)
+    paths.metrics.mkdir(parents=True, exist_ok=True)
+    (paths.metrics / "funnels.json").write_text("{", encoding="utf-8")
+
+    assert funnels.load_funnels(paths)["status"] == "ok"
