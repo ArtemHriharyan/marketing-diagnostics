@@ -1,4 +1,4 @@
-"""Сбор и чтение data/raw/manifest.json.
+"""Сбор и чтение data/raw/manifest.json и data/metrics/manifest.json.
 
 Контракт:
     Читает   — содержимое каталога data/raw/<source>/ (какие источники выгружены)
@@ -6,6 +6,9 @@
     Пишет    — data/raw/manifest.json: по каждому источнику фиксирует окно дат,
                число строк, время выгрузки, версию скрипта и перечень
                канонических таблиц, которые из него строятся.
+             — data/metrics/manifest.json: реестр входов слоя metrics, по
+               каждому артефакту — run_id прогона, который его записал
+               (STATE-1, см. ниже).
 
 Манифест — единственный «указатель истины» о том, что реально выгружено. Слой
 compute и карта деградации (src.pipeline.degradation) опираются на него, а не на
@@ -88,6 +91,80 @@ def update_source(
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
+    return manifest
+
+
+# ── Реестр входов слоя metrics (STATE-1) ────────────────────────────────────
+# Прогон compute помечается run_id; каждый артефакт, записанный в этом прогоне,
+# регистрируется здесь вместе с run_id, который его записал. Реестр НЕ
+# обнуляется в начале прогона: запись предыдущего прогона обязана пережить
+# текущий, иначе артефакт, который сегодня никто не переписал, невозможно
+# отличить (stale) от файла, который в слое metrics вообще не должен лежать
+# (unregistered). Потребитель реестра — src.compute.candidates: он строит
+# список входов отсюда, а не глобом по каталогу.
+#
+# Файл лежит в data/metrics/ и намеренно исключён из побайтовой сверки
+# прогонов (tests/test_compute_determinism._metric_files): он несёт время
+# записи, то есть заведомо не воспроизводим — в отличие от самих артефактов.
+
+
+def metrics_manifest_path(metrics_dir: Path) -> Path:
+    """Путь к manifest.json внутри каталога data/metrics/."""
+    return Path(metrics_dir) / MANIFEST_NAME
+
+
+def load_metrics_manifest(metrics_dir: Path) -> dict[str, Any]:
+    """Прочитать реестр входов metrics. Отсутствие/порча -> пустой реестр.
+
+    Порча файла не роняет прогон (принцип 4): пустой реестр означает, что все
+    найденные в каталоге артефакты окажутся ``unregistered`` и не попадут в
+    кандидаты — состояние заметное, а не молчаливое.
+    """
+    path = metrics_manifest_path(metrics_dir)
+    if not path.exists():
+        return {"run_id": None, "generated_at": None, "artifacts": {}}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        loaded = None
+    if not isinstance(loaded, dict):
+        return {"run_id": None, "generated_at": None, "artifacts": {}}
+    artifacts = loaded.get("artifacts")
+    loaded["artifacts"] = artifacts if isinstance(artifacts, dict) else {}
+    return loaded
+
+
+def _write_metrics_manifest(metrics_dir: Path, manifest: dict[str, Any]) -> Path:
+    path = metrics_manifest_path(metrics_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    return path
+
+
+def start_metrics_run(metrics_dir: Path, run_id: str) -> dict[str, Any]:
+    """Открыть прогон: записать его run_id, сохранив регистрации прошлых прогонов."""
+    manifest = load_metrics_manifest(metrics_dir)
+    manifest["run_id"] = run_id
+    manifest["generated_at"] = datetime.now(timezone.utc).isoformat()
+    _write_metrics_manifest(metrics_dir, manifest)
+    return manifest
+
+
+def register_metrics_artifact(
+    metrics_dir: Path, stem: str, run_id: str
+) -> dict[str, Any]:
+    """Зарегистрировать артефакт ``stem`` как записанный прогоном ``run_id``.
+
+    Идемпотентно: повторная запись того же артефакта в том же прогоне только
+    обновляет отметку времени.
+    """
+    manifest = load_metrics_manifest(metrics_dir)
+    manifest["artifacts"][stem] = {
+        "run_id": run_id,
+        "written_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_metrics_manifest(metrics_dir, manifest)
     return manifest
 
 

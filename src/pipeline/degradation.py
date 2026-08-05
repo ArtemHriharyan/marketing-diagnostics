@@ -190,6 +190,40 @@ def register_missing_dependencies(
     return report
 
 
+def register_artifact_states(
+    report: dict[str, Any],
+    stale: Iterable[dict[str, Any]] = (),
+    unregistered: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Внести в отчёт артефакты metrics, не принадлежащие текущему прогону (STATE-1).
+
+    Два состояния, оба — ограничение прогона, оба обязаны быть видимы, а не
+    молча пропущены (в этом и была задача: candidates раньше подхватывал такой
+    файл глобом наравне со свежим):
+
+      * ``stale``        — артефакт зарегистрирован прошлым прогоном (чужой
+        run_id) либо не зарегистрирован вовсе, а файл на месте: его содержание
+        относится к другому входному состоянию;
+      * ``unregistered`` — файл лежит в data/metrics/, но реестр входов о нём
+        не знает: его записал не слой compute.
+
+    Файлы не удаляются: снести чужой артефакт — потерять улику для разбора
+    прогона. ``counts`` не трогается — это счётчики реестра проверок, а не
+    файлов (тот же приём, что у register_missing_dependencies).
+    """
+    stale_entries = [dict(entry) for entry in stale]
+    unregistered_names = sorted(set(unregistered))
+    if not stale_entries and not unregistered_names:
+        return report
+
+    artifacts = report.setdefault("artifact_states", {})
+    if stale_entries:
+        artifacts["stale"] = sorted(stale_entries, key=lambda e: str(e.get("artifact")))
+    if unregistered_names:
+        artifacts["unregistered"] = unregistered_names
+    return report
+
+
 # Режим (api|manual) каждой канонической таблицы.
 #   * ``_API_TABLES``      — всегда api (машинная выгрузка систем).
 #   * ``_MANUAL_TABLES``   — всегда manual (ручной ввод/обход/анкета): их данные
@@ -450,6 +484,10 @@ def build_degradation_report(
     ]
 
     return {
+        # STATE-1: заполняется orchestrator.run_compute сразу после сборки
+        # отчёта (compute_run_id считается от него же). Ключ объявлен здесь,
+        # чтобы отчёт имел одну форму и до, и после назначения прогону id.
+        "run_id": None,
         "available_tables": sorted(available_set),
         "runnable_check_ids": [c.get("id") for c in runnable],
         "skipped": skipped,

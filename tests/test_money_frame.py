@@ -391,8 +391,17 @@ def test_missing_degradation_report_does_not_crash(tmp_path):
 # ── 10. Подключение к dispatcher ────────────────────────────────────────────
 
 def test_money_frame_registered_in_block_module_names():
+    """money_frame идёт до candidates, но последним модулем не является.
+
+    Раньше тест требовал BLOCK_MODULE_NAMES[-1] == "money_frame". Последним
+    блоком стал candidates: он читает выход money_frame наравне с остальными
+    артефактами, поэтому обязан идти после него. Два теста на «последний
+    модуль» несовместимы (второй — test_candidates.py:186), и позицию
+    money_frame правильно фиксировать относительно его потребителя.
+    """
     assert "money_frame" in common.BLOCK_MODULE_NAMES
-    assert common.BLOCK_MODULE_NAMES[-1] == "money_frame"
+    assert common.BLOCK_MODULE_NAMES.index("money_frame") > common.BLOCK_MODULE_NAMES.index("block3")
+    assert common.BLOCK_MODULE_NAMES.index("money_frame") < common.BLOCK_MODULE_NAMES.index("candidates")
 
 
 def test_dispatch_blocks_runs_money_frame_by_default(tmp_path):

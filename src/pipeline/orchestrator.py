@@ -590,6 +590,17 @@ def run_compute(paths: ClientPaths, log: StageLogger) -> None:
         methodology, manifest=manifest, config=config, defaults=defaults
     )
 
+    # STATE-1. Идентичность прогона назначается здесь и только здесь: отпечаток
+    # считается от готового degradation_report, попадает в него же и открывает
+    # контекст, которым write_metric_artifact регистрирует каждый записанный
+    # артефакт в data/metrics/manifest.json. Так degradation_report и
+    # содержимое metrics/ связаны одним идентификатором, а candidates строит
+    # список входов из реестра, а не глобом.
+    run_id = compute_common.compute_run_id(report)
+    report["run_id"] = run_id
+    manifest_mod.start_metrics_run(paths.metrics, run_id)
+    compute_common.set_run_context(run_id, paths.metrics)
+
     out = paths.metrics / "degradation_report.json"
 
     def _write_degradation_report() -> None:
@@ -604,7 +615,28 @@ def run_compute(paths: ClientPaths, log: StageLogger) -> None:
         f"пропущено {counts['skipped']}. degradation_report -> {out}"
     )
 
-    dispatch_result = compute_common.dispatch_blocks(paths, defaults, report)
+    try:
+        dispatch_result = compute_common.dispatch_blocks(paths, defaults, report)
+    finally:
+        # Контекст прогона закрывается всегда: он глобален для процесса, и
+        # незакрытый контекст пометил бы артефакты следующего прогона (или
+        # соседнего теста) чужим run_id.
+        compute_common.set_run_context(None, None)
+
+    # STATE-1. Артефакты каталога metrics, не принадлежащие этому прогону:
+    # candidates исключил их из пакета для analyze, здесь они попадают в
+    # degradation_report — иначе исключение осталось бы молчаливым.
+    stale, unregistered = compute_common.artifact_states_from_candidates(paths.metrics)
+    if stale or unregistered:
+        degradation_mod.register_artifact_states(report, stale, unregistered)
+        _write_degradation_report()
+        for entry in stale:
+            log(
+                f"compute: артефакт {entry['artifact']} — stale "
+                f"(run_id {entry['run_id']}, текущий {run_id}), в кандидаты не включён"
+            )
+        for name in unregistered:
+            log(f"compute: артефакт {name} не зарегистрирован прогоном, в кандидаты не включён")
 
     # Блок, не импортировавшийся из-за отсутствующего пакета, — ограничение
     # прогона наравне с отсутствующим источником: пишем его в degradation_report

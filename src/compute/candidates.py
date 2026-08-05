@@ -4,6 +4,19 @@
 ``candidate_reason`` и ``context_refs``. Сборщик включает только явно
 положительные кандидаты, их адресный контекст и все ограничения. Неразмеченные
 legacy-артефакты не считаются кандидатами и отражаются в coverage.
+
+STATE-1. Список входов берётся из реестра прогона (data/metrics/manifest.json),
+а не глобом по каталогу. Глоб не различал файл, записанный этим прогоном, и
+файл, оставшийся от прошлого: оба попадали в пакет для analyze как равные.
+Теперь у каждого файла каталога ровно одно состояние:
+
+    current      — зарегистрирован текущим run_id, идёт в кандидаты;
+    stale        — зарегистрирован другим run_id (или файл есть, а записи нет),
+                   в кандидаты НЕ идёт, попадает в degradation_report;
+    unregistered — файла нет в реестре входов вовсе, в кандидаты НЕ идёт,
+                   попадает в degradation_report.
+
+Ни stale, ни unregistered не пропускаются молча и не удаляются с диска.
 """
 
 from __future__ import annotations
@@ -12,6 +25,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..pipeline import manifest as manifest_mod
 from .common import assign_evidence_ids, evidence_label, write_json_atomic
 
 
@@ -164,17 +178,63 @@ def _to_columnar(rows: list[dict[str, Any]]) -> tuple[list[str], list[list[Any]]
     return columns, [[row.get(column) for column in columns] for row in rows]
 
 
-def build_analysis_candidates(metrics_dir: Path) -> dict[str, Any]:
-    """Собрать ``analysis_candidates`` из JSON-артефактов каталога metrics."""
+def _resolve_inputs(
+    metrics_dir: Path, run_id: str | None, registry: dict[str, Any]
+) -> tuple[list[Path], list[dict[str, Any]], list[str]]:
+    """Разложить *.json каталога metrics на входы прогона, stale и unregistered.
+
+    Вход прогона — файл, чья запись в реестре несёт run_id текущего прогона.
+    Служебные артефакты (``_RESERVED_ARTIFACTS``) и сам манифест реестра из
+    разбора исключены: первые — выход этой же стадии, второй — сам реестр.
+
+    ``run_id is None`` — прогон не открыт (candidates вызван вне dispatch:
+    юнит-тест блока, отладка). Тогда реестр не применяется и входами считаются
+    все найденные файлы: без идентичности прогона отличить свежий артефакт от
+    чужого нечем, и выдумывать состояние вместо признания незнания нельзя.
+    """
+    found = [
+        path for path in sorted(metrics_dir.glob("*.json"))
+        if path.stem not in _RESERVED_ARTIFACTS
+        and path.name != manifest_mod.MANIFEST_NAME
+    ]
+    if run_id is None:
+        return found, [], []
+
+    inputs: list[Path] = []
+    stale: list[dict[str, Any]] = []
+    unregistered: list[str] = []
+    for path in found:
+        entry = registry.get(path.stem)
+        entry_run_id = entry.get("run_id") if isinstance(entry, dict) else None
+        if entry_run_id == run_id:
+            inputs.append(path)
+        elif entry_run_id is None:
+            unregistered.append(path.stem)
+        else:
+            stale.append({"artifact": path.stem, "run_id": entry_run_id})
+    return inputs, stale, unregistered
+
+
+def build_analysis_candidates(
+    metrics_dir: Path, run_id: str | None = None
+) -> dict[str, Any]:
+    """Собрать ``analysis_candidates`` из входов прогона в каталоге metrics.
+
+    ``run_id`` — идентификатор текущего прогона; None означает «прогон не
+    открыт», см. ``_resolve_inputs``.
+    """
     metrics_dir = Path(metrics_dir)
     records: list[dict[str, Any]] = []
     artifact_coverage: list[dict[str, Any]] = []
     invalid_artifacts: list[str] = []
     invalid_annotation_rows = 0
 
-    for path in sorted(metrics_dir.glob("*.json")):
-        if path.stem in _RESERVED_ARTIFACTS:
-            continue
+    registry = manifest_mod.load_metrics_manifest(metrics_dir).get("artifacts") or {}
+    input_paths, stale_artifacts, unregistered_artifacts = _resolve_inputs(
+        metrics_dir, run_id, registry
+    )
+
+    for path in input_paths:
         audit: dict[str, Any] = {
             "artifact": path.stem,
             "shape": None,
@@ -322,10 +382,16 @@ def build_analysis_candidates(metrics_dir: Path) -> dict[str, Any]:
         "missing_context_refs": sorted(missing_context_refs),
         "unusable_context_refs": sorted(unusable_context_refs),
         "invalid_artifacts": sorted(invalid_artifacts),
+        # STATE-1: файлы каталога, не принадлежащие прогону. В rows их строк
+        # нет; здесь они названы поимённо, чтобы «в пакете нет данных T03» и
+        # «T03 исключён как stale» не выглядели одинаково.
+        "stale_artifacts": sorted(stale_artifacts, key=lambda e: e["artifact"]),
+        "unregistered_artifacts": sorted(unregistered_artifacts),
         "artifacts": artifact_coverage,
     }
     return {
         "schema_version": 1,
+        "run_id": run_id,
         "columns": columns,
         "rows": columnar_rows,
         "coverage": coverage,
@@ -333,9 +399,17 @@ def build_analysis_candidates(metrics_dir: Path) -> dict[str, Any]:
 
 
 def run(paths: Any, defaults: dict[str, Any], runnable_ids: set[str]) -> list[str]:
-    """Записать analysis_candidates.json последним compute-блоком."""
+    """Записать analysis_candidates.json последним compute-блоком.
+
+    run_id берётся из контекста прогона, открытого orchestrator.run_compute.
+    Записи stale/unregistered едут в degradation_report не отсюда: их
+    забирает orchestrator из coverage готового артефакта — degradation_report
+    пишет он, и второго писателя у этого файла быть не должно.
+    """
     del defaults, runnable_ids
+    from .common import current_run_id
+
     metrics_dir = Path(paths.metrics)
-    result = build_analysis_candidates(metrics_dir)
+    result = build_analysis_candidates(metrics_dir, current_run_id())
     write_json_atomic(metrics_dir / "analysis_candidates.json", result)
     return ["analysis_candidates"]

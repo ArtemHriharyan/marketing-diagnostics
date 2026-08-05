@@ -24,6 +24,93 @@ import duckdb
 import yaml
 
 from ..pipeline import degradation as degradation_mod
+from ..pipeline import manifest as manifest_mod
+
+
+# ── Идентичность прогона (STATE-1) ──────────────────────────────────────────
+# run_id связывает degradation_report и содержимое data/metrics/: артефакт,
+# записанный этим прогоном, регистрируется в манифесте слоя metrics с этим же
+# run_id, и candidates берёт список входов оттуда, а не глобом по каталогу.
+#
+# run_id ДЕТЕРМИНИРОВАН — это отпечаток входного состояния прогона
+# (degradation_report до дописывания самого run_id), а не случайный UUID и не
+# отметка времени. Причина в контракте, а не в удобстве: run_id попадает в
+# degradation_report.json и analysis_candidates.json, а
+# tests/test_compute_determinism.test_two_runs_produce_byte_identical_metrics
+# требует побайтового совпадения всех файлов data/metrics/ между двумя
+# прогонами. Случайный run_id ломал бы этот инвариант в каждом артефакте.
+# Следствие, принятое сознательно: два прогона подряд на неизменившемся входе
+# делят один run_id, поэтому не переписанный артефакт такого прогона считается
+# актуальным — он и есть актуальный, его содержание не могло измениться.
+# Отличается вход (появился/пропал источник, изменился набор runnable) —
+# отличается run_id, и всё, что не переписано, становится stale.
+_RUN_ID_LENGTH = 16
+
+_run_context: dict[str, Any] = {"run_id": None, "metrics_dir": None}
+
+
+def compute_run_id(degradation_report: dict[str, Any]) -> str:
+    """Отпечаток входного состояния прогона по degradation_report."""
+    payload = {
+        key: value for key, value in degradation_report.items() if key != "run_id"
+    }
+    digest = hashlib.sha256(
+        json.dumps(canonicalize(payload), ensure_ascii=False, sort_keys=True).encode("utf-8")
+    )
+    return digest.hexdigest()[:_RUN_ID_LENGTH]
+
+
+def set_run_context(run_id: str | None, metrics_dir: Path | None) -> None:
+    """Открыть/закрыть контекст прогона для регистрации артефактов.
+
+    Вызывается orchestrator.run_compute до dispatch. Вне прогона (юнит-тесты
+    отдельных блоков, отладочный вызов модуля) контекст пуст, и запись
+    артефакта просто ничего не регистрирует — принцип 4.
+    """
+    _run_context["run_id"] = run_id
+    _run_context["metrics_dir"] = Path(metrics_dir) if metrics_dir is not None else None
+
+
+def current_run_id() -> str | None:
+    """run_id открытого прогона либо None вне прогона."""
+    return _run_context["run_id"]
+
+
+def artifact_states_from_candidates(
+    metrics_dir: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """(stale, unregistered) из готового analysis_candidates.json.
+
+    Разбор состояний делает candidates — он же единственный, кто знает, какие
+    файлы стали входами прогона. Здесь только чтение результата: отсутствие
+    или порча артефакта -> пустые списки (принцип 4).
+    """
+    path = Path(metrics_dir) / "analysis_candidates.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [], []
+    coverage = payload.get("coverage") if isinstance(payload, dict) else None
+    if not isinstance(coverage, dict):
+        return [], []
+    stale = [e for e in (coverage.get("stale_artifacts") or []) if isinstance(e, dict)]
+    unregistered = [n for n in (coverage.get("unregistered_artifacts") or []) if isinstance(n, str)]
+    return stale, unregistered
+
+
+def register_run_artifact(metrics_dir: Path, name: str) -> None:
+    """Отметить артефакт как записанный текущим прогоном.
+
+    Вне контекста прогона и для файлов вне каталога metrics текущего прогона —
+    ничего не делает: регистрировать нечего и некуда.
+    """
+    run_id = _run_context["run_id"]
+    context_dir = _run_context["metrics_dir"]
+    if not run_id or context_dir is None:
+        return
+    if Path(metrics_dir).resolve() != context_dir.resolve():
+        return
+    manifest_mod.register_metrics_artifact(context_dir, name, run_id)
 
 
 # ── Загрузка входов ─────────────────────────────────────────────────────────
@@ -308,10 +395,18 @@ def canonicalize(data: Any) -> Any:
     return data
 
 
-def write_json_atomic(path: Path, data: Any) -> Path:
-    """Атомарно записать data как JSON (UTF-8, без ASCII-экранирования) в path."""
+def write_json_atomic(path: Path, data: Any, *, register: bool = True) -> Path:
+    """Атомарно записать data как JSON (UTF-8, без ASCII-экранирования) в path.
+
+    ``register=False`` — не регистрировать файл в манифесте прогона; так
+    пишет write_metric_artifact, который регистрирует свой артефакт сам
+    (STATE-1: владение регистрацией видно в том же месте, где написан
+    артефакт проверки).
+    """
     path = Path(path)
     _atomic_write_text(path, json.dumps(canonicalize(data), ensure_ascii=False, indent=2))
+    if register:
+        register_run_artifact(path.parent, path.stem)
     return path
 
 
@@ -360,7 +455,7 @@ def write_metric_artifact(
         for row in rows
     ]
 
-    write_json_atomic(json_path, rows)
+    write_json_atomic(json_path, rows, register=False)
 
     if rows:
         buf = io.StringIO()
@@ -371,6 +466,11 @@ def write_metric_artifact(
     else:
         csv_text = ""
     _atomic_write_text(csv_path, csv_text)
+
+    # STATE-1: артефакт проверки объявляет себя входом текущего прогона. Без
+    # этой строки candidates увидит файл в каталоге, но не найдёт его в
+    # реестре входов и пометит unregistered (см. tests/test_run_identity.py).
+    register_run_artifact(metrics_dir, name)
 
     return csv_path, json_path
 
